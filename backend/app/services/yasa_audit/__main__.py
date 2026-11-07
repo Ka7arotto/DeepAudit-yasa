@@ -75,12 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "trace":
         result = trace(cfg, root, args.out, args.deploy, deadline)
     else:
-        ef = None
         rec = None
         if getattr(args, "recon", False):
             rec = recon(cfg, root, args.out / "recon", args.deploy, "", start + 0.2 * cfg.time_budget_s)
-            ef = args.out / "recon" / "entries.json"
-            ef = ef if ef.exists() else None
+        ef = args.out / "recon" / "entries.json"  # shared with authz; reused when already present
+        ef = ef if ef.exists() else None
         build_deadline = start + cfg.build_share * cfg.time_budget_s
         b = build(cfg, root, args.out / "build", args.deploy, build_deadline, entries_file=ef)
         t = triage(cfg, root, args.out / "build", args.out / "triage", args.group, args.deploy, deadline)
