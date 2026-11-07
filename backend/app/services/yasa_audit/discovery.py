@@ -110,7 +110,7 @@ def snapshot_codegraph(root: Path, dest_dir: Path) -> Path | None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "codegraph.snapshot.db"
     try:
-        src = sqlite3.connect(f"file:{live}?mode=ro", uri=True, timeout=30)
+        src = _connect(live)
         try:
             dst = sqlite3.connect(dest)
             try:
@@ -157,7 +157,19 @@ def ensure_codegraph(codegraph_bin: str, root: Path, timeout_s: int = 300) -> Pa
 
 
 def _connect(db: Path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+    """Read an existing index, allowing SQLite to initialize WAL sidecars if needed."""
+    uri = db.resolve().as_uri()
+    try:
+        con = sqlite3.connect(f"{uri}?mode=rw", uri=True, timeout=10)
+    except sqlite3.OperationalError:
+        # Read-only filesystems can still serve an index whose WAL sidecars are present.
+        con = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=10)
+    try:
+        con.execute("PRAGMA query_only=ON")
+    except sqlite3.Error:
+        con.close()
+        raise
+    return con
 
 
 def _split_route(name: str) -> tuple[str, str]:

@@ -1,5 +1,6 @@
 """Entry discovery from codegraph's index, script rules and dispatcher marking (no tools needed)."""
 
+import shutil
 import sqlite3
 
 from app.services.yasa_audit.discovery import (
@@ -166,3 +167,45 @@ def test_snapshot_skipped_when_index_incomplete(tmp_path):
 
     _codegraph(tmp_path, [], [], complete=False)
     assert snapshot_codegraph(tmp_path, tmp_path / "run") is None
+
+
+def test_wal_index_without_sidecars_can_be_read_and_snapshotted(tmp_path):
+    from app.services.yasa_audit.discovery import _connect, snapshot_codegraph
+
+    source = tmp_path / "source.db"
+    con = sqlite3.connect(source)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE project_metadata(key TEXT, value TEXT)")
+    con.execute("INSERT INTO project_metadata VALUES('index_state', 'complete')")
+    con.execute("CREATE TABLE nodes(id TEXT, kind TEXT, name TEXT, file_path TEXT, start_line INT, end_line INT, is_exported INT)")
+    con.execute("INSERT INTO nodes VALUES('r', 'route', 'GET /a', 'a.js', 1, 1, 0)")
+    con.execute("CREATE TABLE edges(source TEXT, target TEXT, kind TEXT)")
+    con.commit()
+    assert con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    con.close()
+    root = tmp_path / "project #1"
+    (root / ".codegraph").mkdir(parents=True)
+    db = root / ".codegraph" / "codegraph.db"
+    shutil.copyfile(source, db)  # checkpointed WAL database, no -wal or -shm files
+    assert not (root / ".codegraph" / "codegraph.db-wal").exists()
+    assert codegraph_ready(root)
+    snap = snapshot_codegraph(root, tmp_path / "run")
+    assert snap is not None
+    assert codegraph_routes(snap, root)[0]["route"] == "/a"
+    con = _connect(db)
+    try:
+        import pytest
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            con.execute("DELETE FROM nodes")
+    finally:
+        con.close()
+
+
+def test_connect_never_creates_missing_database(tmp_path):
+    from app.services.yasa_audit.discovery import _connect
+    import pytest
+
+    missing = tmp_path / "missing.db"
+    with pytest.raises(sqlite3.OperationalError):
+        _connect(missing)
+    assert not missing.exists()
