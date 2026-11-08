@@ -28,8 +28,9 @@ There is no list of frameworks to pick from. Work it out from this project's own
    field) selects which file / class / function, and where that mapping is written down (code, config
    files, naming conventions, schemas, dependency-injection bindings). A project often has several
    independent dispatchers (pages, REST, GraphQL, admin area, user area, ...); find each one.
-3. Spend at most about half of your budget on steps 1-2. For each dispatcher, write a small extractor
-   program and run it with run_extractor. The program applies the mapping to the whole project and prints
+3. Spend at most about half of your budget on steps 1-2 (run_probe runs a throwaway program when reading
+   is too slow; its output is not part of the surface). For each dispatcher, write a small extractor
+   program and run it with run_extractor: what an extractor prints IS the surface. The program applies the mapping to the whole project and prints
    every entry: where the code ends up (handler_file + handler + handler_line: the concrete function that
    runs and its first line, not an interface or a base class; for anonymous code such as a callback, the
    line where it starts), what the declaration says about access (auth), and exposure = the LEAST

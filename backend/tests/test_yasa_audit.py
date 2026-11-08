@@ -895,9 +895,10 @@ def test_reconcile_lets_the_access_agent_fix_its_resolver(tmp_path, monkeypatch)
                   ("finish", {"notes": "web/*.php"})],
         "reconcile": [("read_file", {"path": "web/Admin.php"}),
                       ("finish", {"notes": "too early"}),  # refused: G1 not settled
-                      ("settle", {"group": "G9", "verdict": "resolver_wrong", "reason": "x"}),  # no such group
-                      ("settle", {"group": "G1", "verdict": "resolver_wrong",
-                                  "reason": "web/Admin.php:3 require_admin() in the handler"}),
+                      ("settle", {"decisions": [{"group": "G9", "verdict": "resolver_wrong",
+                                                 "reason": "x"}]}),  # no such group
+                      ("settle", {"decisions": [{"group": "G1", "verdict": "resolver_wrong",
+                                                 "reason": "web/Admin.php:3 require_admin() in the handler"}]}),
                       ("write_access_resolver", {"code": reads_handler, "samples": [
                           {"route": "/admin", "handler_file": "web/Admin.php"},
                           {"route": "/home", "handler_file": "web/Home.php"}, {"route": "/x"}]}),
@@ -945,11 +946,12 @@ def test_extractor_regression_is_pointed_out_once(tmp_path):
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
     many = "import json\nprint(json.dumps([{'route': '/r%d' % i, 'handler_file': 'x'} for i in range(30)]))"
     few = "import json\nprint(json.dumps([{'route': '/r0', 'handler_file': 'x'}]))"
+    shrunk = lambda: [m for m in tb.extractor_regressions() if "earlier version" in m]  # noqa: E731
     tb.run_extractor("api", many)
-    assert tb.extractor_regressions() == []
+    assert shrunk() == []
     tb.run_extractor("api", few)
-    assert tb.extractor_regressions() == ["api now yields 1 entries, an earlier version yielded 30"]
-    assert tb.extractor_regressions() == []  # a smaller surface can be right: shown once
+    assert shrunk() == ["api now yields 1 entries, an earlier version yielded 30"]
+    assert shrunk() == []  # a smaller surface can be right: shown once
     tb.finish_gates = [(lambda t: True, lambda t: "dynamic message")]
     assert tb.finish("x") == "not finished: dynamic message"
 
@@ -964,3 +966,27 @@ def test_coverage_says_when_the_pattern_misses_most_handlers(tmp_path):
     assert res["handler_files_matched"] == 1 and res["handler_files"] == 12 and "says little" in res["note"]
     res = json.loads(tb.check_coverage(r"request->get"))
     assert res["handler_files_matched"] == 12 and "note" not in res
+
+
+def test_probe_output_is_not_surface_and_probe_extractors_are_flagged(tmp_path):
+    _write(tmp_path, {"r/a.ts": "router.get('/a', h)\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    out = tb.run_probe("import os,sys; print(sorted(os.listdir(os.path.join(sys.argv[1], 'r'))))")
+    assert "a.ts" in out and tb.entries() == []
+    tb.run_extractor("dbg", "import json; print(json.dumps([{'route': 'files: 3', 'handler_file': 'r/a.ts', "
+                            "'handler': 'nope'}, {'route': 'x', 'handler_file': 'r/a.ts', 'handler': 'nope2'}]))")
+    assert tb.extractor_regressions() == ["dbg: 2 of 2 entries do not resolve to code (fix it, or "
+                                          "drop_extractor if it was a probe)"]
+    assert tb.extractor_regressions() == []  # pointed out once
+    assert tb.drop_extractor("dbg") == "dropped dbg; total entries now 0"
+    assert tb.drop_extractor("dbg").startswith("error")
+
+
+def test_settle_takes_a_batch():
+    tb = Toolbox(AuditConfig(), Path("."), Path("/tmp"))
+    tb.reconcile_groups = {"G1": ["E1"], "G2": ["E2"], "G3": ["E3"]}
+    out = tb.settle([{"group": "G1", "verdict": "resolver_wrong", "reason": "a:1"},
+                     {"group": "G2", "verdict": "maybe"}, {"group": "G7", "verdict": "declared_wrong"}])
+    assert out == ("G2: verdict must be one of resolver_wrong, declared_wrong, inconsistent_code; unknown group "
+                   "'G7'; decided: 1; undecided: G2, G3")
+    assert tb.settle({"group": "G2", "verdict": "declared_wrong", "reason": "b:2"}).endswith("undecided: G3")

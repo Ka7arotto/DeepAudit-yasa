@@ -170,12 +170,13 @@ def _reconcile_message(entries: list[dict], applied: dict, code: str, model: dic
     msg = (f"The surface agent enumerated {len(entries)} entries and declared each one's exposure, "
            f"independently of you. Your resolver disagrees on {applied['disagreements']} of them and answers "
            f"unknown for {applied['unknown']}. The groups:\n" + "\n".join(rows) +
-           "\n\nFor each group G<n>, read the handler of a sample or two and settle it:\n"
+           "\n\nFirst settle every group G<n>, all in one settle call, after reading the handler of a sample "
+           "or two where you are not sure:\n"
            "- resolver_wrong (it misses a check, misreads a request shape, ...): the declared exposure stands;\n"
            "- declared_wrong: the resolver is right;\n"
            "- inconsistent_code: both follow real code that disagrees (a likely access-control bug).\n"
-           "Where the resolver is wrong or answers unknown and you can fix it within your budget, install the "
-           "fixed version with write_access_resolver (samples from these groups). Then finish.\n\n"
+           "Then, with the rest of your budget, fix the resolver where it is wrong or answers unknown and install "
+           "it with write_access_resolver (samples from these groups). Then finish.\n\n"
            + (access_model_text(model) + "\n\n" if model else "") + "Your current resolver:\n" + code)
     return msg, ids
 
@@ -191,8 +192,13 @@ def _reconcile(cfg: AuditConfig, out: Path, entries: list[dict], holder: dict, a
                         lambda t: "settle every group first; undecided: "
                                   + ", ".join(g for g in t.reconcile_groups if g not in t.decisions))]
     llm = holder.get("llm") or LLM(cfg)
+    settle_now = (lambda steps, t: steps >= cfg.reconcile_budget // 2 and any(g not in t.decisions
+                                                                               for g in t.reconcile_groups),
+                  lambda t: "Half of your budget is used: settle the undecided groups now, in one call: "
+                            + ", ".join(g for g in t.reconcile_groups if g not in t.decisions))
     res = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.reconcile_budget, deploy, product), msg,
-                    cfg.reconcile_budget, out / "transcript-reconcile.jsonl", deadline=deadline)
+                    cfg.reconcile_budget, out / "transcript-reconcile.jsonl", deadline=deadline,
+                    reminders=[settle_now])
     changed = tb.resolver_code != holder.get("resolver")
     holder["resolver"] = tb.resolver_code
     return {"steps": res.get("steps"), "finished": res.get("finished"), "resolver_changed": changed,

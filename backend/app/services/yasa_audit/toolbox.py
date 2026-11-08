@@ -416,6 +416,7 @@ class Toolbox:
     def _run_python(self, code: str, prefix: str, stdin: str = "", timeout: int = 180) -> tuple[bool, str]:
         """Run a program an agent wrote: `python -I <script> <project root>`, standard library only,
         in a scratch directory. Returns (ok, stdout) or (False, error text)."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=str(self.run_dir)))
         script = work / f"{prefix}.py"
         script.write_text(code)
@@ -487,6 +488,18 @@ class Toolbox:
             return res + ("; work it out from the access model" if "no resolver" in res else "")
         return json.dumps(res[0], ensure_ascii=False)
 
+    def run_probe(self, code: str) -> str:
+        """Run a throwaway Python program over the project (root in sys.argv[1]) and show its output.
+        Nothing it prints becomes part of the surface."""
+        ok, out = self._run_python(code, "probe", timeout=120)
+        return clip(out, 6000) or "(no output)"
+
+    def drop_extractor(self, name: str) -> str:
+        if self.extractors.pop(str(name), None) is None:
+            return f"error: no extractor {name!r}; extractors: {', '.join(self.extractors) or 'none'}"
+        self.extractor_best.pop(str(name), None)
+        return f"dropped {name}; total entries now {len(self.entries())}"
+
     def run_extractor(self, name: str, code: str) -> str:
         """Run a Python program the agent wrote. It receives the project root as sys.argv[1] and must
         print a JSON list of entries. The result replaces any earlier extractor of the same name."""
@@ -530,10 +543,16 @@ class Toolbox:
         pointed out to the agent. Each is pointed out once: a smaller surface can be the right answer."""
         out = []
         for name, best in self.extractor_best.items():
-            now = len(self.extractors.get(name, {}).get("entries", []))
+            es = self.extractors.get(name, {}).get("entries", [])
+            now = len(es)
             if best - now > max(5, best // 5) and (name, now) not in self.regressions_shown:
                 self.regressions_shown.add((name, now))
                 out.append(f"{name} now yields {now} entries, an earlier version yielded {best}")
+            bad = sum(self._check_entry(e) is not None for e in es)
+            if now and bad * 2 > now and (name, "unresolved", now) not in self.regressions_shown:
+                self.regressions_shown.add((name, "unresolved", now))
+                out.append(f"{name}: {bad} of {now} entries do not resolve to code (fix it, or drop_extractor "
+                           "if it was a probe)")
         return out
 
     def add_entries(self, entries: list[dict]) -> str:
@@ -610,15 +629,23 @@ class Toolbox:
 
     SETTLE_VERDICTS = ("resolver_wrong", "declared_wrong", "inconsistent_code")
 
-    def settle(self, group: str, verdict: str, reason: str = "") -> str:
-        """Decide one group of disagreements between the resolver and the declared exposure."""
-        if group not in self.reconcile_groups:
-            return f"error: unknown group {group!r}; groups: {', '.join(self.reconcile_groups)}"
-        if verdict not in self.SETTLE_VERDICTS:
-            return f"error: verdict must be one of {', '.join(self.SETTLE_VERDICTS)}"
-        self.decisions[group] = {"verdict": verdict, "reason": str(reason)[:400]}
+    def settle(self, decisions: Any) -> str:
+        """Decide groups of disagreements between the resolver and the declared exposure, in one call."""
+        if isinstance(decisions, dict):
+            decisions = [decisions]
+        errors = []
+        for d in decisions if isinstance(decisions, list) else []:
+            d = d if isinstance(d, dict) else {}
+            g, v = str(d.get("group", "")), d.get("verdict")
+            if g not in self.reconcile_groups:
+                errors.append(f"unknown group {g!r}")
+            elif v not in self.SETTLE_VERDICTS:
+                errors.append(f"{g}: verdict must be one of {', '.join(self.SETTLE_VERDICTS)}")
+            else:
+                self.decisions[g] = {"verdict": v, "reason": str(d.get("reason", ""))[:400]}
         left = [g for g in self.reconcile_groups if g not in self.decisions]
-        return f"{group}: {verdict}" + (f"; undecided: {', '.join(left)}" if left else "; all groups decided")
+        return "; ".join(errors + [f"decided: {len(self.decisions)}",
+                                   f"undecided: {', '.join(left)}" if left else "all groups decided"])
 
     def record_access_model(self, **model: Any) -> str:
         """The project-wide model of how requests are authenticated and authorized (recon stage)."""
@@ -723,13 +750,14 @@ def tool_schemas(role: str) -> list[dict]:
                "on your samples now, and later on every entry and by reviewers.",
                {"code": s, "samples": {"type": "array", "items": req}}, ["code", "samples"]),
             fn("settle",
-               "Only when asked to reconcile: decide one group of disagreements. resolver_wrong: the declared "
-               "exposure is right (fix the resolver too if you can); declared_wrong: the resolver is right; "
-               "inconsistent_code: both readings follow real code that disagrees (a likely access-control bug).",
-               {"group": s, "verdict": {"type": "string", "enum": ["resolver_wrong", "declared_wrong",
-                                                                   "inconsistent_code"]},
-                "reason": {"type": "string", "description": "the code that decides it (file:line)"}},
-               ["group", "verdict", "reason"]),
+               "Only when asked to reconcile: decide groups of disagreements, all in one call. resolver_wrong: "
+               "the declared exposure is right; declared_wrong: the resolver is right; inconsistent_code: both "
+               "readings follow real code that disagrees (a likely access-control bug).",
+               {"decisions": {"type": "array", "items": {"type": "object", "properties": {
+                   "group": s, "verdict": {"type": "string", "enum": ["resolver_wrong", "declared_wrong",
+                                                                      "inconsistent_code"]},
+                   "reason": {"type": "string", "description": "the code that decides it (file:line)"}},
+                   "required": ["group", "verdict", "reason"]}}}, ["decisions"]),
             fn("record_access_model",
                "Record how THIS project authenticates and authorizes requests, once, before finish. "
                "Reviewers of every entry rely on it instead of re-reading the security chain.",
@@ -751,6 +779,11 @@ def tool_schemas(role: str) -> list[dict]:
         tools += [
             fn("codegraph_routes", "Routes that codegraph's framework resolvers recognised. Evidence only: "
                "may be empty or incomplete for this project.", {"contains": s, "limit": i}, []),
+            fn("run_probe", "Run a throwaway Python 3 program (standard library; project root in sys.argv[1]) "
+               "to explore the code, e.g. list files or test a regex; prints its output. Nothing becomes an "
+               "entry: use it instead of run_extractor while you are still finding out.", {"code": s}, ["code"]),
+            fn("drop_extractor", "Remove an extractor and its entries (e.g. one used as a probe).",
+               {"name": s}, ["name"]),
             fn("run_extractor",
                "Run a Python 3 program you wrote that enumerates entries of THIS project. It gets the "
                "project root as sys.argv[1], may read any file there (standard library only, no network) "
