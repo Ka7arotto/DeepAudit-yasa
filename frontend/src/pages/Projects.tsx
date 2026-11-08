@@ -43,8 +43,7 @@ import { uploadZipFile, getZipFileInfo, type ZipFileMeta } from "@/shared/utils/
 import { isRepositoryProject, isZipProject, getSourceTypeBadge } from "@/shared/utils/projectUtils";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
-import CreateTaskDialog from "@/components/audit/CreateTaskDialog";
-import TerminalProgressDialog from "@/components/audit/TerminalProgressDialog";
+import CreateAgentTaskDialog from "@/components/agent/CreateAgentTaskDialog";
 import { SUPPORTED_LANGUAGES, REPOSITORY_PLATFORMS } from "@/shared/constants";
 
 export default function Projects() {
@@ -53,9 +52,6 @@ export default function Projects() {
   const [searchTerm, setSearchTerm] = useState("");
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [showCreateTaskDialog, setShowCreateTaskDialog] = useState(false);
-  const [selectedProjectForTask, setSelectedProjectForTask] = useState<string>("");
-  const [showTerminal, setShowTerminal] = useState(false);
-  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -128,10 +124,6 @@ export default function Projects() {
     }
   };
 
-  const handleFastScanStarted = (taskId: string) => {
-    setCurrentTaskId(taskId);
-    setShowTerminal(true);
-  };
 
   const handleCreateProject = async () => {
     if (!createForm.name.trim()) {
@@ -286,8 +278,7 @@ export default function Projects() {
     return new Date(dateString).toLocaleDateString('zh-CN');
   };
 
-  const handleCreateTask = (projectId: string) => {
-    setSelectedProjectForTask(projectId);
+  const handleCreateTask = () => {
     setShowCreateTaskDialog(true);
   };
 
@@ -395,12 +386,6 @@ export default function Projects() {
     }
   };
 
-  const handleTaskCreated = () => {
-    toast.success("审计任务已创建", {
-      description: '因为网络和代码文件大小等因素，审计时长通常至少需要1分钟，请耐心等待...',
-      duration: 5000
-    });
-  };
 
   if (loading) {
     return (
@@ -898,7 +883,7 @@ export default function Projects() {
                     <ArrowUpRight className="w-3 h-3 ml-auto" />
                   </Button>
                 </Link>
-                <Button size="sm" className="cyber-btn-primary h-8 text-xs" onClick={() => handleCreateTask(project.id)}>
+                <Button size="sm" className="cyber-btn-primary h-8 text-xs" onClick={() => handleCreateTask()}>
                   <Shield className="w-3 h-3 mr-2" />
                   审计
                 </Button>
@@ -935,20 +920,9 @@ export default function Projects() {
       </div>
 
       {/* Create Task Dialog */}
-      <CreateTaskDialog
+      <CreateAgentTaskDialog
         open={showCreateTaskDialog}
         onOpenChange={setShowCreateTaskDialog}
-        onTaskCreated={handleTaskCreated}
-        onFastScanStarted={handleFastScanStarted}
-        preselectedProjectId={selectedProjectForTask}
-      />
-
-      {/* Terminal Progress Dialog for Fast Scan */}
-      <TerminalProgressDialog
-        open={showTerminal}
-        onOpenChange={setShowTerminal}
-        taskId={currentTaskId}
-        taskType="repository"
       />
 
       {/* Edit Dialog */}

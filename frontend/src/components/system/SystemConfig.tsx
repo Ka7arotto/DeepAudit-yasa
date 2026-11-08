@@ -17,7 +17,6 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/api/database";
-import EmbeddingConfig from "@/components/agent/EmbeddingConfig";
 import { generateSSHKey, getSSHKey, deleteSSHKey, testSSHKey, clearKnownHosts } from "@/shared/api/sshKeys";
 
 // LLM Providers - 2025
@@ -387,9 +386,6 @@ export function SystemConfig() {
           <TabsTrigger value="llm" className="data-[state=active]:bg-primary data-[state=active]:text-foreground font-mono font-bold uppercase py-2.5 text-muted-foreground transition-all rounded text-xs flex items-center gap-2">
             <Zap className="w-3 h-3" /> LLM 配置
           </TabsTrigger>
-          <TabsTrigger value="embedding" className="data-[state=active]:bg-primary data-[state=active]:text-foreground font-mono font-bold uppercase py-2.5 text-muted-foreground transition-all rounded text-xs flex items-center gap-2">
-            <Brain className="w-3 h-3" /> 嵌入模型
-          </TabsTrigger>
           <TabsTrigger value="analysis" className="data-[state=active]:bg-primary data-[state=active]:text-foreground font-mono font-bold uppercase py-2.5 text-muted-foreground transition-all rounded text-xs flex items-center gap-2">
             <Settings className="w-3 h-3" /> 分析参数
           </TabsTrigger>
@@ -716,11 +712,6 @@ export function SystemConfig() {
             <p className="text-muted-foreground">• <strong className="text-muted-foreground">原生适配器</strong>: 百度、MiniMax、豆包因 API 格式特殊，使用专用适配器</p>
             <p className="text-muted-foreground">• <strong className="text-muted-foreground">API 中转站</strong>: 在 Base URL 填入中转站地址即可，API Key 填中转站提供的 Key</p>
           </div>
-        </TabsContent>
-
-        {/* Embedding Config */}
-        <TabsContent value="embedding" className="space-y-6">
-          <EmbeddingConfig />
         </TabsContent>
 
         {/* Analysis Parameters */}

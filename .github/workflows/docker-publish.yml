@@ -19,11 +19,6 @@ on:
         required: false
         type: boolean
         default: true
-      build_sandbox:
-        description: '构建沙箱镜像'
-        required: false
-        type: boolean
-        default: true
 
 jobs:
   build-and-push:
@@ -101,19 +96,6 @@ jobs:
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
 
-      - name: 构建并推送沙箱 Docker 镜像
-        if: ${{ github.event.inputs.build_sandbox == 'true' }}
-        uses: docker/build-push-action@v5
-        with:
-          context: ./docker/sandbox
-          file: ./docker/sandbox/Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/deepaudit-sandbox:${{ github.event.inputs.tag }}
-          cache-from: type=gha,scope=sandbox
-          cache-to: type=gha,mode=max,scope=sandbox
-
       - name: 输出镜像信息
         run: |
           echo "## 镜像已推送到 GHCR" >> $GITHUB_STEP_SUMMARY
@@ -123,7 +105,4 @@ jobs:
           fi
           if [ "${{ github.event.inputs.build_backend }}" == "true" ]; then
             echo "- \`ghcr.io/${{ github.repository_owner }}/deepaudit-backend:${{ github.event.inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          fi
-          if [ "${{ github.event.inputs.build_sandbox }}" == "true" ]; then
-            echo "- \`ghcr.io/${{ github.repository_owner }}/deepaudit-sandbox:${{ github.event.inputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
           fi

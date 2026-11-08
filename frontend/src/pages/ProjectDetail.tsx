@@ -23,7 +23,6 @@ import {
   CheckCircle,
   Clock,
   XCircle,
-  FileText,
   Upload,
   GitBranch,
   Terminal
@@ -35,8 +34,7 @@ import { getAgentTasks, updateAgentFinding } from "@/shared/api/agentTasks";
 import { apiClient } from "@/shared/api/serverClient";
 import { isRepositoryProject, getSourceTypeLabel, getRepositoryPlatformLabel } from "@/shared/utils/projectUtils";
 import { toast } from "sonner";
-import CreateTaskDialog from "@/components/audit/CreateTaskDialog";
-import TerminalProgressDialog from "@/components/audit/TerminalProgressDialog";
+import CreateAgentTaskDialog from "@/components/agent/CreateAgentTaskDialog";
 import { SUPPORTED_LANGUAGES, REPOSITORY_PLATFORMS } from "@/shared/constants";
 import type { AggregatedAgentFinding, AggregatedAuditIssue, IssuesSummary, LatestProblem, UnifiedTask } from "@/shared/types";
 import {
@@ -55,8 +53,6 @@ export default function ProjectDetail() {
   const [agentTasks, setAgentTasks] = useState<AgentTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreateTaskDialog, setShowCreateTaskDialog] = useState(false);
-  const [showTerminalDialog, setShowTerminalDialog] = useState(false);
-  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<CreateProjectForm>({
     name: "",
     description: "",
@@ -334,11 +330,7 @@ export default function ProjectDetail() {
 
   const handleStatusChange = async (problem: LatestProblem, newStatus: string) => {
     try {
-      if (problem.kind === "agent") {
-        await updateAgentFinding(problem.task_id, problem.id, { status: newStatus });
-      } else {
-        await api.updateAuditIssue(problem.task_id, problem.id, { status: newStatus } as any);
-      }
+      await updateAgentFinding(problem.task_id, problem.id, { status: newStatus });
       toast.success("状态已更新");
       await loadLatestIssues();
     } catch (error) {
@@ -396,7 +388,7 @@ export default function ProjectDetail() {
       setLoading(true);
       const [projectRes, auditTasksRes, agentTasksRes] = await Promise.allSettled([
         api.getProjectById(id),
-        api.getAuditTasks(id),
+        Promise.resolve([]),
         getAgentTasks({ project_id: id })
       ]);
 
@@ -526,18 +518,7 @@ export default function ProjectDetail() {
     setShowCreateTaskDialog(true);
   };
 
-  const handleTaskCreated = () => {
-    toast.success("审计任务已创建", {
-      description: '因为网络和代码文件大小等因素，审计时长通常至少需要1分钟，请耐心等待...',
-      duration: 5000
-    });
-    loadProjectData();
-  };
 
-  const handleFastScanStarted = (taskId: string) => {
-    setCurrentTaskId(taskId);
-    setShowTerminalDialog(true);
-  };
 
   if (loading) {
     return (
@@ -907,20 +888,9 @@ export default function ProjectDetail() {
       </Tabs>
 
       {/* 创建任务对话框 */}
-      <CreateTaskDialog
+      <CreateAgentTaskDialog
         open={showCreateTaskDialog}
         onOpenChange={setShowCreateTaskDialog}
-        onTaskCreated={handleTaskCreated}
-        onFastScanStarted={handleFastScanStarted}
-        preselectedProjectId={id}
-      />
-
-      {/* 终端进度对话框 */}
-      <TerminalProgressDialog
-        open={showTerminalDialog}
-        onOpenChange={setShowTerminalDialog}
-        taskId={currentTaskId}
-        taskType="repository"
       />
     </div>
   );

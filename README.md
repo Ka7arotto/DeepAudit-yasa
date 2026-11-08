@@ -4,14 +4,14 @@
 [YASA-Engine](https://github.com/antgroup/YASA-Engine) 污点规则并运行引擎，再在多个小上下文里分组复核引擎结果和残余危险调用；
 同时用确定性的路由表做权限（访问控制）审计。整个审计有时间预算，默认 30 分钟内完成；超出预算没审到的候选会列出来。
 
-原有的 Multi-Agent 审计、快速扫描、项目管理、报告等功能保持不变，和新模式并存。
-上游 README 见 [README_EN.md](README_EN.md) / [README_JA.md](README_JA.md)（内容与上游一致，不包含本分支的改动）。
+本分支只保留上游的平台部分（登录、项目管理、任务、发现、报告、Web 界面），YASA 混合审计是唯一的审计模式。
+上游的 Multi-Agent 审计、RAG、Docker 沙箱、快速扫描、即时分析、提示词/规则管理已移除。
 
 ---
 
 ## 目录
 
-- [两种审计引擎](#两种审计引擎)
+- [与上游的区别](#与上游的区别)
 - [实测结果](#实测结果)
 - [从源码部署](#从源码部署)
 - [使用](#使用)
@@ -20,9 +20,9 @@
 - [开发与测试](#开发与测试)
 - [许可证与致谢](#许可证与致谢)
 
-## 两种审计引擎
+## 与上游的区别
 
-| | Agent（上游） | YASA 混合（本分支） |
+| | 上游 DeepAudit（Multi-Agent，已移除） | YASA 混合（本分支） |
 |---|---|---|
 | 思路 | Orchestrator 调度 Recon / Analysis / Verification Agent 自主审计 | 固定流水线：建规则 → 引擎 → 分组复核；并行做权限审计 |
 | 数据流 | Agent 自己沿 source → sink 追踪 | YASA 引擎找污点路径，Agent 只负责"写规则"和"判定" |
@@ -77,7 +77,6 @@ YASA 混合审计的流程（`backend/app/services/yasa_audit/`）：
 | PostgreSQL | 15+ | 数据库 |
 | curl、unzip、tar | — | 安装 YASA 工具（源码安装另需 git） |
 | Redis | 可选 | 启动时检查，缺失不影响使用 |
-| Docker | 可选 | 只有 Agent 模式的沙箱验证需要；YASA 模式不需要 |
 
 YASA 混合审计支持 **Linux x86_64、macOS Apple Silicon（ARM64）和 macOS Intel（x86_64）**。
 安装脚本和后端按本机平台选择官方工具包；macOS 不需要 Docker 或 Rosetta。
@@ -177,10 +176,10 @@ pnpm dev                         # http://localhost:5173
 ### 网页
 
 1. "项目管理"里新建项目：Git 仓库地址，或者上传 ZIP。
-2. 首页（Agent 审计）在终端里输入 `audit`，或者在"审计任务"页新建任务。
-3. 引擎选 **YASA Hybrid**；"产品上下文"里写明哪些入口按设计公开、有哪些角色
+2. 首页在终端里输入 `audit`，或者在项目页点"新建审计"。
+3. "产品上下文"里写明哪些入口按设计公开、有哪些角色
    （例如"公开 /login、/search；角色 admin / user"），可以明显减少权限审计的误报。
-4. 任务页实时显示阶段事件；完成后发现列表、状态流转和报告导出都和 Agent 任务一样使用。
+4. 任务页实时显示阶段事件；完成后发现列表、状态流转和报告导出照常使用。
    结论中的 confirmed / likely 换算为置信度（0.85 / 0.6，likely 严重度降一级），不会标成"已验证"。
 5. 规则、SARIF、每个 Agent 的对话记录和未审清单（`not_reviewed`）保存在 `YASA_AUDIT_RUNS_DIR/<任务 ID>/`。
 
@@ -239,7 +238,7 @@ uv run python -m app.services.yasa_audit authz /path/to/project --out out-authz/
   PHP 的引擎入口：YASA 的 PHP 分析器会忽略 ruleConfig 里的自定义入口（检查器收集了，分析器从不执行），只自动识别 `*Service`
   类的公开方法等几种约定。流水线因此在引擎副本里把入口脚本的顶层代码包装成 `YasaEntry*Service::run()`（行号不变），
   并把项目自己的 `*Service` 类改名，避免它们也被当成入口。
-- Go：YASA 引擎支持，但流水线还没有为 Go 写危险调用清单、路由提取和规则手册，请先用 Agent 模式。
+- Go：YASA 引擎支持，但流水线还没有为 Go 写危险调用清单、路由提取和规则手册。
 - 结论是静态判定，没有执行验证；报告里附带了路径和证据，需要的话请人工复现。
 - 大型 Spring 项目上引擎受内存限制（见上文），而且自定义入口方案还没跑通，这时数据流阶段主要靠残余危险调用复核。
 - 时间预算优先：预算用完时剩下的候选不再复核，任务页会提示数量，清单在运行目录里。
@@ -250,7 +249,7 @@ uv run python -m app.services.yasa_audit authz /path/to/project --out out-authz/
   YASA 能自动识别的 `*Service::run()`。SuiteCRM（76 万行）因此能在 2.5 分钟内跑完污点分析，之前整库调用图 15 分钟都建不完。
   前端控制器通过动态分发（如 `index.php?module=&action=`）到达的代码不在静态切片里，需要建规则的 Agent 补充，数据流复核也只能覆盖一部分，
   其余列在未审清单里。
-- 和 Agent 模式一样遵守项目的排除规则（默认 `node_modules/**`、`.git/**`、`dist/**`、`build/**`、`*.log`）和"指定文件"。
+- 遵守项目的排除规则（默认 `node_modules/**`、`.git/**`、`dist/**`、`build/**`、`*.log`）和"指定文件"。
   只选部分文件时，跨到未选文件的数据流和路由注册（例如 Express 的 `server.ts`）会看不到，召回会下降。
 
 ## 开发与测试
@@ -273,8 +272,7 @@ backend/app/services/yasa_audit/     YASA 混合审计（pipeline / entrypoints 
   task.py                            DeepAudit 任务入口（agent_tasks.py 中 audit_mode=yasa 时调用）
 backend/scripts/setup_yasa.sh        YASA 工具安装
 backend/benchmarks/yasa_audit/       靶场、真值、评分、实验记录
-frontend/src/components/agent/CreateAgentTaskDialog.tsx   引擎选择（首页）
-frontend/src/components/audit/CreateTaskDialog.tsx        审计模式选择（审计任务页）
+frontend/src/components/agent/CreateAgentTaskDialog.tsx   新建审计对话框
 ```
 
 ## 许可证与致谢

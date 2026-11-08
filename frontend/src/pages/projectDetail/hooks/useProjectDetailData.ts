@@ -27,7 +27,7 @@ export function useProjectDetailData(projectId: string | undefined) {
 
       const [projectRes, auditTasksRes, agentTasksRes] = await Promise.allSettled([
         api.getProjectById(projectId),
-        api.getAuditTasks(projectId),
+        Promise.resolve([]),
         getAgentTasks({ project_id: projectId }),
       ]);
 
