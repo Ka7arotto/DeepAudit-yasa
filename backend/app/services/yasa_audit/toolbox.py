@@ -202,6 +202,7 @@ class Toolbox:
         self.manual: list[dict] = []
         self.coverage: dict | None = None
         self.access_model: dict | None = None
+        self.resolver_code: str | None = None  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
 
@@ -407,26 +408,83 @@ class Toolbox:
                     f"auth={e.get('auth', '?')} exposure={e['exposure']}"
                     for e in rnd.sample(ok, min(8, len(ok)))]}
 
+    def _run_python(self, code: str, prefix: str, stdin: str = "", timeout: int = 180) -> tuple[bool, str]:
+        """Run a program an agent wrote: `python -I <script> <project root>`, standard library only,
+        in a scratch directory. Returns (ok, stdout) or (False, error text)."""
+        work = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=str(self.run_dir)))
+        script = work / f"{prefix}.py"
+        script.write_text(code)
+        env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
+        try:
+            r = subprocess.run([sys.executable, "-I", str(script), str(self.root)], capture_output=True,
+                               text=True, timeout=timeout, cwd=work, env=env, input=stdin)
+        except subprocess.TimeoutExpired:
+            return False, f"error: program ran longer than {timeout} s"
+        if r.returncode:
+            return False, clip(f"error: program exited {r.returncode}\n{r.stderr[-3000:]}", 4000)
+        return True, r.stdout
+
+    def resolve_access(self, requests: list[dict], code: str | None = None) -> list[dict] | str:
+        """Run the who-can-call program on [{method, route}]; a list of results in the same order, or
+        an error text. Each result: least_privileged (public|authenticated|privileged|denied|unknown),
+        principals (list), rule (where the decision comes from)."""
+        code = code or self.resolver_code
+        if not code:
+            return "error: no resolver"
+        reqs = [{"method": str(r.get("method") or "GET").upper(), "route": str(r.get("route") or "")}
+                for r in requests]
+        ok, out = self._run_python(code, "resolver", json.dumps(reqs), timeout=120)
+        if not ok:
+            return out
+        try:
+            res = json.loads(out)
+        except json.JSONDecodeError as e:
+            return clip(f"error: stdout is not JSON ({e}); first bytes: {out[:300]!r}", 2000)
+        if not isinstance(res, list) or len(res) != len(reqs):
+            return f"error: expected a JSON list of {len(reqs)} results (one per request, same order)"
+        clean = []
+        for r in res:
+            r = r if isinstance(r, dict) else {}
+            lp = str(r.get("least_privileged") or "unknown")
+            clean.append({"least_privileged": lp if lp in (*EXPOSURES, "denied") else "unknown",
+                          "principals": [str(p) for p in (r.get("principals") or [])][:8],
+                          "rule": str(r.get("rule") or "")[:200]})
+        return clean
+
+    def write_access_resolver(self, code: str, samples: Any) -> str:
+        """Install the who-can-call program after running it on sample requests."""
+        samples = [x for x in (samples or []) if isinstance(x, dict) and x.get("route")]
+        if len(samples) < 3:
+            return "rejected: give at least 3 sample requests {method, route}, of different privilege levels"
+        res = self.resolve_access(samples, code)
+        if isinstance(res, str):
+            return res
+        self.resolver_code = code
+        (self.run_dir / "resolver.py").write_text(code)
+        rows = [f"{s.get('method', 'GET')} {s['route']} -> {r['least_privileged']} {r['principals']} ({r['rule']})"
+                for s, r in zip(samples, res, strict=True)]
+        unknown = sum(r["least_privileged"] == "unknown" for r in res)
+        return clip("resolver installed. Check each result against the code you read; fix and resend if any is "
+                    f"wrong{' (unknown results: ' + str(unknown) + ')' if unknown else ''}:\n" + "\n".join(rows))
+
+    def who_can_call(self, method: str, path: str) -> str:
+        res = self.resolve_access([{"method": method, "route": path}])
+        if isinstance(res, str):
+            return res + ("; work it out from the access model" if "no resolver" in res else "")
+        return json.dumps(res[0], ensure_ascii=False)
+
     def run_extractor(self, name: str, code: str) -> str:
         """Run a Python program the agent wrote. It receives the project root as sys.argv[1] and must
         print a JSON list of entries. The result replaces any earlier extractor of the same name."""
         if not re.fullmatch(r"[\w-]{1,40}", str(name)):
             return "error: name must be 1-40 letters, digits, '-' or '_'"
-        work = Path(tempfile.mkdtemp(prefix="extractor-", dir=str(self.run_dir)))
-        script = work / f"{name}.py"
-        script.write_text(code)
-        env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
+        ok, out = self._run_python(code, "extractor")
+        if not ok:
+            return out
         try:
-            r = subprocess.run([sys.executable, "-I", str(script), str(self.root)], capture_output=True,
-                               text=True, timeout=180, cwd=work, env=env)
-        except subprocess.TimeoutExpired:
-            return "error: extractor ran longer than 180 s"
-        if r.returncode:
-            return clip(f"error: extractor exited {r.returncode}\n{r.stderr[-3000:]}", 4000)
-        try:
-            raw = json.loads(r.stdout)
+            raw = json.loads(out)
         except json.JSONDecodeError as e:
-            return clip(f"error: stdout is not JSON ({e}); first bytes: {r.stdout[:300]!r}", 2000)
+            return clip(f"error: stdout is not JSON ({e}); first bytes: {out[:300]!r}", 2000)
         entries, problems = self._clean(raw, f"extractor:{name}")
         prev = self.extractors.get(name)
         self.extractors[name] = {"code": code, "entries": entries}
@@ -603,8 +661,18 @@ def tool_schemas(role: str) -> list[dict]:
         "auth": {"type": "string", "description": "what the code/config says about authentication or "
                  "authorization for this entry, verbatim where possible"},
         "exposure": {"type": "string", "enum": list(EXPOSURES)}}}
+    req = {"type": "object", "properties": {"method": s, "route": s}}
     if role == "access":
         tools += [
+            fn("write_access_resolver",
+               "Install a who-can-call program: Python 3 (standard library only) that gets the project root "
+               "as sys.argv[1], reads a JSON list of requests [{method, route}] from stdin and prints a JSON "
+               "list with one result per request, same order: {least_privileged: public|authenticated|"
+               "privileged|denied|unknown, principals: [roles or principal kinds allowed], rule: where the "
+               "decision comes from (file:line or config key)}. It applies the project's real access rules "
+               "(route tables, role definitions, middleware or filter order) as you read them. It is run on "
+               "your samples now, and later on every entry and by reviewers.",
+               {"code": s, "samples": {"type": "array", "items": req}}, ["code", "samples"]),
             fn("record_access_model",
                "Record how THIS project authenticates and authorizes requests, once, before finish. "
                "Reviewers of every entry rely on it instead of re-reading the security chain.",
@@ -691,6 +759,8 @@ def tool_schemas(role: str) -> list[dict]:
                 "verdict": {"type": "string", "enum": ["confirmed", "likely"]}},
                ["vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege",
                 "verdict", "route_evidence", "impact"]),
+            fn("who_can_call", "Who can call a request (method, path) under the project's access rules, "
+               "computed by the access agent's resolver program.", {"method": s, "path": s}, ["method", "path"]),
             fn("add_fact", "Share a project fact other reviewers can rely on: one claim, at most 240 "
                "characters (e.g. how a helper escapes, that all data access goes through a typed query API, "
                "which base class enforces login). Rejected unless each quote is found at file:line.",
