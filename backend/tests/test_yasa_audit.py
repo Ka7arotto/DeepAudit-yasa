@@ -662,3 +662,28 @@ def test_recon_sends_access_model_to_the_surface_agent(tmp_path, monkeypatch):
     m = pipeline.recon(AuditConfig(), tmp_path, tmp_path / "recon")
     assert m["access_model"]["principals"] == "anon < admin" and m["access_agent"]["finished"]
     assert any("access-control model is ready" in u and "anon < admin" in u for msgs in surface_msgs for u in msgs)
+
+
+def test_generic_handlers_are_reviewed_per_resource():
+    from app.services.yasa_audit.pipeline import SPLIT_ROUTES, _resource_key, _units
+
+    assert _resource_key("/apis/g/v1/posts/{name}/status") == "/apis/g/v1/posts"
+    assert _resource_key("/V1/carts/:cartId/items") == "/V1/carts"
+    entries, n = [], 0
+    for res, exp in (("posts", "public"), ("users", "privileged"), ("menus", "privileged")):
+        for verb, h in (("GET", "Get"), ("PUT", "Update"), ("DELETE", "Delete")):
+            n += 1
+            entries.append({"id": f"E{n}", "route": f"/apis/g/v1/{res}/{{name}}", "method": verb,
+                            "handler_file": f"x/Extension{h}Handler.java", "handler": "handle",
+                            "exposure": exp if verb == "GET" else "privileged"})
+    entries += [dict(e, id=f"X{i}", route=e["route"].replace("/g/", f"/g{i}/"))
+                for i in range(SPLIT_ROUTES) for e in entries[:3]]  # every generic handler > SPLIT_ROUTES
+    entries.append({"id": "S1", "route": "/login", "handler_file": "Login.java", "handler": "login",
+                    "exposure": "public"})
+    units = _units(entries)
+    posts = next(u for u in units if u["entries"][0]["route"] == "/apis/g/v1/posts/{name}")
+    assert posts["generic"] and len(posts["entries"]) == 3 and len(posts["handlers"]) == 3
+    assert posts["exposure"] == "public"
+    users = next(u for u in units if u["entries"][0]["route"] == "/apis/g/v1/users/{name}")
+    assert users["exposure"] == "privileged"  # not dragged to public by the posts routes
+    assert not next(u for u in units if u["entries"][0]["id"] == "S1")["generic"]

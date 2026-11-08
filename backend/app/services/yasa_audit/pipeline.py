@@ -169,16 +169,48 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
 
 # ----------------------------------------------------------------- review
 
+SPLIT_ROUTES = 8  # a handler serving more routes than this is generic: review it per resource
+
+
+def _resource_key(route: str) -> str:
+    """The route without its parameters and trailing id-like segments: /apis/g/v1/posts/{name}/x -> /apis/g/v1/posts."""
+    parts = [p for p in re.split(r"[/?]", route or "") if p]
+    while parts and (parts[-1].startswith(("{", ":", "<", "*")) or "{" in parts[-1]):
+        parts.pop()
+    keep = []
+    for p in parts:
+        if p.startswith(("{", ":", "<", "*")):
+            break
+        keep.append(p)
+    return "/" + "/".join(keep)
+
+
 def _units(entries: list[dict]) -> list[dict]:
-    """One unit per handler (several routes can run the same code), most exposed first."""
+    """One unit per handler (several routes can run the same code), most exposed first.
+
+    A generic handler (one function serving many resources, e.g. a CRUD dispatcher) is split into one
+    unit per resource: access control and object ownership differ per resource, and one context cannot
+    judge dozens of them.
+    """
     by_handler: dict[tuple, list[dict]] = {}
     for e in entries:
         by_handler.setdefault((e.get("handler_file") or "", e.get("handler") or "", e.get("route")
                                if not e.get("handler_file") else ""), []).append(e)
-    units = []
+    groups: list[tuple[str, str, list[dict], bool]] = []
+    by_res: dict[str, list[dict]] = {}  # routes of generic handlers, by resource (all their verbs together)
     for (hf, h, _), es in by_handler.items():
+        if len(es) > SPLIT_ROUTES:
+            for e in es:
+                by_res.setdefault(_resource_key(e.get("route", "")), []).append(e)
+        else:
+            groups.append((hf, h, es, False))
+    for es in by_res.values():
+        groups.append((es[0].get("handler_file") or "", es[0].get("handler") or "", es, True))
+    units = []
+    for hf, h, es, generic in groups:
         exp = min((e.get("exposure", "unknown") for e in es), key=lambda x: EXPOSURE_RANK.get(x, 1))
-        units.append({"handler_file": hf, "handler": h, "exposure": exp, "entries": es,
+        units.append({"handler_file": hf, "handler": h, "exposure": exp, "entries": es, "generic": generic,
+                      "handlers": sorted({f"{e.get('handler_file')}::{e.get('handler')}" for e in es}),
                       "resolved": all(e.get("resolved", True) for e in es)})
     units.sort(key=lambda u: (EXPOSURE_RANK.get(u["exposure"], 1), not u["resolved"],
                               u["entries"][0].get("route", "")))
@@ -227,6 +259,10 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
                                                      "declared_at") if e.get(k)} for e in unit["entries"][:20]],
                   "more_routes": max(0, len(unit["entries"]) - 20),
                   "handler_file": unit["handler_file"], "handler": unit["handler"]}
+    if unit.get("generic"):
+        entry_view["handlers"] = unit["handlers"][:10]
+        entry_view["note"] = ("these handlers are shared by many resources; review them for the resource of "
+                              "these routes only (its access rules, ownership and stored data)")
     peers = _peers(unit, entries)
     user = "\n\n".join(x for x in (
         "Entry to review:\n" + json.dumps(entry_view, ensure_ascii=False),
