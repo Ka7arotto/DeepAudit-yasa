@@ -285,8 +285,20 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
         facts.prompt_block(),
         issues.prompt_block() if issues is not None else "",
         _handler_snippet(root, unit)) if x)
+    seen_facts = {f["id"] for f in facts.facts}
+    seen_issues = {i["id"] for i in issues.issues} if issues is not None else set()
+
+    def updates() -> str | None:
+        """What other units verified or reported since this one started (units run in parallel)."""
+        nf = facts.since(seen_facts, uid)
+        ni = issues.since(seen_issues, uid) if issues is not None else []
+        rows = [f"- {f['id']}: {f['statement']}" for f in nf]
+        rows += [f"- {i['id']} ({i['cwe']}, {i['where']}): {i['root_cause']} -> use same_as={i['id']} if this "
+                 "entry has the same root cause" for i in ni]
+        return ("New from reviewers working in parallel:\n" + "\n".join(rows)) if rows else None
+
     res = run_agent(llm, tb, tool_schemas("review"), system, user, cfg.review_budget, out / "transcript.jsonl",
-                    deadline=deadline)
+                    deadline=deadline, updates=updates)
     for x in tb.findings + tb.cards:
         x["entries"] = [e["id"] for e in unit["entries"]]
         x["handler"] = f"{unit['handler_file']}::{unit['handler']}"

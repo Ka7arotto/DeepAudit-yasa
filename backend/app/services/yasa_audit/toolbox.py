@@ -113,6 +113,13 @@ class FactBook:
                     unknown.append(str(i))
         return unknown
 
+    def since(self, seen: set[str], unit: str) -> list[dict]:
+        """Facts other units added that `seen` does not contain yet (marks them seen)."""
+        with self._lock:
+            new = [f for f in self.facts if f["id"] not in seen and f["unit"] != unit]
+        seen.update(f["id"] for f in new)
+        return new
+
     def prompt_block(self) -> str:
         with self._lock:
             facts = sorted(self.facts, key=lambda f: (-f["cited"], int(f["id"][1:])))
@@ -150,10 +157,16 @@ class IssueBoard:
             if issue is None:
                 issue = {"id": f"I{len(self.issues) + 1}", "root_cause": _norm(str(finding.get("root_cause"))),
                          "cwe": finding.get("cwe"), "where": f"{finding.get('sink_file')}:{finding.get('sink_line')}",
-                         "entries": []}
+                         "entries": [], "unit": finding.get("_unit")}
                 self.issues.append(issue)
             issue["entries"].append(finding.get("entry"))
             return issue["id"]
+
+    def since(self, seen: set[str], unit: str) -> list[dict]:
+        with self._lock:
+            new = [i for i in self.issues if i["id"] not in seen and i.get("unit") != unit]
+        seen.update(i["id"] for i in new)
+        return new
 
     def prompt_block(self, char_budget: int = 4000) -> str:
         with self._lock:
@@ -460,12 +473,19 @@ class Toolbox:
         handlers = sorted({e["handler_file"] for e in self.entries() if e.get("handler_file")})
         reach = reachable_files(self.root, handlers, depth=int(depth)) or set(handlers)
         unc = [s for s in sites if s[0] not in reach]
-        self.coverage = {"pattern": request_read_pattern, "sites": len(sites), "files": len(files),
-                         "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc)}
+        result = {"pattern": request_read_pattern, "sites": len(sites), "files": len(files),
+                  "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc)}
+        # A narrower pattern finds fewer reads, not better coverage: the broadest check is the record.
+        if self.coverage is None or result["sites"] >= self.coverage["sites"]:
+            self.coverage = result
+        elif result["sites"] < self.coverage["sites"]:
+            result["note"] = (f"this pattern matches fewer read sites than an earlier check "
+                              f"({self.coverage['sites']}: {self.coverage['pattern']}); the earlier, broader "
+                              "check stays the recorded coverage")
         by_file: dict[str, list[str]] = {}
         for f, ln, code in unc:
             by_file.setdefault(f, []).append(f"{ln}: {code.strip()[:120]}")
-        res = {**self.coverage,
+        res = {**result,
                "uncovered_files": len(by_file),
                "account_for_each": ("each file below reads request data but no entry reaches it: add the "
                                     "entries that reach it, or say in your finish notes why it is not "

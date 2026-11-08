@@ -28,12 +28,14 @@ Reminder = tuple[Callable[[int, Toolbox], bool], "str | Callable[[Toolbox], str]
 
 def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, budget: int,
               log_path: Path, deadline: float | None = None,
-              reminders: list[Reminder] | None = None) -> dict:
+              reminders: list[Reminder] | None = None,
+              updates: Callable[[], str | None] | None = None) -> dict:
     """Run until finish, the step budget, or the wall-clock deadline (epoch seconds).
 
     Near the deadline the agent is told to report and finish; 60 s after it the loop stops.
     `reminders` are (condition(steps, toolbox), message) pairs; each message is sent once, the first
-    time its condition holds.
+    time its condition holds. `updates()` is called before every model call; text it returns (e.g. facts
+    other agents verified meanwhile) is appended as a message, so parallel agents share what they learn.
     """
     pending = list(reminders or [])
     messages: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -55,6 +57,8 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                 messages.append({"role": "user", "content": "Time budget reached. Report what you "
                                  "have concluded now, then call finish."})
                 time_warned = warned = True
+            if updates is not None and steps and (news := updates()):
+                messages.append({"role": "user", "content": news})
             for rem in [r for r in pending if r[0](steps, tb)]:
                 messages.append({"role": "user", "content": rem[1](tb) if callable(rem[1]) else rem[1]})
                 pending.remove(rem)

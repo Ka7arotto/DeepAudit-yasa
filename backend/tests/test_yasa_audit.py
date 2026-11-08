@@ -744,3 +744,43 @@ def test_issue_board_links_findings_by_root_cause(tmp_path):
     out = to_deepaudit_findings(t1.findings + t2.findings)
     assert out[-1]["severity"] == "low" and "Documented as intended" in out[-1]["description"]
     assert "Root cause I1" in out[0]["description"]
+
+
+def test_agent_loop_appends_live_updates_from_parallel_units(tmp_path):
+    from app.services.yasa_audit.agent_loop import run_agent
+
+    news = iter([None, "New from reviewers working in parallel:\n- F7: helper escapes", None, None, None])
+    seen = []
+
+    class FakeLLM:
+        def chat(self, messages, tools=None):
+            seen.append([m["content"] for m in messages if m["role"] == "user"])
+            return SimpleNamespace(content="", tool_calls=[_call("list_dir", {})])
+
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    run_agent(FakeLLM(), tb, tool_schemas("review"), "s", "u", budget=4, log_path=tmp_path / "t.jsonl",
+              updates=lambda: next(news, None))
+    assert sum("F7: helper escapes" in m for m in seen[-1]) == 1  # appended once, kept in the history
+    assert not any("F7" in m for m in seen[0])  # nothing before the first step
+
+
+def test_fact_and_issue_boards_report_what_others_added(tmp_path):
+    from app.services.yasa_audit.toolbox import IssueBoard
+
+    _write(tmp_path, {"A.java": "a\n"})
+    fb, board = FactBook(tmp_path), IssueBoard()
+    fb.add("mine", [{"file": "A.java", "line": 1, "quote": "a"}], "u1")
+    fb.add("theirs", [{"file": "A.java", "line": 1, "quote": "a"}], "u2")
+    board.register({"root_cause": "x", "cwe": "CWE-1", "entry": "e", "_unit": "u2"})
+    seen_f, seen_i = set(), set()
+    assert [f["statement"] for f in fb.since(seen_f, "u1")] == ["theirs"] and fb.since(seen_f, "u1") == []
+    assert [i["id"] for i in board.since(seen_i, "u1")] == ["I1"] and board.since(seen_i, "u2") == []
+
+
+@needs_rg
+def test_coverage_record_keeps_the_broadest_check(tmp_path):
+    _write(tmp_path, {"a.js": "req.body.x\nreq.query.y\n"})
+    tb = Toolbox(_cfg(), tmp_path, tmp_path)
+    tb.check_coverage(r"req\.(body|query)")
+    res = json.loads(tb.check_coverage(r"req\.body"))
+    assert tb.coverage["sites"] == 2 and "fewer read sites" in res["note"]
