@@ -2,14 +2,9 @@ import Dashboard from "@/pages/Dashboard";
 import Projects from "@/pages/Projects";
 import ProjectDetail from "@/pages/ProjectDetail";
 import RecycleBin from "@/pages/RecycleBin";
-import InstantAnalysis from "@/pages/InstantAnalysis";
-import AuditTasks from "@/pages/AuditTasks";
-import TaskDetail from "@/pages/TaskDetail";
 import AgentAudit from "@/pages/AgentAudit";
 import AdminDashboard from "@/pages/AdminDashboard";
 import Account from "@/pages/Account";
-import AuditRules from "@/pages/AuditRules";
-import PromptManager from "@/pages/PromptManager";
 import type { ReactNode } from 'react';
 
 export interface RouteConfig {
@@ -49,36 +44,6 @@ const routes: RouteConfig[] = [
     path: "/projects/:id",
     element: <ProjectDetail />,
     visible: false,
-  },
-  {
-    name: "即时分析",
-    path: "/instant-analysis",
-    element: <InstantAnalysis />,
-    visible: true,
-  },
-  {
-    name: "审计任务",
-    path: "/audit-tasks",
-    element: <AuditTasks />,
-    visible: true,
-  },
-  {
-    name: "任务详情",
-    path: "/tasks/:id",
-    element: <TaskDetail />,
-    visible: false,
-  },
-  {
-    name: "审计规则",
-    path: "/audit-rules",
-    element: <AuditRules />,
-    visible: true,
-  },
-  {
-    name: "提示词管理",
-    path: "/prompts",
-    element: <PromptManager />,
-    visible: true,
   },
   {
     name: "系统管理",

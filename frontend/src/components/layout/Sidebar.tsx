@@ -278,7 +278,7 @@ export default function Sidebar({ collapsed, setCollapsed }: SidebarProps) {
                         {/* GitHub & Status Row */}
                         <div className={`flex items-center ${collapsed ? 'flex-col gap-2' : 'justify-between'} px-3 py-2`}>
                             <a
-                                href="https://github.com/lintsinghua/DeepAudit"
+                                href="https://github.com/Ka7arotto/DeepAudit-yasa"
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="flex items-center gap-2 transition-all duration-300 group"

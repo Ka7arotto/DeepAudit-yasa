@@ -20,13 +20,6 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { BranchSelector } from "@/components/ui/branch-selector";
 import {
   Search,
@@ -40,14 +33,13 @@ import {
   Play,
   Upload,
   FolderOpen,
-  Microscope,
 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/shared/config/database";
 import { createAgentTask } from "@/shared/api/agentTasks";
 import { isRepositoryProject, isZipProject } from "@/shared/utils/projectUtils";
 import { getZipFileInfo, type ZipFileMeta } from "@/shared/utils/zipStorage";
-import { validateZipFile } from "@/features/projects/services/repoZipScan";
+import { validateZipFile } from "@/features/projects/services/zipValidation";
 import type { Project } from "@/shared/types";
 import FileSelectionDialog from "@/components/audit/FileSelectionDialog";
 
@@ -81,7 +73,6 @@ export default function CreateAgentTaskDialog({
   const [excludePatterns, setExcludePatterns] = useState(DEFAULT_EXCLUDES);
   const [showAdvanced, setShowAdvanced] = useState(false);
   // 审计引擎：agent = 动态 Agent 树；yasa = YASA 混合审计（规则 + 引擎 + 分组复核 + 权限审计）
-  const [engine, setEngine] = useState<"agent" | "yasa">("agent");
   const [productContext, setProductContext] = useState("");
   const [creating, setCreating] = useState(false);
 
@@ -200,23 +191,20 @@ export default function CreateAgentTaskDialog({
 
     setCreating(true);
     try {
-      const isYasa = engine === "yasa";
       const agentTask = await createAgentTask({
         project_id: selectedProject.id,
-        name: `${isYasa ? "YASA审计" : "Agent审计"}-${selectedProject.name}`,
+        name: `YASA审计-${selectedProject.name}`,
         branch_name: isRepositoryProject(selectedProject) ? branch : undefined,
         exclude_patterns: excludePatterns,
         target_files: selectedFiles,
-        verification_level: isYasa ? "analysis_only" : "sandbox",
-        ...(isYasa && {
-          audit_mode: "yasa" as const,
-          timeout_seconds: 1800,
-          audit_scope: productContext.trim() ? { product: productContext.trim() } : undefined,
-        }),
+        verification_level: "analysis_only",
+        audit_mode: "yasa" as const,
+        timeout_seconds: 1800,
+        audit_scope: productContext.trim() ? { product: productContext.trim() } : undefined,
       });
 
       onOpenChange(false);
-      toast.success(isYasa ? "YASA 混合审计任务已创建" : "Agent 审计任务已创建");
+      toast.success("YASA 混合审计任务已创建");
       navigate(`/agent-audit/${agentTask.id}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "创建失败";
@@ -386,38 +374,8 @@ export default function CreateAgentTaskDialog({
                 </div>
               )}
 
-              {/* 审计引擎 */}
               <div className="space-y-2">
-                <span className="text-xs font-mono font-bold uppercase text-muted-foreground">
-                  Engine
-                </span>
-                <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="审计引擎">
-                  {([
-                    { id: "agent", icon: Bot, title: "Agent", desc: "多 Agent 自主审计 + 沙箱验证" },
-                    { id: "yasa", icon: Microscope, title: "YASA Hybrid", desc: "规则 + 污点引擎 + 权限审计，≤30 分钟" },
-                  ] as const).map(({ id, icon: Icon, title, desc }) => (
-                    <button
-                      key={id}
-                      type="button"
-                      role="radio"
-                      aria-checked={engine === id}
-                      onClick={() => setEngine(id)}
-                      disabled={creating}
-                      className={`text-left p-3 rounded border transition-colors ${
-                        engine === id
-                          ? "border-primary/60 bg-primary/10"
-                          : "border-border bg-muted/50 hover:border-primary/30"
-                      }`}
-                    >
-                      <span className="flex items-center gap-2 font-mono text-sm font-bold">
-                        <Icon className="w-4 h-4" />
-                        {title}
-                      </span>
-                      <span className="block text-xs text-muted-foreground mt-1">{desc}</span>
-                    </button>
-                  ))}
-                </div>
-                {engine === "yasa" && (
+                {(
                   <div className="space-y-1">
                     <label
                       htmlFor="yasa-product-context"

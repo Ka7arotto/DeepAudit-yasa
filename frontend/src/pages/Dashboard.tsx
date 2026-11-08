@@ -20,8 +20,6 @@ import { api, dbMode, isDemoMode } from "@/shared/config/database";
 import type { Project, AuditTask, ProjectStats, UnifiedTask } from "@/shared/types";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
-import { getRuleSets } from "@/shared/api/rules";
-import { getPromptTemplates } from "@/shared/api/prompts";
 import { getAgentTasks, type AgentTask } from "@/shared/api/agentTasks";
 
 export default function Dashboard() {
@@ -31,8 +29,6 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [issueTypeData, setIssueTypeData] = useState<Array<{ name: string; value: number; color: string }>>([]);
   const [qualityTrendData, setQualityTrendData] = useState<Array<{ date: string; score: number }>>([]);
-  const [ruleStats, setRuleStats] = useState({ total: 0, enabled: 0 });
-  const [templateStats, setTemplateStats] = useState({ total: 0, active: 0 });
 
   useEffect(() => {
     loadDashboardData();
@@ -45,7 +41,7 @@ export default function Dashboard() {
       const results = await Promise.allSettled([
         api.getProjectStats(),
         api.getProjects(),
-        api.getAuditTasks(),
+        Promise.resolve([] as AuditTask[]),
         getAgentTasks({ limit: 10 })
       ]);
 
@@ -107,55 +103,7 @@ export default function Dashboard() {
         setQualityTrendData([]);
       }
 
-      try {
-        const allIssues = await Promise.all(
-          tasks.map(task => api.getAuditIssues(task.id).catch(() => []))
-        );
-        const flatIssues = allIssues.flat();
-
-        if (flatIssues.length > 0) {
-          const typeCount: Record<string, number> = {};
-          flatIssues.forEach(issue => {
-            typeCount[issue.issue_type] = (typeCount[issue.issue_type] || 0) + 1;
-          });
-
-          const typeMap: Record<string, { name: string; color: string }> = {
-            security: { name: '安全问题', color: '#f43f5e' },
-            bug: { name: '潜在Bug', color: '#f97316' },
-            performance: { name: '性能问题', color: '#eab308' },
-            style: { name: '代码风格', color: '#3b82f6' },
-            maintainability: { name: '可维护性', color: '#8b5cf6' }
-          };
-
-          const issueData = Object.entries(typeCount).map(([type, count]) => ({
-            name: typeMap[type]?.name || type,
-            value: count,
-            color: typeMap[type]?.color || '#6b7280'
-          }));
-
-          setIssueTypeData(issueData);
-        } else {
-          setIssueTypeData([]);
-        }
-      } catch (error) {
-        setIssueTypeData([]);
-      }
-
-      try {
-        const [rulesRes, promptsRes] = await Promise.all([
-          getRuleSets(),
-          getPromptTemplates(),
-        ]);
-        const totalRules = rulesRes.items.reduce((acc, rs) => acc + rs.rules_count, 0);
-        const enabledRules = rulesRes.items.reduce((acc, rs) => acc + rs.enabled_rules_count, 0);
-        setRuleStats({ total: totalRules, enabled: enabledRules });
-        setTemplateStats({
-          total: promptsRes.items.length,
-          active: promptsRes.items.filter(t => t.is_active).length
-        });
-      } catch (error) {
-        console.error('获取规则和模板统计失败:', error);
-      }
+      setIssueTypeData([]);
     } catch (error) {
       console.error('仪表盘数据加载失败:', error);
       toast.error("数据加载失败");
@@ -586,24 +534,6 @@ export default function Dashboard() {
                 <span className="text-base text-muted-foreground">待解决问题</span>
                 <span className="text-base font-bold text-amber-400">
                   {stats ? stats.total_issues - stats.resolved_issues : 0}
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-base text-muted-foreground flex items-center gap-1">
-                  <Shield className="w-4 h-4" />
-                  审计规则
-                </span>
-                <span className="text-base font-bold text-violet-400">
-                  {ruleStats.enabled}/{ruleStats.total}
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-base text-muted-foreground flex items-center gap-1">
-                  <MessageSquare className="w-4 h-4" />
-                  提示词模板
-                </span>
-                <span className="text-base font-bold text-emerald-400">
-                  {templateStats.active}/{templateStats.total}
                 </span>
               </div>
             </div>

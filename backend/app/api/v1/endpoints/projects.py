@@ -1,6 +1,5 @@
 from typing import Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -12,14 +11,14 @@ import uuid
 import json
 
 from app.api import deps
-from app.db.session import get_db, AsyncSessionLocal
+from app.db.session import get_db
 from app.models.project import Project
 from app.models.user import User
 from app.models.audit import AuditTask, AuditIssue
 from app.models.agent_task import AgentTask, AgentTaskStatus, AgentFinding
 from app.models.user_config import UserConfig
 import zipfile
-from app.services.scanner import scan_repo_task, get_github_files, get_gitlab_files, get_github_branches, get_gitlab_branches, get_gitea_branches, should_exclude, is_text_file
+from app.services.scanner import get_github_files, get_gitlab_files, get_github_branches, get_gitlab_branches, get_gitea_branches, should_exclude, is_text_file
 from app.services.zip_storage import (
     save_project_zip, load_project_zip, get_project_zip_meta,
     delete_project_zip, has_project_zip
@@ -491,84 +490,6 @@ class ScanRequest(BaseModel):
     full_scan: bool = True
     exclude_patterns: Optional[List[str]] = None
     branch_name: Optional[str] = None
-
-
-@router.post("/{id}/scan")
-async def scan_project(
-    id: str,
-    background_tasks: BackgroundTasks,
-    scan_request: Optional[ScanRequest] = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    """
-    Start a scan task.
-    """
-    project = await db.get(Project, id)
-    if not project:
-        raise HTTPException(status_code=404, detail="项目不存在")
-
-    # 获取分支和排除模式
-    branch_name = scan_request.branch_name if scan_request else None
-    exclude_patterns = scan_request.exclude_patterns if scan_request else None
-
-    # Create Task Record
-    task = AuditTask(
-        project_id=project.id,
-        created_by=current_user.id,
-        task_type="repository",
-        status="pending",
-        branch_name=branch_name or project.default_branch or "main",
-        exclude_patterns=json.dumps(exclude_patterns or []),
-        scan_config=json.dumps(scan_request.dict()) if scan_request else "{}"
-    )
-    db.add(task)
-    await db.commit()
-    await db.refresh(task)
-
-    # 获取用户配置（包含解密敏感字段）
-    from app.core.encryption import decrypt_sensitive_data
-
-    # 需要解密的敏感字段列表
-    SENSITIVE_LLM_FIELDS = [
-        'llmApiKey', 'geminiApiKey', 'openaiApiKey', 'claudeApiKey',
-        'qwenApiKey', 'deepseekApiKey', 'zhipuApiKey', 'moonshotApiKey',
-        'baiduApiKey', 'minimaxApiKey', 'doubaoApiKey'
-    ]
-    SENSITIVE_OTHER_FIELDS = ['githubToken', 'gitlabToken']
-
-    def decrypt_config(config_dict: dict, sensitive_fields: list) -> dict:
-        """解密配置中的敏感字段"""
-        decrypted = config_dict.copy()
-        for field in sensitive_fields:
-            if field in decrypted and decrypted[field]:
-                decrypted[field] = decrypt_sensitive_data(decrypted[field])
-        return decrypted
-
-    result = await db.execute(
-        select(UserConfig).where(UserConfig.user_id == current_user.id)
-    )
-    config = result.scalar_one_or_none()
-    user_config = {}
-    if config:
-        llm_config = json.loads(config.llm_config) if config.llm_config else {}
-        other_config = json.loads(config.other_config) if config.other_config else {}
-        # 解密敏感字段
-        llm_config = decrypt_config(llm_config, SENSITIVE_LLM_FIELDS)
-        other_config = decrypt_config(other_config, SENSITIVE_OTHER_FIELDS)
-        user_config = {
-            'llmConfig': llm_config,
-            'otherConfig': other_config,
-        }
-
-    # 将扫描配置注入到 user_config 中，以便 scan_repo_task 使用
-    if scan_request and scan_request.file_paths:
-        user_config['scan_config'] = {'file_paths': scan_request.file_paths}
-
-    # Trigger Background Task
-    background_tasks.add_task(scan_repo_task, task.id, AsyncSessionLocal, user_config)
-
-    return {"task_id": task.id, "status": "started"}
 
 
 # ============ ZIP文件管理端点 ============

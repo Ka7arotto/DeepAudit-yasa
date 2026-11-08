@@ -319,5 +319,3 @@ LLM_MODEL=gpt-4o-mini
 ## 更多资源
 
 - [配置说明](CONFIGURATION.md) - 详细的配置参数说明
-- [部署指南](DEPLOYMENT.md) - 部署相关说明
-- [常见问题](FAQ.md) - LLM 相关问题解答

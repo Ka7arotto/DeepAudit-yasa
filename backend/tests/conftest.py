@@ -24,16 +24,6 @@ def mock_settings():
                 yield test_settings
 
 
-@pytest.fixture(autouse=True)
-def reset_agent_config():
-    """Clear @lru_cache on get_agent_config between tests to prevent state leakage."""
-    from app.services.agent.config import get_agent_config
-
-    get_agent_config.cache_clear()
-    yield
-    get_agent_config.cache_clear()
-
-
 @pytest.fixture
 def temp_dir():
     """Provide a clean temporary directory (cleaned up after test)."""
