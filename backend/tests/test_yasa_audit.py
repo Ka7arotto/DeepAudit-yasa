@@ -286,7 +286,9 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
     assert m["recon"]["access_model"]["principals"] == "anyone" and m["recon"]["coverage"]["sites"] == 1
     assert m["recon"]["notes"] == "web/<Name>.php::execute serves /<name>"  # the early finish was refused
     assert "- principals: anyone" in systems[-1]  # reviewers get the access model
-    assert m["recon"]["resolver"] == {"installed": True, "entries": 2, "disagreements": 0, "unknown": 0}
+    assert m["recon"]["resolver"] == {"installed": True, "entries": 2, "settled": False, "disagreements": 0,
+                                      "unknown": 0}
+    assert m["recon"]["reconcile"] is None  # nothing to reconcile
     assert any('"who_can_call": {"least_privileged": "public"' in u for u in users[1:])
     assert m["review"]["units"] == 2 and m["review"]["reviewed_units"] == 2 and m["review"]["facts"] == 1
     data = json.loads((tmp_path / "out" / "review" / "findings.json").read_text())
@@ -825,15 +827,118 @@ def test_access_resolver_installs_after_samples_and_answers_reviewers(tmp_path):
     assert (tmp_path / "resolver.py").read_text() == RESOLVER
 
 
-def test_resolver_sets_exposure_and_flags_disagreement(tmp_path):
+def test_resolver_disagreement_keeps_declared_until_settled(tmp_path):
     from app.services.yasa_audit.pipeline import _apply_resolver
 
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
-    entries = [{"route": "/admin/users", "exposure": "authenticated"},   # surface agent too lenient
-               {"route": "/me/orders", "exposure": "unknown"},            # surface agent did not know
-               {"route": "/posts", "exposure": "public"}]
-    out = _apply_resolver(tb, entries, RESOLVER, tmp_path)
-    assert out == {"installed": True, "entries": 3, "disagreements": 1, "unknown": 0}
-    assert entries[0]["exposure"] == "privileged" and entries[0]["exposure_declared"] == "authenticated"
-    assert entries[1]["exposure"] == "authenticated" and "exposure_declared" not in entries[1]
-    assert entries[2]["who_can_call"]["rule"] == "Rbac.java:1"
+    es = [{"route": "/admin/users", "exposure": "authenticated"},   # the two readings disagree
+          {"route": "/me/orders", "exposure": "unknown"},            # surface agent did not know
+          {"route": "/posts", "exposure": "public"}]
+    out = _apply_resolver(tb, es, RESOLVER, tmp_path)
+    assert {k: v for k, v in out.items() if not k.startswith("_")} == \
+        {"installed": True, "entries": 3, "settled": False, "disagreements": 1, "unknown": 0}
+    assert list(out["_groups"]) == [("authenticated", "privileged", "Rbac.java:3")]
+    # not reconciled: a resolver that misreads routes must not relabel the surface
+    assert es[0]["exposure"] == "authenticated" and es[0]["exposure_declared"] == "authenticated"
+    assert es[0]["who_can_call"]["least_privileged"] == "privileged"
+    assert es[1]["exposure"] == "authenticated" and "exposure_declared" not in es[1]
+    assert es[2]["who_can_call"]["rule"] == "Rbac.java:1"
+    es = [{"route": "/admin/x", "exposure": "public"}, {"route": "/posts", "exposure": "privileged"}]
+    _apply_resolver(tb, es, RESOLVER, tmp_path, settled=True)  # reconciled: the less privileged orders
+    assert [e["exposure"] for e in es] == ["public", "public"]
+    assert [e["exposure_declared"] for e in es] == ["public", "privileged"]
+
+
+def test_reconcile_lets_the_access_agent_fix_its_resolver(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+
+    proj = tmp_path / "p"
+    _write(proj, {"web/Admin.php": "<?php\nclass Admin {\n  function execute() { require_admin(); }\n}\n",
+                  "web/Home.php": "<?php\nclass Home {\n  function execute() { echo $_GET['q']; }\n}\n"})
+    extractor = ("import json\nprint(json.dumps([{'route': '/admin', 'handler_file': 'web/Admin.php', "
+                 "'handler': 'execute', 'exposure': 'privileged'}, {'route': '/home', 'handler_file': "
+                 "'web/Home.php', 'handler': 'execute', 'exposure': 'public'}]))")
+    gate_only = ("import json,sys; r=json.load(sys.stdin); print(json.dumps([{'least_privileged': 'public', "
+                 "'rule': 'no gate'} for _ in r]))")
+    reads_handler = ("import json,sys,os; r=json.load(sys.stdin); print(json.dumps([{'least_privileged': "
+                     "'privileged' if 'require_admin' in open(os.path.join(sys.argv[1], q['handler_file']))"
+                     ".read() else 'public', 'rule': 'handler check'} if q.get('handler_file') else "
+                     "{'least_privileged': 'unknown'} for q in r]))")
+    scripts = {
+        "access": [("record_access_model", {"authentication": "session", "authorization": "in handlers",
+                                            "permission_mapping": "require_admin()", "principals": "anyone, admin",
+                                            "evidence": [{"file": "web/Admin.php", "line": 3,
+                                                          "quote": "require_admin()"}]}),
+                   ("write_access_resolver", {"code": gate_only, "samples": [{"route": "/a"}, {"route": "/b"},
+                                                                             {"route": "/c"}]}),
+                   ("finish", {"notes": "gate only"})],
+        "recon": [("run_extractor", {"name": "web", "code": extractor}),
+                  ("check_coverage", {"request_read_pattern": r"\$_GET"}),
+                  ("finish", {"notes": "web/*.php"})],
+        "reconcile": [("read_file", {"path": "web/Admin.php"}),
+                      ("write_access_resolver", {"code": reads_handler, "samples": [
+                          {"route": "/admin", "handler_file": "web/Admin.php"},
+                          {"route": "/home", "handler_file": "web/Home.php"}, {"route": "/x"}]}),
+                      ("finish", {"notes": "resolver missed the check in the handler: fixed"})],
+    }
+    users = []
+
+    class Router(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            if not self.script and len(messages) == 2:
+                user = messages[1]["content"]
+                users.append(user)
+                key = ("reconcile" if "independently of you" in user else
+                       "access" if "controls ACCESS" in messages[0]["content"] else "recon")
+                self.script = list(scripts[key])
+            return super().chat(messages, tools)
+
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
+    m = pipeline.recon(_cfg(), proj, tmp_path / "out", deadline=time.time() + 900)
+    msg = next(u for u in users if "independently of you" in u)
+    assert "1 entries: declared privileged, resolver public (rule: no gate)" in msg
+    assert "/admin -> web/Admin.php execute" in msg and gate_only in msg  # samples and current code
+    rc = m["reconcile"]
+    assert rc["before"] == {"disagreements": 1, "unknown": 0} and rc["resolver_changed"] and rc["finished"]
+    assert "fixed" in rc["notes"]
+    assert m["resolver"]["disagreements"] == 0 and m["resolver"]["settled"] is True
+    es = json.loads((tmp_path / "out" / "entries.json").read_text())
+    assert {e["route"]: e["exposure"] for e in es} == {"/admin": "privileged", "/home": "public"}
+    assert not any(e.get("exposure_declared") for e in es)
+    assert (tmp_path / "out" / "resolver.py").read_text() == reads_handler
+
+
+def test_who_can_call_passes_the_entry_handler_to_the_resolver(tmp_path):
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    tb.resolver_code = ("import json,sys; r=json.load(sys.stdin); print(json.dumps([{'least_privileged': "
+                        "'public', 'rule': q.get('handler_file', '-') + ':' + str(q.get('handler_line', ''))} "
+                        "for q in r]))")
+    tb.known_entries = {("POST", "/x"): {"route": "/x", "handler_file": "a.php", "handler_line": 7,
+                                        "exposure": "public", "id": "E1"}}
+    assert json.loads(tb.who_can_call("post", "/x"))["rule"] == "a.php:7"
+    assert json.loads(tb.who_can_call("GET", "/y"))["rule"] == "-:"
+
+
+def test_extractor_regression_is_pointed_out_once(tmp_path):
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    many = "import json\nprint(json.dumps([{'route': '/r%d' % i, 'handler_file': 'x'} for i in range(30)]))"
+    few = "import json\nprint(json.dumps([{'route': '/r0', 'handler_file': 'x'}]))"
+    tb.run_extractor("api", many)
+    assert tb.extractor_regressions() == []
+    tb.run_extractor("api", few)
+    assert tb.extractor_regressions() == ["api now yields 1 entries, an earlier version yielded 30"]
+    assert tb.extractor_regressions() == []  # a smaller surface can be right: shown once
+    tb.finish_gates = [(lambda t: True, lambda t: "dynamic message")]
+    assert tb.finish("x") == "not finished: dynamic message"
+
+
+def test_coverage_says_when_the_pattern_misses_most_handlers(tmp_path):
+    files = {f"c/H{i}.php": f"<?php\nfunction a{i}() {{ $this->request->get('x'); }}\n" for i in range(12)}
+    files["c/H0.php"] += "$_GET['y'];\n"
+    _write(tmp_path, files)
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    tb.manual = [{"route": f"/h{i}", "handler_file": f"c/H{i}.php", "handler": f"a{i}"} for i in range(12)]
+    res = json.loads(tb.check_coverage(r"\$_GET"))
+    assert res["handler_files_matched"] == 1 and res["handler_files"] == 12 and "says little" in res["note"]
+    res = json.loads(tb.check_coverage(r"request->get"))
+    assert res["handler_files_matched"] == 12 and "note" not in res

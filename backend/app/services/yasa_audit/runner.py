@@ -147,7 +147,7 @@ def to_deepaudit_findings(findings: list[dict]) -> list[dict]:
             sev = LOWER[sev]
         if f.get("documented_intent"):
             sev = "low"
-        elif f.get("required_privilege") == "admin":
+        elif f.get("required_privilege") in ("privileged", "admin"):
             sev = LOWER[sev]
         elif f.get("required_privilege") == "operator_or_cli":
             sev = "low"

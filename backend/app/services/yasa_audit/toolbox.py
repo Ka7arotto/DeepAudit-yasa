@@ -202,7 +202,10 @@ class Toolbox:
         self.manual: list[dict] = []
         self.coverage: dict | None = None
         self.access_model: dict | None = None
-        self.resolver_code: str | None = None  # the access agent's who-can-call program
+        self.resolver_code: str | None = None
+        self.known_entries: dict[tuple, dict] = {}  # (METHOD, route) -> entry, so who_can_call sees the handler
+        self.extractor_best: dict[str, int] = {}  # most entries any version of each extractor produced
+        self.regressions_shown: set[tuple] = set()  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
 
@@ -424,15 +427,21 @@ class Toolbox:
             return False, clip(f"error: program exited {r.returncode}\n{r.stderr[-3000:]}", 4000)
         return True, r.stdout
 
+    RESOLVER_FIELDS = ("kind", "handler_file", "handler", "handler_line")
+
     def resolve_access(self, requests: list[dict], code: str | None = None) -> list[dict] | str:
-        """Run the who-can-call program on [{method, route}]; a list of results in the same order, or
-        an error text. Each result: least_privileged (public|authenticated|privileged|denied|unknown),
-        principals (list), rule (where the decision comes from)."""
+        """Run the who-can-call program on requests ({method, route} plus, when known, the entry's kind and
+        handler location); a list of results in the same order, or an error text. Each result:
+        least_privileged (public|authenticated|privileged|denied|unknown), principals (list), rule (where
+        the decision comes from)."""
         code = code or self.resolver_code
         if not code:
             return "error: no resolver"
-        reqs = [{"method": str(r.get("method") or "GET").upper(), "route": str(r.get("route") or "")}
-                for r in requests]
+        reqs = []
+        for r in requests:
+            q = {"method": str(r.get("method") or "GET").upper(), "route": str(r.get("route") or "")}
+            q.update({k: r[k] for k in self.RESOLVER_FIELDS if r.get(k) not in (None, "")})
+            reqs.append(q)
         ok, out = self._run_python(code, "resolver", json.dumps(reqs), timeout=120)
         if not ok:
             return out
@@ -455,7 +464,8 @@ class Toolbox:
         """Install the who-can-call program after running it on sample requests."""
         samples = [x for x in (samples or []) if isinstance(x, dict) and x.get("route")]
         if len(samples) < 3:
-            return "rejected: give at least 3 sample requests {method, route}, of different privilege levels"
+            return ("rejected: give at least 3 sample requests {method, route, handler_file, handler, ...}, of "
+                    "different privilege levels")
         res = self.resolve_access(samples, code)
         if isinstance(res, str):
             return res
@@ -468,7 +478,9 @@ class Toolbox:
                     f"wrong{' (unknown results: ' + str(unknown) + ')' if unknown else ''}:\n" + "\n".join(rows))
 
     def who_can_call(self, method: str, path: str) -> str:
-        res = self.resolve_access([{"method": method, "route": path}])
+        req = {**self.known_entries.get((str(method or "GET").upper(), str(path)), {}),
+               "method": method, "route": path}
+        res = self.resolve_access([req])
         if isinstance(res, str):
             return res + ("; work it out from the access model" if "no resolver" in res else "")
         return json.dumps(res[0], ensure_ascii=False)
@@ -488,6 +500,7 @@ class Toolbox:
         entries, problems = self._clean(raw, f"extractor:{name}")
         prev = self.extractors.get(name)
         self.extractors[name] = {"code": code, "entries": entries}
+        self.extractor_best[name] = max(self.extractor_best.get(name, 0), len(entries))
         (self.run_dir / "extractors").mkdir(exist_ok=True)
         (self.run_dir / "extractors" / f"{name}.py").write_text(code)
         res = {"extractor": name, **self._summary(entries), "problems": problems[:5],
@@ -509,6 +522,17 @@ class Toolbox:
                                   "one; check that this was intended (a bug in the rewrite, an exception "
                                   "caught too broadly, a changed path) before you finish")
         return clip(json.dumps(res, ensure_ascii=False, indent=1))
+
+    def extractor_regressions(self) -> list[str]:
+        """Extractors whose latest version yields far fewer entries than an earlier version did, not yet
+        pointed out to the agent. Each is pointed out once: a smaller surface can be the right answer."""
+        out = []
+        for name, best in self.extractor_best.items():
+            now = len(self.extractors.get(name, {}).get("entries", []))
+            if best - now > max(5, best // 5) and (name, now) not in self.regressions_shown:
+                self.regressions_shown.add((name, now))
+                out.append(f"{name} now yields {now} entries, an earlier version yielded {best}")
+        return out
 
     def add_entries(self, entries: list[dict]) -> str:
         """Add entries by hand (a few special ones an extractor would not cover)."""
@@ -532,7 +556,8 @@ class Toolbox:
         reach = reachable_files(self.root, handlers, depth=int(depth)) or set(handlers)
         unc = [s for s in sites if s[0] not in reach]
         result = {"pattern": request_read_pattern, "sites": len(sites), "files": len(files),
-                  "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc)}
+                  "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc),
+                  "handler_files_matched": len(set(files) & set(handlers)), "handler_files": len(handlers)}
         # A narrower pattern finds fewer reads, not better coverage: the broadest check is the record.
         if self.coverage is None or result["sites"] >= self.coverage["sites"]:
             self.coverage = result
@@ -540,6 +565,10 @@ class Toolbox:
             result["note"] = (f"this pattern matches fewer read sites than an earlier check "
                               f"({self.coverage['sites']}: {self.coverage['pattern']}); the earlier, broader "
                               "check stays the recorded coverage")
+        if len(handlers) >= 10 and result["handler_files_matched"] * 4 < len(handlers):
+            result["note"] = (f"the pattern matches request reads in only {result['handler_files_matched']} of "
+                              f"{len(handlers)} handler files, so most handlers read requests some other way "
+                              "and this check says little; use a pattern that matches how they read it")
         by_file: dict[str, list[str]] = {}
         for f, ln, code in unc:
             by_file.setdefault(f, []).append(f"{ln}: {code.strip()[:120]}")
@@ -626,7 +655,7 @@ class Toolbox:
     def finish(self, notes: str = "", _force: bool = False) -> str:
         for cond, msg in self.finish_gates:
             if not _force and cond(self):
-                return f"not finished: {msg}"
+                return f"not finished: {msg(self) if callable(msg) else msg}"
         self.finished = True
         self.notes = notes
         return f"finished ({len(self.findings)} findings, {len(self.cards)} cards)"
@@ -661,17 +690,23 @@ def tool_schemas(role: str) -> list[dict]:
         "auth": {"type": "string", "description": "what the code/config says about authentication or "
                  "authorization for this entry, verbatim where possible"},
         "exposure": {"type": "string", "enum": list(EXPOSURES)}}}
-    req = {"type": "object", "properties": {"method": s, "route": s}}
+    req = {"type": "object", "properties": {"method": s, "route": s, "kind": s, "handler_file": s, "handler": s,
+                                            "handler_line": i}}
     if role == "access":
         tools += [
             fn("write_access_resolver",
                "Install a who-can-call program: Python 3 (standard library only) that gets the project root "
-               "as sys.argv[1], reads a JSON list of requests [{method, route}] from stdin and prints a JSON "
-               "list with one result per request, same order: {least_privileged: public|authenticated|"
-               "privileged|denied|unknown, principals: [roles or principal kinds allowed], rule: where the "
-               "decision comes from (file:line or config key)}. It applies the project's real access rules "
-               "(route tables, role definitions, middleware or filter order) as you read them. It is run on "
-               "your samples now, and later on every entry and by reviewers.",
+               "as sys.argv[1], reads a JSON list of requests from stdin and prints a JSON list with one "
+               "result per request, same order. A request is an entry of the attack surface: method, route "
+               "(in whatever shape the surface agent wrote it), and when known kind, handler_file, handler, "
+               "handler_line. A result is {least_privileged: public|authenticated|privileged|denied|unknown, "
+               "principals: [roles or principal kinds allowed], rule: where the decision comes from (file:line "
+               "or config key)}. least_privileged is the least privileged principal whose request gets the "
+               "handler's operation done: count the shared gates AND the checks the handler itself makes (the "
+               "program can read the handler's code). Answer unknown for requests whose shape you do not "
+               "recognise, rather than guessing. It applies the project's real access rules (route tables, "
+               "role definitions, middleware or filter order, checks in handlers) as you read them. It is run "
+               "on your samples now, and later on every entry and by reviewers.",
                {"code": s, "samples": {"type": "array", "items": req}}, ["code", "samples"]),
             fn("record_access_model",
                "Record how THIS project authenticates and authorizes requests, once, before finish. "
@@ -718,6 +753,10 @@ def tool_schemas(role: str) -> list[dict]:
                "then again with every hypothesis's final status (a later call replaces the card).",
                {"function": {"type": "string", "description": "what the entry does, in business terms"},
                 "callers": {"type": "string", "description": "who can call it, with the evidence"},
+                "least_privileged_caller": {"type": "string", "description": "who can actually call it, as you "
+                                            "established from the code (put a wrong recon exposure right "
+                                            "here, not in report_finding)",
+                                            "enum": ["public", "authenticated", "privileged", "denied"]},
                 "authz_verdict": {"type": "string", "enum": ["ok", "missing_authentication",
                                                              "missing_authorization", "object_level",
                                                              "unclear"]},
@@ -739,8 +778,9 @@ def tool_schemas(role: str) -> list[dict]:
                {"vuln_type": s, "cwe": s, "sink_file": s, "sink_line": i,
                 "source": {"type": "string", "description": "attacker-controlled input and where"},
                 "entry": {"type": "string", "description": "route and who can reach it"},
-                "required_privilege": {"type": "string",
-                                       "enum": ["none", "customer", "admin", "operator_or_cli"]},
+                "required_privilege": {"type": "string", "description": "least privileged principal that can "
+                                       "exploit it", "enum": ["public", "authenticated", "privileged",
+                                                              "operator_or_cli"]},
                 "hops": {"type": "array", "items": s},
                 "sanitizers": s,
                 "impact": {"type": "string", "description": "what the attacker concretely gains: data read, "

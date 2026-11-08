@@ -25,7 +25,7 @@ from .config import AuditConfig
 from .discovery import codegraph_db, codegraph_routes, snapshot_codegraph
 from .llm import LLM, limiter_for
 from .prompts import access_model_text, access_prompt, recon_prompt, review_prompt
-from .toolbox import FactBook, IssueBoard, Toolbox, tool_schemas
+from .toolbox import EXPOSURES, FactBook, IssueBoard, Toolbox, tool_schemas
 
 MIN_UNIT_S = 60  # do not start a unit with less time left than this
 SKIP_PARTS = {"node_modules", ".git", ".yasa", ".codegraph", "vendor", "venv", ".venv", "__pycache__"}
@@ -85,33 +85,85 @@ def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
                                   user, cfg.access_budget, out / "transcript-access.jsonl", deadline=deadline)
     except Exception as e:  # the surface agent and the review still run without a model
         holder["error"] = f"{type(e).__name__}: {e}"
-    holder["model"], holder["llm"], holder["resolver"] = tb.access_model, llm, tb.resolver_code
+    holder["model"], holder["llm"], holder["resolver"], holder["tb"] = tb.access_model, llm, tb.resolver_code, tb
     holder["done"].set()
 
 
-def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Path) -> dict:
-    """Run the access agent's who-can-call program on every entry. Its answer becomes the entry's
-    exposure; where the surface agent declared another one, both are kept: two independent readings of
-    the access rules that disagree are where access-control mistakes are most likely."""
+def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Path,
+                    settled: bool = False) -> dict:
+    """Run the access agent's who-can-call program on every entry and compare it with the exposure the
+    surface agent declared: two independent readings of the access rules. Before they are reconciled the
+    declared exposure stands (a resolver that misreads one route shape would otherwise relabel hundreds of
+    entries); once reconciled, the less privileged of the two orders the review. Both stay visible."""
     if not code or not entries:
         return {"installed": bool(code)}
     (out / "resolver.py").write_text(code)
     res = tb.resolve_access(entries, code)
     if isinstance(res, str):
         return {"installed": True, "error": res[:500]}
-    disagree = unknown = 0
+    groups: dict[tuple, list[dict]] = {}
+    unknown: dict[str, list[dict]] = {}
     for e, r in zip(entries, res, strict=True):
         e["who_can_call"] = r
+        declared = e.get("exposure_declared") or e.get("exposure") or "unknown"
         lp = r["least_privileged"]
-        if lp in ("unknown", "denied"):
-            unknown += lp == "unknown"
+        if lp == "unknown":
+            unknown.setdefault(str(e.get("kind") or _route_key(e.get("route", ""), 1)), []).append(e)
             continue
-        if lp != e.get("exposure"):
-            if e.get("exposure") != "unknown":
-                e["exposure_declared"] = e.get("exposure")
-                disagree += 1
-            e["exposure"] = lp
-    return {"installed": True, "entries": len(entries), "disagreements": disagree, "unknown": unknown}
+        if declared == "unknown":
+            if lp in EXPOSURES:
+                e["exposure"] = lp
+            continue
+        if lp != declared:
+            e["exposure_declared"] = declared
+            groups.setdefault((declared, lp, r["rule"][:100]), []).append(e)
+            if settled and lp in EXPOSURES:
+                e["exposure"] = min(declared, lp, key=lambda x: EXPOSURE_RANK.get(x, 1))
+    return {"installed": True, "entries": len(entries), "settled": settled,
+            "disagreements": sum(len(v) for v in groups.values()),
+            "unknown": sum(len(v) for v in unknown.values()), "_groups": groups, "_unknown": unknown}
+
+
+def _sample(e: dict) -> str:
+    where = f"{e.get('handler_file')}:{e.get('handler_line') or ''}".rstrip(":")
+    return f"{e.get('method', '')} {e.get('route', '')} -> {where} {e.get('handler', '')}".strip()
+
+
+def _reconcile_message(entries: list[dict], applied: dict, code: str, model: dict | None) -> str:
+    rows = []
+    for (declared, lp, rule), es in sorted(applied["_groups"].items(), key=lambda kv: -len(kv[1]))[:12]:
+        rows.append(f"- {len(es)} entries: declared {declared}, resolver {lp} (rule: {rule})")
+        rows += [f"    {_sample(e)}" for e in es[:3]]
+    for kind, es in sorted(applied["_unknown"].items(), key=lambda kv: -len(kv[1]))[:6]:
+        rows.append(f"- {len(es)} entries of kind/prefix {kind!r}: resolver unknown")
+        rows += [f"    {_sample(e)}  request fields: "
+                 + json.dumps({k: e.get(k) for k in ("method", "route", *Toolbox.RESOLVER_FIELDS) if e.get(k)},
+                              ensure_ascii=False) for e in es[:2]]
+    return (f"The surface agent enumerated {len(entries)} entries and declared each one's exposure, "
+            f"independently of you. Your resolver disagrees on {applied['disagreements']} of them and answers "
+            f"unknown for {applied['unknown']}. The groups:\n" + "\n".join(rows) +
+            "\n\nFor each group, read the handler of a sample or two and decide which reading is right:\n"
+            "- the resolver is wrong (it misses a check, misreads a request shape, ...): fix it and install it "
+            "again with write_access_resolver (samples from these groups);\n"
+            "- the declared exposure is wrong: leave the resolver;\n"
+            "- both are right about different parts of the code (the code is inconsistent): that is a likely "
+            "access-control bug, leave it.\n"
+            "Then finish, with one line per group: your decision and why.\n\n"
+            + (access_model_text(model) + "\n\n" if model else "") + "Your current resolver:\n" + code)
+
+
+def _reconcile(cfg: AuditConfig, out: Path, entries: list[dict], holder: dict, applied: dict,
+               deadline: float | None, deploy: str = "", product: str = "") -> dict:
+    """The access agent settles its disagreements with the surface agent (a fresh, short context)."""
+    tb: Toolbox = holder["tb"]
+    tb.finished, tb.finish_gates = False, []
+    llm = holder.get("llm") or LLM(cfg)
+    res = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.reconcile_budget, deploy, product),
+                    _reconcile_message(entries, applied, tb.resolver_code or "", holder.get("model")),
+                    cfg.reconcile_budget, out / "transcript-reconcile.jsonl", deadline=deadline)
+    holder["resolver"] = tb.resolver_code
+    return {"steps": res.get("steps"), "finished": res.get("finished"), "notes": (tb.notes or "")[:3000],
+            "resolver_changed": tb.resolver_code != applied.get("_code")}
 
 
 def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
@@ -132,8 +184,16 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
                               args=(cfg, root, out, deploy, product, deadline, user, holder))
     access.start()
 
+    regressions: list[str] = []
+
+    def regressed(t: Toolbox) -> bool:
+        regressions[:] = t.extractor_regressions()
+        return bool(regressions)
+
     tb.finish_gates = [(lambda t: (t.extractors or t.manual) and t.coverage is None,
-                        "run check_coverage once with a pattern for how this project reads request data")]
+                        "run check_coverage once with a pattern for how this project reads request data"),
+                       (regressed, lambda t: "; ".join(regressions) + ". Fix the regression and run the extractor "
+                        "again, or finish again if the smaller result is the right one.")]
     llm = LLM(cfg)
     no_extractor_yet = (lambda steps, t: steps >= cfg.recon_budget // 2 and not t.extractors and not t.manual,
                         "Half of your tool budget is used and no extractor has run. Stop reading: write an "
@@ -175,6 +235,22 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         e["id"] = f"E{i + 1}"
         e["resolved"] = tb._check_entry(e) is None
     resolver = _apply_resolver(tb, entries, holder.get("resolver"), out)
+    reconcile = None
+    if (resolver.get("disagreements") or resolver.get("unknown")) and holder.get("tb") is not None \
+            and (deadline is None or time.time() < deadline - 300):
+        resolver["_code"] = holder["resolver"]
+        try:
+            reconcile = _reconcile(cfg, out, entries, holder, resolver, deadline, deploy, product)
+        except Exception as e:  # keep the unreconciled answers
+            reconcile = {"error": f"{type(e).__name__}: {e}"}
+        before = {k: resolver.get(k) for k in ("disagreements", "unknown")}
+        for e in entries:
+            if e.get("exposure_declared"):
+                e["exposure"] = e.pop("exposure_declared")
+        resolver = _apply_resolver(tb, entries, holder.get("resolver"), out,
+                                   settled=bool(reconcile.get("finished")))
+        reconcile["before"] = before
+    resolver = {k: v for k, v in resolver.items() if not k.startswith("_")}
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
     by_exp = collections.Counter(e["exposure"] for e in entries)
     m = _metrics(llm, {"stage": "recon", "source": source, "entries": len(entries),
@@ -182,7 +258,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
                        "extractors": {k: len(v["entries"]) for k, v in tb.extractors.items()},
                        "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
                        "access_model": holder["model"], "access_error": holder.get("error"),
-                       "resolver": resolver,
+                       "resolver": resolver, "reconcile": reconcile,
                        "passes": passes, **res})
     if holder.get("llm") is not None:  # both agents' tokens count
         a = _metrics(holder["llm"], holder.get("res") or {})
@@ -252,7 +328,9 @@ def _units(entries: list[dict]) -> list[dict]:
                       "exposure": exp, "entries": es, "generic": generic,
                       "handlers": sorted({f"{e.get('handler_file')}::{e.get('handler')}" for e in es}),
                       "resolved": all(e.get("resolved", True) for e in es)})
+    # within a level: entries where the two readings of the access rules disagree first
     units.sort(key=lambda u: (EXPOSURE_RANK.get(u["exposure"], 1), not u["resolved"],
+                              not any(e.get("exposure_declared") for e in u["entries"]),
                               u["entries"][0].get("route", "")))
     return units
 
@@ -298,6 +376,7 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
     uid = ",".join(e["id"] for e in unit["entries"][:5])
     tb = Toolbox(cfg, root, out, facts=facts, unit=uid, issues=issues)
     tb.resolver_code = resolver
+    tb.known_entries = {(str(e.get("method") or "GET").upper(), str(e.get("route"))): e for e in entries}
     llm = LLM(cfg)
     entry_view = {"routes": [{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
                                                      "exposure_declared", "who_can_call", "declared_at")
@@ -335,6 +414,24 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
     return {"findings": tb.findings, "cards": tb.cards, **_metrics(llm, res)}
 
 
+def _exposure_check(cards: list[dict], entries: list[dict]) -> dict:
+    """How often the reviewers, having read the handler, agree with recon's exposure and the resolver."""
+    by_id = {e["id"]: e for e in entries}
+    c: collections.Counter = collections.Counter()
+    for card in cards:
+        seen = card.get("least_privileged_caller")
+        es = [by_id[i] for i in card.get("entries", []) if i in by_id]
+        if seen not in (*EXPOSURES, "denied") or not es:
+            continue
+        e = es[0]
+        c["cards"] += 1
+        c["recon_agrees"] += (e.get("exposure_declared") or e.get("exposure")) == seen
+        if e.get("who_can_call"):
+            c["resolver_answered"] += 1
+            c["resolver_agrees"] += e["who_can_call"]["least_privileged"] == seen
+    return dict(c)
+
+
 def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy: str = "", product: str = "",
            surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None,
            resolver: str | None = None) -> dict:
@@ -364,6 +461,7 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
          "errors": sum(1 for r in results if r.get("error")), "facts": len(facts.facts),
          "cards": len(cards), "n_findings": len(findings), "root_causes": len(issues.issues),
          "authz_verdicts": dict(collections.Counter(c.get("authz_verdict") for c in cards)),
+         "exposure_check": _exposure_check(cards, entries),
          "workers": cfg.workers, "llm_limiter": limiter_for(cfg).stats(),
          "wall_s": round(time.time() - t0, 1)}
     (out / "metrics.json").write_text(json.dumps(m, indent=1))
