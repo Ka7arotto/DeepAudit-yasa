@@ -32,7 +32,7 @@ ENTRY_KEYS = ("route", "method", "handler_file", "handler", "handler_line", "aut
               "kind")
 EXPOSURES = ("public", "authenticated", "privileged", "unknown")
 FINDING_REQUIRED = ("vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege", "verdict",
-                    "route_evidence")
+                    "route_evidence", "impact")
 
 
 def clip(text: str, limit: int = MAX_OUT) -> str:
@@ -675,6 +675,8 @@ def tool_schemas(role: str) -> list[dict]:
                                        "enum": ["none", "customer", "admin", "operator_or_cli"]},
                 "hops": {"type": "array", "items": s},
                 "sanitizers": s,
+                "impact": {"type": "string", "description": "what the attacker concretely gains: data read, "
+                           "state changed, privilege obtained, code run (not 'a check is skipped')"},
                 "root_cause": {"type": "string", "description": "one sentence naming the underlying flaw, so "
                                "the same flaw behind other entries is recognised"},
                 "same_as": {"type": "string", "description": "id of an already reported root cause (e.g. I2) "
@@ -688,7 +690,7 @@ def tool_schemas(role: str) -> list[dict]:
                                    "properties": {"file": s, "line": i, "quote": s}},
                 "verdict": {"type": "string", "enum": ["confirmed", "likely"]}},
                ["vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege",
-                "verdict", "route_evidence"]),
+                "verdict", "route_evidence", "impact"]),
             fn("add_fact", "Share a project fact other reviewers can rely on: one claim, at most 240 "
                "characters (e.g. how a helper escapes, that all data access goes through a typed query API, "
                "which base class enforces login). Rejected unless each quote is found at file:line.",

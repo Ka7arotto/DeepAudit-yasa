@@ -257,6 +257,7 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                                           "source": "$_GET['name']", "entry": "GET /download (public)",
                                           "required_privilege": "none", "verdict": "confirmed",
                                           "root_cause": "file name from the query joined to a path",
+                                          "impact": "reads any file the server can read",
                                           "route_evidence": {"file": "web/Download.php", "line": 2,
                                                              "quote": "class Download"}})],
         "/home": [("record_card", {"function": "home page", "callers": "anyone", "authz_verdict": "ok",
@@ -628,9 +629,13 @@ def test_adaptive_limiter_halves_on_rate_limit_and_grows_back():
 def test_report_finding_requires_fields(tmp_path):
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path, unit="E1")
     assert tb.report_finding().startswith("rejected: missing vuln_type")
+    assert "impact" in tb.report_finding(vuln_type="x", cwe="y", sink_file="a", sink_line=1, source="s",
+                                         entry="e", required_privilege="none", verdict="likely",
+                                         route_evidence={"file": "a", "line": 1, "quote": "q"})
     _write(tmp_path, {"Routes.java": "class Routes {\n  route(GET(\"/x\"), this::get);\n}\n"})
     full = {"vuln_type": "IDOR", "cwe": "CWE-639", "sink_file": "a.java", "sink_line": 3, "source": "id",
             "entry": "GET /x", "required_privilege": "customer", "root_cause": "no owner check",
+            "impact": "reads another user's order",
             "route_evidence": {"file": "Routes.java", "line": 2, "quote": 'GET("/x")'}}
     assert tb.report_finding(**full, verdict="false_positive").startswith("rejected: verdict")
     phantom = dict(full, route_evidence={"file": "Routes.java", "line": 2, "quote": 'GET("/y")'})
@@ -727,7 +732,7 @@ def test_issue_board_links_findings_by_root_cause(tmp_path):
     board = IssueBoard()
     ev = lambda line, q: {"file": "r.js", "line": line, "quote": q}  # noqa: E731
     base = {"vuln_type": "IDOR", "cwe": "CWE-639", "sink_file": "s.js", "sink_line": 9, "source": "id",
-            "required_privilege": "customer", "verdict": "likely"}
+            "required_privilege": "customer", "verdict": "likely", "impact": "uses the owner's bank link"}
     t1 = Toolbox(AuditConfig(), tmp_path, tmp_path, unit="E1", issues=board)
     assert t1.report_finding(**base, entry="POST /a", route_evidence=ev(1, "app.post('/a'")).startswith("rejected: root_cause")
     assert t1.report_finding(**base, entry="POST /a", route_evidence=ev(1, "app.post('/a'"),

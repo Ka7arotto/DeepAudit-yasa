@@ -107,7 +107,9 @@ mail servers, impersonating) is not a vulnerability; report an admin-level issue
 boundary the role should not cross (a read-only role writes, a role reads secrets it is not granted,
 one tenant reaches another), and say which boundary. "confirmed" needs a concrete request (method,
 path, parameters) and the observable difference it causes; otherwise use "likely". Give each finding its
-root cause in one sentence, or link it to an already reported one with same_as. If the project itself
+impact (what the attacker concretely gains: data read, state changed, privilege obtained, code run; a
+check that is skipped without any such effect is not a finding) and its root cause in one sentence, or
+link it to an already reported one with same_as. If the project itself
 states the behaviour is intended or accepted (a code comment, a document), still report it and cite that
 statement as documented_intent: whether to accept the risk is the owner's decision.
 Use at most {budget} tool calls.

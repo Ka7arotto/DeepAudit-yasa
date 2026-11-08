@@ -117,7 +117,7 @@ def _describe(f: dict) -> str:
         parts.append(f"Documented as intended by the project: {di.get('file')}:{di.get('line')} \"{di.get('quote')}\"")
     if f.get("issue"):
         parts.append(f"Root cause {f['issue']}: {f.get('root_cause') or '(see linked finding)'}")
-    for key, label in (("entry", "Entry"), ("required_privilege", "Required privilege"),
+    for key, label in (("impact", "Impact"), ("entry", "Entry"), ("required_privilege", "Required privilege"),
                        ("source", "Source"), ("sanitizers", "Guards/sanitizers"), ("handler", "Handler")):
         if f.get(key):
             parts.append(f"{label}: {f[key]}")
