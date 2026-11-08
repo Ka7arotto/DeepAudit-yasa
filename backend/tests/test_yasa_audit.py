@@ -514,3 +514,12 @@ def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
     m = pipeline.recon(AuditConfig(), tmp_path, tmp_path / "recon")
     assert m["passes"] == 2 and m["source"] == "agent" and m["entries"] == 1 and m["resolved"] == 1
     assert "/apis/posts -> Posts::list" in seen[-1] and m["notes"] == "RouterFunction beans, 1 extractor"
+
+
+def test_report_finding_requires_fields(tmp_path):
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path, unit="E1")
+    assert tb.report_finding().startswith("rejected: missing vuln_type")
+    full = {"vuln_type": "IDOR", "cwe": "CWE-639", "sink_file": "a.java", "sink_line": 3, "source": "id",
+            "entry": "GET /x", "required_privilege": "customer"}
+    assert tb.report_finding(**full, verdict="false_positive").startswith("rejected: verdict")
+    assert tb.report_finding(**full, verdict="likely") == "recorded #1" and tb.findings[0]["_unit"] == "E1"

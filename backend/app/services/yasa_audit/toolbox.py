@@ -30,6 +30,7 @@ SKIP_DIRS = {".yasa", ".codegraph", "node_modules", ".git"}
 MAX_OUT = 8000
 ENTRY_KEYS = ("route", "method", "handler_file", "handler", "auth", "exposure", "declared_at", "kind")
 EXPOSURES = ("public", "authenticated", "privileged", "unknown")
+FINDING_REQUIRED = ("vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege", "verdict")
 
 
 def clip(text: str, limit: int = MAX_OUT) -> str:
@@ -387,6 +388,11 @@ class Toolbox:
         return f"card recorded ({len(self.cards)})"
 
     def report_finding(self, **finding: Any) -> str:
+        missing = [k for k in FINDING_REQUIRED if finding.get(k) in (None, "")]
+        if missing:
+            return f"rejected: missing {', '.join(missing)}; send the finding again with them"
+        if finding.get("verdict") not in ("confirmed", "likely"):
+            return "rejected: verdict must be confirmed or likely (record rejected risks in record_card)"
         finding["_unit"] = self.unit
         self.findings.append(finding)
         return f"recorded #{len(self.findings)}"
