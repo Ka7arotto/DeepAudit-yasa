@@ -86,8 +86,26 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
     user = (f"Files by extension (vendored and VCS directories left out): {_ext_counts(root)}\n\n"
             f"Top-level layout:\n{tb.list_dir('.', 2)}\n\n"
             f"codegraph route evidence:\n{tb.codegraph_routes(limit=25)}")
+    no_extractor_yet = (lambda steps, t: steps >= cfg.recon_budget // 2 and not t.extractors and not t.manual,
+                        "Half of your tool budget is used and no extractor has run. Stop reading: write an "
+                        "extractor for the dispatcher you understand best and run it now, then refine.")
     res = run_agent(llm, tb, tool_schemas("recon"), recon_prompt(cfg.recon_budget, deploy, product), user,
-                    cfg.recon_budget, out / "transcript.jsonl", deadline=deadline)
+                    cfg.recon_budget, out / "transcript.jsonl", deadline=deadline, reminders=[no_extractor_yet])
+    passes = 1
+    # Understood the dispatch but enumerated nothing: a second, fresh context that starts from the agent's
+    # own notes and only has to turn them into extractors.
+    if not tb.entries() and tb.notes and (deadline is None or time.time() < deadline - 120):
+        budget2 = max(10, cfg.recon_budget // 2)
+        tb.finished = False
+        res2 = run_agent(
+            llm, tb, tool_schemas("recon"), recon_prompt(budget2, deploy, product),
+            "An earlier pass worked out how requests reach code but did not enumerate any entries. Its "
+            f"notes:\n{tb.notes}\n\nWrite one extractor per dispatcher described there, run each with "
+            "run_extractor, fix what the checks report, then call finish with the notes (updated).",
+            budget2, out / "transcript-2.jsonl", deadline=deadline)
+        res = {k: (res.get(k, 0) + res2.get(k, 0)) if isinstance(res2.get(k), (int, float)) and k != "finished"
+               else res2.get(k) for k in res2}
+        passes = 2
     entries = tb.entries()
     source = "agent"
     if not entries:  # the agent produced nothing usable: keep codegraph's routes so review can start
@@ -104,7 +122,8 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
     m = _metrics(llm, {"stage": "recon", "source": source, "entries": len(entries),
                        "resolved": sum(e["resolved"] for e in entries), "by_exposure": dict(by_exp),
                        "extractors": {k: len(v["entries"]) for k, v in tb.extractors.items()},
-                       "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes, **res})
+                       "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
+                       "passes": passes, **res})
     (out / "recon.json").write_text(json.dumps(m, indent=1, ensure_ascii=False))
     return m
 

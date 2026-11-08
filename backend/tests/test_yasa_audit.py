@@ -490,3 +490,27 @@ def test_agent_loop_explains_unparsable_arguments_and_forces_finish(tmp_path):
     log = [json.loads(line) for line in (tmp_path / "t.jsonl").read_text().splitlines()]
     assert "not valid JSON" in next(e["content"] for e in log if e.get("role") == "tool")
     assert llm.seen[-1] == ["finish"] and res["finished"] and tb.notes == "two dispatchers"
+
+
+def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+
+    _write(tmp_path, {"api/Posts.java": "class Posts { Mono<ServerResponse> list(ServerRequest r) { return null; } }"})
+    extractor = ("import json; print(json.dumps([{'route': '/apis/posts', 'handler_file': 'api/Posts.java', "
+                 "'handler': 'list', 'exposure': 'authenticated'}]))")
+    script = [("finish", {"notes": "RouterFunction beans: /apis/posts -> Posts::list"}),  # pass 1: notes only
+              ("run_extractor", {"name": "router", "code": extractor}),                  # pass 2
+              ("finish", {"notes": "RouterFunction beans, 1 extractor"})]
+    llm = ScriptedLLM(script)
+    seen = []
+    orig = llm.chat
+
+    def chat(messages, tools=None):
+        seen.append(messages[1]["content"])
+        return orig(messages, tools)
+
+    llm.chat = chat
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: llm)
+    m = pipeline.recon(AuditConfig(), tmp_path, tmp_path / "recon")
+    assert m["passes"] == 2 and m["source"] == "agent" and m["entries"] == 1 and m["resolved"] == 1
+    assert "/apis/posts -> Posts::list" in seen[-1] and m["notes"] == "RouterFunction beans, 1 extractor"
