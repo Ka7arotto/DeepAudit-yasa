@@ -47,6 +47,26 @@ class ScriptedLLM:
         return SimpleNamespace(content="", tool_calls=[_call(name, args, f"c{self.usage.calls}")])
 
 
+class ByRole:
+    """LLM factory for recon tests: each agent gets the scripted model for its role, picked from its
+    system prompt at the first call (the two agents start in parallel, in no fixed order)."""
+
+    def __init__(self, **roles):
+        self.roles = roles
+
+    def __call__(self, cfg):
+        roles = self.roles
+
+        class Proxy:
+            usage = SimpleNamespace(prompt=0, completion=0, cached=0, reasoning=0, calls=0)
+
+            def chat(self, messages, tools=None):
+                role = "access" if "controls ACCESS" in messages[0]["content"] else "surface"
+                return roles[role].chat(messages, tools)
+
+        return Proxy()
+
+
 # ---------------------------------------------------------------- toolbox
 
 
@@ -211,12 +231,14 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                  "'handler_file': 'web/' + f, 'handler': 'execute', 'exposure': 'public'} "
                  "for f in sorted(os.listdir(os.path.join(r, 'web')))]))")
     scripts = {
+        "access": [("finish", {"notes": "too early"}),  # refused: no access model yet
+                   ("record_access_model", {"authentication": "none", "authorization": "none",
+                                            "permission_mapping": "none", "principals": "anyone",
+                                            "evidence": [{"file": "web/Home.php", "line": 3,
+                                                          "quote": "function execute()"}]}),
+                   ("finish", {"notes": "no access control"})],
         "recon": [("run_extractor", {"name": "web", "code": extractor}),
-                  ("finish", {"notes": "too early"}),  # refused: no access model, no coverage check
-                  ("record_access_model", {"authentication": "none", "authorization": "none",
-                                           "permission_mapping": "none", "principals": "anyone",
-                                           "evidence": [{"file": "web/Home.php", "line": 3,
-                                                         "quote": "function execute()"}]}),
+                  ("finish", {"notes": "too early"}),  # refused: coverage not checked
                   ("check_coverage", {"request_read_pattern": r"\$_GET"}),
                   ("finish", {"notes": "web/<Name>.php::execute serves /<name>"})],
         "/download": [("record_card", {"function": "file download", "callers": "anyone",
@@ -244,7 +266,8 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                 user = messages[1]["content"]
                 users.append(user)
                 systems.append(messages[0]["content"])
-                key = next((k for k in ("/download", "/home") if f'"route": "{k}"' in user), "recon")
+                key = next((k for k in ("/download", "/home") if f'"route": "{k}"' in user),
+                           "access" if "controls ACCESS" in messages[0]["content"] else "recon")
                 self.script = list(scripts[key])
             return super().chat(messages, tools)
 
@@ -529,20 +552,21 @@ def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
               ("record_access_model", model),
               ("check_coverage", {"request_read_pattern": r"queryParam\("}),
               ("finish", {"notes": "RouterFunction beans, 1 extractor"})]
-    llm = ScriptedLLM(script)
+    surface = ScriptedLLM([x for x in script if x[0] != "record_access_model"])
+    access = ScriptedLLM([("record_access_model", model), ("finish", {})])
     seen = []
-    orig = llm.chat
+    orig = surface.chat
 
     def chat(messages, tools=None):
-        seen.append(messages[1]["content"])
+        seen.append(messages[-1]["content"] if messages[-1]["role"] == "user" else messages[1]["content"])
         return orig(messages, tools)
 
-    llm.chat = chat
-    monkeypatch.setattr(pipeline, "LLM", lambda cfg: llm)
+    surface.chat = chat
+    monkeypatch.setattr(pipeline, "LLM", ByRole(access=access, surface=surface))
     cfg = _cfg(recon_budget=2)
     m = pipeline.recon(cfg, tmp_path, tmp_path / "recon")
     assert m["passes"] == 2 and m["source"] == "agent" and m["entries"] == 1 and m["resolved"] == 1
-    assert "/apis/posts -> Posts::list" in seen[-1] and m["notes"] == "RouterFunction beans, 1 extractor"
+    assert any("/apis/posts -> Posts::list" in x for x in seen) and m["notes"] == "RouterFunction beans, 1 extractor"
     assert m["access_model"]["principals"] == "anonymous < user"
 
 
@@ -604,3 +628,37 @@ def test_report_finding_requires_fields(tmp_path):
             "entry": "GET /x", "required_privilege": "customer"}
     assert tb.report_finding(**full, verdict="false_positive").startswith("rejected: verdict")
     assert tb.report_finding(**full, verdict="likely") == "recorded #1" and tb.findings[0]["_unit"] == "E1"
+
+
+def test_recon_sends_access_model_to_the_surface_agent(tmp_path, monkeypatch):
+    import threading
+
+    from app.services.yasa_audit import pipeline
+
+    _write(tmp_path, {"Sec.java": "class Sec {\n  boolean allowed() { return true; }\n}\n"})
+    recorded = threading.Event()
+    model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "anon < admin",
+             "evidence": [{"file": "Sec.java", "line": 2, "quote": "allowed()"}]}
+
+    class Access(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            r = super().chat(messages, tools)
+            if self.usage.calls == 2:
+                recorded.set()
+            return r
+
+    surface_msgs = []
+
+    class Surface(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            recorded.wait(5)
+            time.sleep(0.05)  # let the access agent publish its result
+            surface_msgs.append([m["content"] for m in messages if m["role"] == "user"])
+            return super().chat(messages, tools)
+
+    monkeypatch.setattr(pipeline, "LLM", ByRole(
+        access=Access([("record_access_model", model), ("finish", {})]),
+        surface=Surface([("list_dir", {}), ("list_dir", {}), ("finish", {"notes": "n"})])))
+    m = pipeline.recon(AuditConfig(), tmp_path, tmp_path / "recon")
+    assert m["access_model"]["principals"] == "anon < admin" and m["access_agent"]["finished"]
+    assert any("access-control model is ready" in u and "anon < admin" in u for msgs in surface_msgs for u in msgs)

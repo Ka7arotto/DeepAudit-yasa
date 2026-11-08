@@ -22,7 +22,8 @@ def _compact(messages: list[dict], keep_last: int = 14, limit_chars: int = 160_0
             messages[i]["content"] = c[:400] + "\n...[older tool output elided]"
 
 
-Reminder = tuple[Callable[[int, Toolbox], bool], str]
+# (condition(steps, toolbox), message or message(toolbox)); sent once, the first time the condition holds
+Reminder = tuple[Callable[[int, Toolbox], bool], "str | Callable[[Toolbox], str]"]
 
 
 def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, budget: int,
@@ -55,7 +56,7 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                                  "have concluded now, then call finish."})
                 time_warned = warned = True
             for rem in [r for r in pending if r[0](steps, tb)]:
-                messages.append({"role": "user", "content": rem[1]})
+                messages.append({"role": "user", "content": rem[1](tb) if callable(rem[1]) else rem[1]})
                 pending.remove(rem)
             if not warned and steps >= budget - 3:
                 messages.append({"role": "user", "content": "Budget nearly used. Report what you "

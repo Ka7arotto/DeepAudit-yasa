@@ -24,7 +24,7 @@ from .agent_loop import run_agent
 from .config import AuditConfig
 from .discovery import codegraph_db, codegraph_routes, snapshot_codegraph
 from .llm import LLM, limiter_for
-from .prompts import recon_prompt, review_prompt
+from .prompts import access_model_text, access_prompt, recon_prompt, review_prompt
 from .toolbox import FactBook, Toolbox, tool_schemas
 
 MIN_UNIT_S = 60  # do not start a unit with less time left than this
@@ -73,28 +73,53 @@ def _ext_counts(root: Path) -> list[tuple[str, int]]:
 
 # ----------------------------------------------------------------- recon
 
+def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product: str,
+                  deadline: float | None, user: str, holder: dict) -> None:
+    """Works out the project-wide access-control model; publishes it in holder['model']."""
+    tb = Toolbox(cfg, root, out, unit="access")
+    tb.finish_gates = [(lambda t: t.access_model is None,
+                        "record_access_model first (how requests are authenticated and authorized)")]
+    llm = LLM(cfg)
+    try:
+        holder["res"] = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.access_budget, deploy, product),
+                                  user, cfg.access_budget, out / "transcript-access.jsonl", deadline=deadline)
+    except Exception as e:  # the surface agent and the review still run without a model
+        holder["error"] = f"{type(e).__name__}: {e}"
+    holder["model"], holder["llm"] = tb.access_model, llm
+    holder["done"].set()
+
+
 def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
           deadline: float | None = None) -> dict:
-    """The recon agent decides the attack surface. Writes entries.json and recon.json to out."""
+    """Two agents in parallel: one maps the attack surface (entries.json), one the access-control model.
+    The model is sent to the surface agent as soon as it is recorded, for the entries' exposure."""
     out.mkdir(parents=True, exist_ok=True)
     try:
         snapshot_codegraph(root, out)
     except Exception:
         pass
     tb = Toolbox(cfg, root, out, unit="recon")
-    tb.finish_gates = [(lambda t: t.access_model is None,
-                        "record_access_model first (how requests are authenticated and authorized)"),
-                       (lambda t: (t.extractors or t.manual) and t.coverage is None,
-                        "run check_coverage once with a pattern for how this project reads request data")]
-    llm = LLM(cfg)
     user = (f"Files by extension (vendored and VCS directories left out): {_ext_counts(root)}\n\n"
             f"Top-level layout:\n{tb.list_dir('.', 2)}\n\n"
             f"codegraph route evidence:\n{tb.codegraph_routes(limit=25)}")
+    holder: dict = {"model": None, "done": threading.Event()}
+    access = threading.Thread(target=_access_agent, daemon=True,
+                              args=(cfg, root, out, deploy, product, deadline, user, holder))
+    access.start()
+
+    tb.finish_gates = [(lambda t: (t.extractors or t.manual) and t.coverage is None,
+                        "run check_coverage once with a pattern for how this project reads request data")]
+    llm = LLM(cfg)
     no_extractor_yet = (lambda steps, t: steps >= cfg.recon_budget // 2 and not t.extractors and not t.manual,
                         "Half of your tool budget is used and no extractor has run. Stop reading: write an "
                         "extractor for the dispatcher you understand best and run it now, then refine.")
+    model_ready = (lambda steps, t: holder["done"].is_set() and holder["model"] is not None,
+                   lambda t: "The access-control model is ready. Use it to set each entry's exposure (the "
+                             "least privileged principal that can call it); re-run extractors if needed:\n"
+                             + access_model_text(holder["model"]))
     res = run_agent(llm, tb, tool_schemas("recon"), recon_prompt(cfg.recon_budget, deploy, product), user,
-                    cfg.recon_budget, out / "transcript.jsonl", deadline=deadline, reminders=[no_extractor_yet])
+                    cfg.recon_budget, out / "transcript.jsonl", deadline=deadline,
+                    reminders=[no_extractor_yet, model_ready])
     passes = 1
     # Understood the dispatch but enumerated nothing: a second, fresh context that starts from the agent's
     # own notes and only has to turn them into extractors.
@@ -106,10 +131,13 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
             "An earlier pass worked out how requests reach code but did not enumerate any entries. Its "
             f"notes:\n{tb.notes}\n\nWrite one extractor per dispatcher described there, run each with "
             "run_extractor, fix what the checks report, then call finish with the notes (updated).",
-            budget2, out / "transcript-2.jsonl", deadline=deadline)
+            budget2, out / "transcript-2.jsonl", deadline=deadline,
+            reminders=[model_ready] if holder["model"] is None else [])
         res = {k: (res.get(k, 0) + res2.get(k, 0)) if isinstance(res2.get(k), (int, float)) and k != "finished"
                else res2.get(k) for k in res2}
         passes = 2
+    # the review needs the model: wait for the access agent within the deadline
+    holder["done"].wait(timeout=None if deadline is None else max(0.0, deadline + 60 - time.time()))
     entries = tb.entries()
     source = "agent"
     if not entries:  # the agent produced nothing usable: keep codegraph's routes so review can start
@@ -127,8 +155,14 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
                        "resolved": sum(e["resolved"] for e in entries), "by_exposure": dict(by_exp),
                        "extractors": {k: len(v["entries"]) for k, v in tb.extractors.items()},
                        "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
-                       "access_model": tb.access_model,
+                       "access_model": holder["model"], "access_error": holder.get("error"),
                        "passes": passes, **res})
+    if holder.get("llm") is not None:  # both agents' tokens count
+        a = _metrics(holder["llm"], holder.get("res") or {})
+        for k in ("prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens", "llm_calls"):
+            m[k] = m.get(k, 0) + a.get(k, 0)
+        m["access_agent"] = {k: a.get(k) for k in ("steps", "wall_s", "tool_counts", "finished",
+                                                   "prompt_tokens", "llm_calls")}
     (out / "recon.json").write_text(json.dumps(m, indent=1, ensure_ascii=False))
     return m
 

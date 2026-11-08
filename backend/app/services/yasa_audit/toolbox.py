@@ -486,7 +486,7 @@ class Toolbox:
 
 
 def tool_schemas(role: str) -> list[dict]:
-    """role: 'recon' or 'review'."""
+    """role: 'recon' (surface), 'access' (access-control model) or 'review'."""
     def fn(name: str, desc: str, props: dict, required: list[str]) -> dict:
         return {"type": "function", "function": {
             "name": name, "description": desc,
@@ -514,20 +514,8 @@ def tool_schemas(role: str) -> list[dict]:
         "auth": {"type": "string", "description": "what the code/config says about authentication or "
                  "authorization for this entry, verbatim where possible"},
         "exposure": {"type": "string", "enum": list(EXPOSURES)}}}
-    if role == "recon":
+    if role == "access":
         tools += [
-            fn("codegraph_routes", "Routes that codegraph's framework resolvers recognised. Evidence only: "
-               "may be empty or incomplete for this project.", {"contains": s, "limit": i}, []),
-            fn("run_extractor",
-               "Run a Python 3 program you wrote that enumerates entries of THIS project. It gets the "
-               "project root as sys.argv[1], may read any file there (standard library only, no network) "
-               "and must print a JSON list of objects with keys route, method, handler_file (relative), "
-               "handler (function/method name), kind, auth, exposure (public|authenticated|privileged|"
-               "unknown), declared_at (file:line). Returns counts, unresolved handlers and random samples "
-               "to verify. Several extractors may cover different parts of the surface; the same name "
-               "replaces the earlier version.", {"name": s, "code": s}, ["name", "code"]),
-            fn("add_entries", "Add a few entries by hand (same keys as extractor output).",
-               {"entries": {"type": "array", "items": entry}}, ["entries"]),
             fn("record_access_model",
                "Record how THIS project authenticates and authorizes requests, once, before finish. "
                "Reviewers of every entry rely on it instead of re-reading the security chain.",
@@ -544,6 +532,21 @@ def tool_schemas(role: str) -> list[dict]:
                 "evidence": {"type": "array", "items": {"type": "object", "properties": {
                     "file": s, "line": i, "quote": s}}}},
                ["authentication", "authorization", "permission_mapping", "principals", "evidence"]),
+        ]
+    elif role == "recon":
+        tools += [
+            fn("codegraph_routes", "Routes that codegraph's framework resolvers recognised. Evidence only: "
+               "may be empty or incomplete for this project.", {"contains": s, "limit": i}, []),
+            fn("run_extractor",
+               "Run a Python 3 program you wrote that enumerates entries of THIS project. It gets the "
+               "project root as sys.argv[1], may read any file there (standard library only, no network) "
+               "and must print a JSON list of objects with keys route, method, handler_file (relative), "
+               "handler (function/method name), kind, auth, exposure (public|authenticated|privileged|"
+               "unknown), declared_at (file:line). Returns counts, unresolved handlers and random samples "
+               "to verify. Several extractors may cover different parts of the surface; the same name "
+               "replaces the earlier version.", {"name": s, "code": s}, ["name", "code"]),
+            fn("add_entries", "Add a few entries by hand (same keys as extractor output).",
+               {"entries": {"type": "array", "items": entry}}, ["entries"]),
             fn("check_coverage",
                "Coverage check: give a ripgrep pattern matching how THIS project reads request data "
                "(e.g. the request object's getter calls). Lists read sites not reachable from any "
