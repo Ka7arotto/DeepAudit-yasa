@@ -350,9 +350,27 @@ def _units(entries: list[dict]) -> list[dict]:
     unit per resource: access control and object ownership differ per resource, and one context cannot
     judge dozens of them.
     """
+    # One code path is reviewed once: entries that share a handler or a request (the same method and route
+    # described by two extractors, e.g. once at the route file and once at the controller) are one unit.
+    parent = list(range(len(entries)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first: dict[tuple, int] = {}
+    for i, e in enumerate(entries):
+        for key in (("h", *_handler_id(e)), ("r", e.get("method", "ANY"), e.get("route"))):
+            if key in first:
+                parent[find(i)] = find(first[key])
+            else:
+                first[key] = i
     by_handler: dict[tuple, list[dict]] = {}
-    for e in entries:
-        by_handler.setdefault(_handler_id(e), []).append(e)
+    for i, e in enumerate(entries):
+        root = entries[find(i)]
+        by_handler.setdefault(_handler_id(root), []).append(e)
     groups: list[tuple[str, str, list[dict], bool]] = []
     by_res: dict[str, list[dict]] = {}  # routes of generic handlers, by resource (all their verbs together)
     for (hf, h, _line, _), es in by_handler.items():

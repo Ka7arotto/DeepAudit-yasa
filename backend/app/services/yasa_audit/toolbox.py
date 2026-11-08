@@ -347,14 +347,27 @@ class Toolbox:
         return clip(head + ("\n" + "\n".join(rows) if rows else ""))
 
     def entries(self) -> list[dict]:
-        """Union of all extractor outputs and manual entries, deduplicated."""
-        seen, out = set(), []
-        for e in [x for ex in self.extractors.values() for x in ex["entries"]] + self.manual:
-            key = (e.get("method", "ANY"), e.get("route"), e.get("handler_file"), e.get("handler"))
-            if key not in seen:
-                seen.add(key)
-                out.append(e)
+        """Union of all extractor outputs and manual entries. One entry per (method, route, handler file):
+        the most recently run extractor wins, and an entry whose handler does not resolve is dropped when
+        another one for the same request does (two services may serve the same path from different files)."""
+        runs = sorted(self.extractors.values(), key=lambda ex: ex.get("run", 0))
+        by_req: dict[tuple, dict[str, dict]] = {}
+        for e in [x for ex in runs for x in ex["entries"]] + self.manual:  # later ones replace earlier ones
+            by_req.setdefault((e.get("method", "ANY"), e.get("route")), {})[str(e.get("handler_file"))] = e
+        out = []
+        for cands in by_req.values():
+            ok = [e for e in cands.values() if self._check_entry(e) is None]
+            out += ok or list(cands.values())
         return out
+
+    def overlaps(self) -> list[tuple]:
+        """Requests that several extractors map to different handlers."""
+        seen: dict[tuple, set] = {}
+        for name, ex in self.extractors.items():
+            for e in ex["entries"]:
+                seen.setdefault((e.get("method", "ANY"), e.get("route")), set()).add(
+                    (name, e.get("handler_file"), e.get("handler")))
+        return [(k, v) for k, v in seen.items() if len({(f, h) for _, f, h in v}) > 1 and len({n for n, _, _ in v}) > 1]
 
     def _check_entry(self, e: dict) -> str | None:
         """None when the handler is concrete code in the project, else the reason it is not."""
@@ -514,7 +527,8 @@ class Toolbox:
             return clip(f"error: stdout is not JSON ({e}); first bytes: {out[:300]!r}", 2000)
         entries, problems = self._clean(raw, f"extractor:{name}")
         prev = self.extractors.get(name)
-        self.extractors[name] = {"code": code, "entries": entries}
+        self._runs = getattr(self, "_runs", 0) + 1
+        self.extractors[name] = {"code": code, "entries": entries, "run": self._runs}
         self.extractor_best[name] = max(self.extractor_best.get(name, 0), len(entries))
         (self.run_dir / "extractors").mkdir(exist_ok=True)
         (self.run_dir / "extractors" / f"{name}.py").write_text(code)
@@ -553,6 +567,13 @@ class Toolbox:
                 self.regressions_shown.add((name, "unresolved", now))
                 out.append(f"{name}: {bad} of {now} entries do not resolve to code (fix it, or drop_extractor "
                            "if it was a probe)")
+        ov = self.overlaps()
+        if ov and ("overlaps", len(ov)) not in self.regressions_shown:
+            self.regressions_shown.add(("overlaps", len(ov)))
+            (m, r), v = ov[0]
+            out.append(f"{len(ov)} requests are mapped to different handlers by different extractors, e.g. {m} {r}: "
+                       + "; ".join(f"{n} -> {f}::{h}" for n, f, h in sorted(v, key=str)[:4])
+                       + " (drop or fix the extractors that are wrong)")
         return out
 
     def add_entries(self, entries: list[dict]) -> str:

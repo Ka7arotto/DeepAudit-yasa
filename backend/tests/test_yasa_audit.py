@@ -990,3 +990,34 @@ def test_settle_takes_a_batch():
     assert out == ("G2: verdict must be one of resolver_wrong, declared_wrong, inconsistent_code; unknown group "
                    "'G7'; decided: 1; undecided: G2, G3")
     assert tb.settle({"group": "G2", "verdict": "declared_wrong", "reason": "b:2"}).endswith("undecided: G3")
+
+
+def test_one_entry_per_request_and_overlaps_are_pointed_out(tmp_path):
+    _write(tmp_path, {"r/a.ts": "function real() {}\n", "w/b.ts": "function other() {}\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    tb.run_extractor("probe", "import json; print(json.dumps([{'route': '/cb', 'method': 'GET', "
+                              "'handler_file': 'r/a.ts', 'handler': 'missing'}]))")
+    tb.run_extractor("good", "import json; print(json.dumps([{'route': '/cb', 'method': 'GET', "
+                             "'handler_file': 'r/a.ts', 'handler': 'real'}, {'route': '/s', 'method': 'GET', "
+                             "'handler_file': 'r/a.ts', 'handler': 'real'}]))")
+    tb.run_extractor("worker", "import json; print(json.dumps([{'route': '/s', 'method': 'GET', "
+                               "'handler_file': 'w/b.ts', 'handler': 'other'}]))")
+    es = tb.entries()
+    assert sorted((e["route"], e["handler"]) for e in es) == [("/cb", "real"), ("/s", "other"), ("/s", "real")]
+    msgs = [m for m in tb.extractor_regressions() if "different handlers" in m]
+    assert len(msgs) == 1 and msgs[0].startswith("2 requests are mapped to different handlers")
+
+
+def test_units_merge_entries_that_share_a_request():
+    from app.services.yasa_audit.pipeline import _units
+
+    es = [{"id": "E1", "method": "GET", "route": "/cb", "handler_file": "routes/a.ts", "handler": "h",
+           "exposure": "public"},
+          {"id": "E2", "method": "GET", "route": "/cb", "handler_file": "controllers/a.ts", "handler": "done",
+           "exposure": "public"},
+          {"id": "E3", "method": "POST", "route": "/cb/x", "handler_file": "controllers/a.ts", "handler": "done",
+           "exposure": "public"},
+          {"id": "E4", "method": "GET", "route": "/other", "handler_file": "controllers/b.ts", "handler": "b",
+           "exposure": "public"}]
+    units = _units(es)
+    assert sorted(sorted(e["id"] for e in u["entries"]) for u in units) == [["E1", "E2", "E3"], ["E4"]]
