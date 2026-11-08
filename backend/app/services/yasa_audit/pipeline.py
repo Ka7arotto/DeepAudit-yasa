@@ -85,8 +85,33 @@ def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
                                   user, cfg.access_budget, out / "transcript-access.jsonl", deadline=deadline)
     except Exception as e:  # the surface agent and the review still run without a model
         holder["error"] = f"{type(e).__name__}: {e}"
-    holder["model"], holder["llm"] = tb.access_model, llm
+    holder["model"], holder["llm"], holder["resolver"] = tb.access_model, llm, tb.resolver_code
     holder["done"].set()
+
+
+def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Path) -> dict:
+    """Run the access agent's who-can-call program on every entry. Its answer becomes the entry's
+    exposure; where the surface agent declared another one, both are kept: two independent readings of
+    the access rules that disagree are where access-control mistakes are most likely."""
+    if not code or not entries:
+        return {"installed": bool(code)}
+    (out / "resolver.py").write_text(code)
+    res = tb.resolve_access(entries, code)
+    if isinstance(res, str):
+        return {"installed": True, "error": res[:500]}
+    disagree = unknown = 0
+    for e, r in zip(entries, res, strict=True):
+        e["who_can_call"] = r
+        lp = r["least_privileged"]
+        if lp in ("unknown", "denied"):
+            unknown += lp == "unknown"
+            continue
+        if lp != e.get("exposure"):
+            if e.get("exposure") != "unknown":
+                e["exposure_declared"] = e.get("exposure")
+                disagree += 1
+            e["exposure"] = lp
+    return {"installed": True, "entries": len(entries), "disagreements": disagree, "unknown": unknown}
 
 
 def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
@@ -149,6 +174,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
     for i, e in enumerate(entries):
         e["id"] = f"E{i + 1}"
         e["resolved"] = tb._check_entry(e) is None
+    resolver = _apply_resolver(tb, entries, holder.get("resolver"), out)
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
     by_exp = collections.Counter(e["exposure"] for e in entries)
     m = _metrics(llm, {"stage": "recon", "source": source, "entries": len(entries),
@@ -156,6 +182,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
                        "extractors": {k: len(v["entries"]) for k, v in tb.extractors.items()},
                        "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
                        "access_model": holder["model"], "access_error": holder.get("error"),
+                       "resolver": resolver,
                        "passes": passes, **res})
     if holder.get("llm") is not None:  # both agents' tokens count
         a = _metrics(holder["llm"], holder.get("res") or {})
@@ -265,13 +292,16 @@ def _handler_snippet(root: Path, unit: dict, lines: int = 70) -> str:
 
 
 def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: list[dict], facts: FactBook,
-                 system: str, deadline: float | None, issues: IssueBoard | None = None) -> dict:
+                 system: str, deadline: float | None, issues: IssueBoard | None = None,
+                 resolver: str | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     uid = ",".join(e["id"] for e in unit["entries"][:5])
     tb = Toolbox(cfg, root, out, facts=facts, unit=uid, issues=issues)
+    tb.resolver_code = resolver
     llm = LLM(cfg)
     entry_view = {"routes": [{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
-                                                     "declared_at") if e.get(k)} for e in unit["entries"][:20]],
+                                                     "exposure_declared", "who_can_call", "declared_at")
+                              if e.get(k)} for e in unit["entries"][:20]],
                   "more_routes": max(0, len(unit["entries"]) - 20),
                   "handler_file": unit["handler_file"], "handler": unit["handler"]}
     if unit.get("generic"):
@@ -306,7 +336,8 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
 
 
 def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy: str = "", product: str = "",
-           surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None) -> dict:
+           surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None,
+           resolver: str | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     units = _units(entries)
@@ -315,7 +346,7 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
     system = review_prompt(cfg.review_budget, deploy, product, surface_notes, access_model)
     results, skipped = _schedule(
         units, lambda i, u: _review_unit(cfg, root, out / f"unit-{i:04d}", u, entries, facts, system, deadline,
-                                  issues),
+                                  issues, resolver),
         cfg.workers, deadline, cfg.stopped)
     findings = [f for r in results for f in r["findings"]]
     cards = [c for r in results for c in r["cards"]]
@@ -353,8 +384,9 @@ def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str 
     else:
         rec = recon(cfg, root, out / "recon", deploy, product, start + cfg.recon_share * (deadline - start))
     entries = json.loads(ef.read_text())
+    rf = out / "recon" / "resolver.py"
     rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", deadline,
-                rec.get("access_model"))
+                rec.get("access_model"), rf.read_text() if rf.exists() else None)
     tok = lambda m, k: (m or {}).get(k, 0) or 0  # noqa: E731
     m = {"recon": rec, "review": rv,
          "total_tokens": sum(tok(x, "prompt_tokens") + tok(x, "completion_tokens") for x in (rec, rv)),

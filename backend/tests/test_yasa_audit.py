@@ -237,6 +237,9 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                                             "permission_mapping": "none", "principals": "anyone",
                                             "evidence": [{"file": "web/Home.php", "line": 3,
                                                           "quote": "function execute()"}]}),
+                   ("write_access_resolver", {"code": "import json,sys; r=json.load(sys.stdin); print(json.dumps("
+                                              "[{'least_privileged': 'public', 'rule': 'none'} for _ in r]))",
+                                              "samples": [{"route": "/a"}, {"route": "/b"}, {"route": "/c"}]}),
                    ("finish", {"notes": "no access control"})],
         "recon": [("run_extractor", {"name": "web", "code": extractor}),
                   ("finish", {"notes": "too early"}),  # refused: coverage not checked
@@ -283,6 +286,8 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
     assert m["recon"]["access_model"]["principals"] == "anyone" and m["recon"]["coverage"]["sites"] == 1
     assert m["recon"]["notes"] == "web/<Name>.php::execute serves /<name>"  # the early finish was refused
     assert "- principals: anyone" in systems[-1]  # reviewers get the access model
+    assert m["recon"]["resolver"] == {"installed": True, "entries": 2, "disagreements": 0, "unknown": 0}
+    assert any('"who_can_call": {"least_privileged": "public"' in u for u in users[1:])
     assert m["review"]["units"] == 2 and m["review"]["reviewed_units"] == 2 and m["review"]["facts"] == 1
     data = json.loads((tmp_path / "out" / "review" / "findings.json").read_text())
     (f,) = data["findings"]
@@ -789,3 +794,46 @@ def test_coverage_record_keeps_the_broadest_check(tmp_path):
     tb.check_coverage(r"req\.(body|query)")
     res = json.loads(tb.check_coverage(r"req\.body"))
     assert tb.coverage["sites"] == 2 and "fewer read sites" in res["note"]
+
+
+RESOLVER = """
+import json, sys
+reqs = json.load(sys.stdin)
+out = []
+for r in reqs:
+    p = r["route"]
+    if p.startswith("/admin"):
+        out.append({"least_privileged": "privileged", "principals": ["admin"], "rule": "Rbac.java:3"})
+    elif p.startswith("/me"):
+        out.append({"least_privileged": "authenticated", "principals": ["user"], "rule": "Rbac.java:2"})
+    else:
+        out.append({"least_privileged": "public", "principals": ["anonymous"], "rule": "Rbac.java:1"})
+print(json.dumps(out))
+"""
+
+
+def test_access_resolver_installs_after_samples_and_answers_reviewers(tmp_path):
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    assert tb.who_can_call("GET", "/admin").startswith("error: no resolver")
+    assert tb.write_access_resolver(RESOLVER, [{"route": "/a"}]).startswith("rejected: give at least 3")
+    bad = "import json,sys; json.load(sys.stdin); print(json.dumps([]))"
+    assert "one per request" in tb.write_access_resolver(bad, [{"route": "/a"}, {"route": "/me"}, {"route": "/admin"}])
+    assert tb.resolver_code is None
+    msg = tb.write_access_resolver(RESOLVER, [{"route": "/a"}, {"route": "/me/x"}, {"method": "POST", "route": "/admin/u"}])
+    assert msg.startswith("resolver installed") and "POST /admin/u -> privileged ['admin']" in msg
+    assert json.loads(tb.who_can_call("GET", "/me/orders"))["least_privileged"] == "authenticated"
+    assert (tmp_path / "resolver.py").read_text() == RESOLVER
+
+
+def test_resolver_sets_exposure_and_flags_disagreement(tmp_path):
+    from app.services.yasa_audit.pipeline import _apply_resolver
+
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    entries = [{"route": "/admin/users", "exposure": "authenticated"},   # surface agent too lenient
+               {"route": "/me/orders", "exposure": "unknown"},            # surface agent did not know
+               {"route": "/posts", "exposure": "public"}]
+    out = _apply_resolver(tb, entries, RESOLVER, tmp_path)
+    assert out == {"installed": True, "entries": 3, "disagreements": 1, "unknown": 0}
+    assert entries[0]["exposure"] == "privileged" and entries[0]["exposure_declared"] == "authenticated"
+    assert entries[1]["exposure"] == "authenticated" and "exposure_declared" not in entries[1]
+    assert entries[2]["who_can_call"]["rule"] == "Rbac.java:1"

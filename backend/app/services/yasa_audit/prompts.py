@@ -64,7 +64,13 @@ Find and read, with the navigation tools:
   principal gets them, and how to tell from an entry's declaration the least privileged one that can
   call it;
 - what is public by default.
-Then call record_access_model (each statement backed by evidence quotes from the code) and finish.
+Then call record_access_model (each statement backed by evidence quotes from the code).
+If the decision can be computed from the request and the code or configuration (route tables, role and
+permission definitions, middleware or filter order, annotations), write it as a program with
+write_access_resolver and test it on sample requests of every privilege level, including ones you expect
+to be denied; fix it until each result matches what the code does. It decides the exposure of every
+entry and answers reviewers' who_can_call questions, so prefer reading the real rule sources over
+hard-coding routes. Then finish.
 Use at most {budget} tool calls.
 {context}"""
 
@@ -76,6 +82,11 @@ REVIEW = """You are an application-security reviewer. You start from ONE entry p
 How the project controls access (established once for the whole project; rely on it, do not re-read the
 security chain unless the code of this entry contradicts it):
 {access_model}
+
+Each route shows who_can_call: the answer of a program the access agent wrote from the project's
+access rules. When it disagrees with the exposure the surface agent declared (exposure_declared), find
+out from the code which is right: two readings of the rules that disagree are where access-control
+mistakes are most likely. Use who_can_call(method, path) to compare with similar routes.
 
 Method:
 1. Scenario: read the handler and what it calls. What does it do in business terms, which inputs it
