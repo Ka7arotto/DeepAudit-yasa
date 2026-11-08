@@ -454,3 +454,39 @@ def test_benchmark_scoring():
     assert r["wrongly_rejected"] == ["JS-E01"]
     assert r["unmatched"] == []
     assert json.dumps(r)
+
+
+def test_run_extractor_reports_lost_entries_on_rewrite(tmp_path):
+    _write(tmp_path / "p", {f"c/A{i}.php": "<?php function execute() {}" for i in range(10)})
+    tb = Toolbox(AuditConfig(), tmp_path / "p", tmp_path)
+    gen = ("import json; print(json.dumps([{'route': '/a%d' % i, 'handler_file': 'c/A%d.php' % i, "
+           "'handler': 'execute'} for i in range({n})]))")
+    assert "change_from_previous_version" not in json.loads(tb.run_extractor("x", gen.replace("{n}", "10")))
+    res = json.loads(tb.run_extractor("x", gen.replace("{n}", "3")))
+    ch = res["change_from_previous_version"]
+    assert (ch["previous"], ch["now"], ch["removed"], ch["added"]) == (10, 3, 7, 0)
+    assert "lost 7 of 10" in res["warning"] and ch["removed_by_directory"] == [["c", 7]]
+
+
+def test_agent_loop_explains_unparsable_arguments_and_forces_finish(tmp_path):
+    from app.services.yasa_audit.agent_loop import run_agent
+
+    class FakeLLM:
+        def __init__(self):
+            self.seen = []
+
+        def chat(self, messages, tools=None):
+            self.seen.append([t["function"]["name"] for t in tools])
+            if len(self.seen) == 1:  # a long call cut off mid-JSON
+                bad = SimpleNamespace(id="c1", function=SimpleNamespace(name="list_dir", arguments='{"path": "a'))
+                return SimpleNamespace(content="", tool_calls=[bad])
+            if [t for t in tools if t["function"]["name"] != "finish"]:
+                return SimpleNamespace(content="", tool_calls=[_call("list_dir", {})])
+            return SimpleNamespace(content="", tool_calls=[_call("finish", {"notes": "two dispatchers"})])
+
+    llm = FakeLLM()
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    res = run_agent(llm, tb, tool_schemas("recon"), "s", "u", budget=2, log_path=tmp_path / "t.jsonl")
+    log = [json.loads(line) for line in (tmp_path / "t.jsonl").read_text().splitlines()]
+    assert "not valid JSON" in next(e["content"] for e in log if e.get("role") == "tool")
+    assert llm.seen[-1] == ["finish"] and res["finished"] and tb.notes == "two dispatchers"

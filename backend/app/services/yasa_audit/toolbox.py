@@ -319,11 +319,28 @@ class Toolbox:
         except json.JSONDecodeError as e:
             return clip(f"error: stdout is not JSON ({e}); first bytes: {r.stdout[:300]!r}", 2000)
         entries, problems = self._clean(raw, f"extractor:{name}")
+        prev = self.extractors.get(name)
         self.extractors[name] = {"code": code, "entries": entries}
         (self.run_dir / "extractors").mkdir(exist_ok=True)
         (self.run_dir / "extractors" / f"{name}.py").write_text(code)
         res = {"extractor": name, **self._summary(entries), "problems": problems[:5],
                "total_entries_all_extractors": len(self.entries())}
+        if prev is not None:  # a rewrite must not silently lose part of the surface
+            key = lambda e: (e.get("method"), e.get("route"))  # noqa: E731
+            old, new = {key(e): e for e in prev["entries"]}, {key(e): e for e in entries}
+            removed = [old[k] for k in old.keys() - new.keys()]
+            by_dir: dict[str, int] = {}
+            for e in removed:
+                d = "/".join(os.path.dirname(str(e.get("handler_file") or "?")).split("/")[:4]) or "."
+                by_dir[d] = by_dir.get(d, 0) + 1
+            res["change_from_previous_version"] = {
+                "previous": len(old), "now": len(new), "added": len(new.keys() - old.keys()),
+                "removed": len(removed),
+                "removed_by_directory": sorted(by_dir.items(), key=lambda kv: -kv[1])[:10]}
+            if len(removed) > max(5, len(old) // 5):
+                res["warning"] = (f"this version lost {len(removed)} of {len(old)} entries of the previous "
+                                  "one; check that this was intended (a bug in the rewrite, an exception "
+                                  "caught too broadly, a changed path) before you finish")
         return clip(json.dumps(res, ensure_ascii=False, indent=1))
 
     def add_entries(self, entries: list[dict]) -> str:
@@ -353,7 +370,12 @@ class Toolbox:
             by_dir[d] = by_dir.get(d, 0) + 1
         self.coverage = {"pattern": request_read_pattern, "sites": len(sites), "files": len(files),
                          "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc)}
-        res = {**self.coverage,
+        share = len(unc) / len(sites) if sites else 0.0
+        res = {**self.coverage, "uncovered_share": round(share, 2),
+               "reading": ("most request reads are not reachable from your entries: some dispatcher or "
+                           "area is missing, or entries point at the wrong handlers" if share > 0.5 else
+                           "some request reads are not reachable: look at the directories below" if share > 0.1
+                           else "request reads are covered"),
                "uncovered_by_directory": sorted(by_dir.items(), key=lambda kv: -kv[1])[:20],
                "uncovered_samples": [":".join(s)[:200] for s in unc[:10]]}
         return clip(json.dumps(res, ensure_ascii=False, indent=1))

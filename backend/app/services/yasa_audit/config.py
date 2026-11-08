@@ -68,7 +68,7 @@ class AuditConfig:
     # Budgets. Wall time is the hard constraint: one audit should finish within time_budget_s.
     time_budget_s: int = 1800
     recon_share: float = 0.25  # route reconnaissance may use this share of the budget
-    recon_budget: int = 40  # tool calls of the recon agent
+    recon_budget: int = 60  # tool calls of the recon agent
     review_budget: int = 18  # tool calls per entry review
     workers: int = 6
 
