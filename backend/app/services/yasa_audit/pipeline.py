@@ -185,6 +185,19 @@ def _resource_key(route: str) -> str:
     return "/" + "/".join(keep)
 
 
+def _handler_id(e: dict) -> tuple:
+    """What identifies the code an entry runs: file, name and first line. A name alone does not identify
+    anonymous code (callbacks, lambdas, closures: every route of a file may be 'app.post'), so the
+    handler_line, or else the registration line in the same file, is part of the identity."""
+    hf, h = e.get("handler_file") or "", e.get("handler") or ""
+    line = e.get("handler_line") or 0
+    if not line and e.get("declared_at"):
+        f, _, ln = str(e["declared_at"]).rpartition(":")
+        if f.lstrip("./") == hf and ln.isdigit():
+            line = int(ln)
+    return (hf, h, int(line or 0), "" if hf else e.get("route"))
+
+
 def _units(entries: list[dict]) -> list[dict]:
     """One unit per handler (several routes can run the same code), most exposed first.
 
@@ -194,11 +207,10 @@ def _units(entries: list[dict]) -> list[dict]:
     """
     by_handler: dict[tuple, list[dict]] = {}
     for e in entries:
-        by_handler.setdefault((e.get("handler_file") or "", e.get("handler") or "", e.get("route")
-                               if not e.get("handler_file") else ""), []).append(e)
+        by_handler.setdefault(_handler_id(e), []).append(e)
     groups: list[tuple[str, str, list[dict], bool]] = []
     by_res: dict[str, list[dict]] = {}  # routes of generic handlers, by resource (all their verbs together)
-    for (hf, h, _), es in by_handler.items():
+    for (hf, h, _line, _), es in by_handler.items():
         if len(es) > SPLIT_ROUTES:
             for e in es:
                 by_res.setdefault(_resource_key(e.get("route", "")), []).append(e)
@@ -209,7 +221,8 @@ def _units(entries: list[dict]) -> list[dict]:
     units = []
     for hf, h, es, generic in groups:
         exp = min((e.get("exposure", "unknown") for e in es), key=lambda x: EXPOSURE_RANK.get(x, 1))
-        units.append({"handler_file": hf, "handler": h, "exposure": exp, "entries": es, "generic": generic,
+        units.append({"handler_file": hf, "handler": h, "handler_line": _handler_id(es[0])[2] or None,
+                      "exposure": exp, "entries": es, "generic": generic,
                       "handlers": sorted({f"{e.get('handler_file')}::{e.get('handler')}" for e in es}),
                       "resolved": all(e.get("resolved", True) for e in es)})
     units.sort(key=lambda u: (EXPOSURE_RANK.get(u["exposure"], 1), not u["resolved"],
@@ -241,7 +254,9 @@ def _handler_snippet(root: Path, unit: dict, lines: int = 70) -> str:
     text = f.read_text(errors="ignore").splitlines()
     name = re.escape((unit["handler"] or "").split("::")[-1].split(".")[-1])
     start = 0
-    if name:
+    if unit.get("handler_line"):
+        start = max(0, min(len(text) - 1, int(unit["handler_line"]) - 1))
+    elif name:
         rx = re.compile(rf"(function|def|func|fn|sub)\s+&?{name}\b|\b{name}\s*[:=]\s*(async\s*)?(function|\()"
                         rf"|\b(public|private|protected|static|async)\b[^;=]*\b{name}\s*\(")
         start = next((i for i, ln in enumerate(text) if rx.search(ln)), 0)

@@ -28,7 +28,8 @@ from .config import AuditConfig
 
 SKIP_DIRS = {".yasa", ".codegraph", "node_modules", ".git"}
 MAX_OUT = 8000
-ENTRY_KEYS = ("route", "method", "handler_file", "handler", "auth", "exposure", "declared_at", "kind")
+ENTRY_KEYS = ("route", "method", "handler_file", "handler", "handler_line", "auth", "exposure", "declared_at",
+              "kind")
 EXPOSURES = ("public", "authenticated", "privileged", "unknown")
 FINDING_REQUIRED = ("vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege", "verdict",
                     "route_evidence")
@@ -304,9 +305,12 @@ class Toolbox:
             return "handler_file escapes the project"
         if not p.is_file():
             return "handler_file does not exist"
+        text = p.read_text(errors="ignore")
         h = str(e.get("handler") or "").split("::")[-1].split(".")[-1].split("#")[-1]
-        if h and h not in p.read_text(errors="ignore"):
+        if h and h not in text:
             return f"handler '{h}' does not occur in handler_file"
+        if e.get("handler_line") and not 0 < int(e["handler_line"]) <= text.count("\n") + 1:
+            return "handler_line is outside handler_file"
         return None
 
     def _clean(self, raw: Any, origin: str) -> tuple[list[dict], list[str]]:
@@ -319,6 +323,12 @@ class Toolbox:
                 continue
             e = {k: e.get(k) for k in ENTRY_KEYS if e.get(k) not in (None, "")} | {"origin": origin}
             e["handler_file"] = str(e.get("handler_file", "")).lstrip("./") if e.get("handler_file") else ""
+            try:
+                e["handler_line"] = int(e["handler_line"]) if e.get("handler_line") else None
+            except (TypeError, ValueError):
+                e["handler_line"] = None
+            if not e["handler_line"]:
+                e.pop("handler_line")
             if e.get("exposure") not in EXPOSURES:
                 e["exposure"] = "unknown"
             e["method"] = str(e.get("method") or "ANY").upper()
@@ -517,7 +527,7 @@ def tool_schemas(role: str) -> list[dict]:
         fn("search_symbol", "Search functions/classes/files by name.", {"query": s}, ["query"]),
     ]
     entry = {"type": "object", "properties": {
-        "route": s, "method": s, "handler_file": s, "handler": s, "kind": s, "declared_at": s,
+        "route": s, "method": s, "handler_file": s, "handler": s, "handler_line": i, "kind": s, "declared_at": s,
         "auth": {"type": "string", "description": "what the code/config says about authentication or "
                  "authorization for this entry, verbatim where possible"},
         "exposure": {"type": "string", "enum": list(EXPOSURES)}}}
@@ -548,8 +558,9 @@ def tool_schemas(role: str) -> list[dict]:
                "Run a Python 3 program you wrote that enumerates entries of THIS project. It gets the "
                "project root as sys.argv[1], may read any file there (standard library only, no network) "
                "and must print a JSON list of objects with keys route, method, handler_file (relative), "
-               "handler (function/method name), kind, auth, exposure (public|authenticated|privileged|"
-               "unknown), declared_at (file:line). Returns counts, unresolved handlers and random samples "
+               "handler (function/method name), handler_line (first line of the code that runs; required "
+               "when the handler is anonymous, e.g. a callback or lambda), kind, auth, exposure (public|"
+               "authenticated|privileged|unknown), declared_at (file:line). Returns counts, unresolved handlers and random samples "
                "to verify. Several extractors may cover different parts of the surface; the same name "
                "replaces the earlier version.", {"name": s, "code": s}, ["name", "code"]),
             fn("add_entries", "Add a few entries by hand (same keys as extractor output).",

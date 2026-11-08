@@ -693,3 +693,25 @@ def test_generic_handlers_are_reviewed_per_resource():
     users = next(u for u in units if u["entries"][0]["route"] == "/apis/g/v1/users/{name}")
     assert users["exposure"] == "privileged"  # not dragged to public by the posts routes
     assert not next(u for u in units if u["entries"][0]["id"] == "S1")["generic"]
+
+
+def test_anonymous_handlers_are_told_apart_by_line(tmp_path):
+    from app.services.yasa_audit.pipeline import _handler_snippet, _units
+
+    entries = [
+        {"id": "E1", "route": "/sync/sync", "handler_file": "app-sync.ts", "handler": "app.post",
+         "declared_at": "app-sync.ts:140", "exposure": "authenticated"},
+        {"id": "E2", "route": "/sync/user-get-key", "handler_file": "app-sync.ts", "handler": "app.post",
+         "handler_line": 205, "exposure": "authenticated"},
+        {"id": "E3", "route": "/sync/list", "handler_file": "app-sync.ts", "handler": "listFiles",
+         "exposure": "authenticated"},
+        {"id": "E4", "route": "/sync/files", "handler_file": "app-sync.ts", "handler": "listFiles",
+         "exposure": "authenticated"},
+    ]
+    units = _units(entries)
+    assert sorted(len(u["entries"]) for u in units) == [1, 1, 2]  # named handler still shared
+    _write(tmp_path, {"app-sync.ts": "\n".join(f"// {i}" for i in range(1, 300))})
+    u = next(u for u in units if u["entries"][0]["id"] == "E2")
+    assert _handler_snippet(tmp_path, u, lines=2).startswith("app-sync.ts lines 205-206")
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    assert tb._check_entry({"handler_file": "app-sync.ts", "handler_line": 999}) == "handler_line is outside handler_file"
