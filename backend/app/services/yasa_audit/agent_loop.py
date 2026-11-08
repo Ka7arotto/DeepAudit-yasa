@@ -89,6 +89,7 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                               f"({len(tc.function.arguments or '')} chars; probably cut off by the output "
                               "limit). Send a shorter call, e.g. split a long program into several.")
                 else:
+                    args = {k: v for k, v in args.items() if not str(k).startswith("_")}  # private params
                     try:
                         result = fn(**args)
                     except Exception as e:  # tool errors go back to the model
@@ -111,7 +112,7 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
             for tc in (msg.tool_calls or []) if msg else []:
                 if tc.function.name == "finish":
                     args = parse_args(tc.function.arguments)
-                    tb.finish(**{k: v for k, v in args.items() if k == "notes"})
+                    tb.finish(**{k: v for k, v in args.items() if k == "notes"}, _force=True)
                     log.write(json.dumps({"t": round(time.time() - t0, 1), "role": "tool", "name": "finish",
                                           "args": args, "content": "forced finish"}, ensure_ascii=False) + "\n")
                     break

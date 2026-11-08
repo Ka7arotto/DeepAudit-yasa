@@ -117,7 +117,7 @@ async def execute_yasa_task(
     product = scope.get("product") or ""
     budget_s = int(task.timeout_seconds or 1800)
 
-    cfg = config_from_llm(llm_config, workers=int(scope.get("workers") or 6))
+    cfg = config_from_llm(llm_config, workers=int(scope.get("workers") or 16))
     cfg.should_stop = is_cancelled
     cfg.time_budget_s = budget_s
     missing = check_tools(cfg)

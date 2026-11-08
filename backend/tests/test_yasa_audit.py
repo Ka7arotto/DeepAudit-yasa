@@ -142,12 +142,14 @@ def test_factbook_accepts_only_evidence_found_in_code(tmp_path):
                                          "    return htmlspecialchars($s, ENT_QUOTES);\n  }\n}\n"})
     fb = FactBook(tmp_path)
     ok = [{"file": "lib/Escaper.php", "line": 4, "quote": "htmlspecialchars($s,   ENT_QUOTES)"}]
-    assert fb.add("escapeHtml HTML-escapes with ENT_QUOTES", ok, "u1").startswith("accepted")
-    assert fb.add("escapeHtml  html-escapes with ENT_QUOTES", ok, "u2") == "already known"
+    assert fb.add("escapeHtml HTML-escapes with ENT_QUOTES", ok, "u1") == "accepted as F1"
+    assert fb.add("escapeHtml  html-escapes with ENT_QUOTES", ok, "u2") == "already known as F1"
+    assert fb.add("x" * 300, ok, "u2").startswith("rejected: the statement has 300")
     assert fb.add("x", [{"file": "lib/Escaper.php", "line": 4, "quote": "strip_tags"}], "u3").startswith("rejected")
     assert fb.add("x", [{"file": "../etc/passwd", "line": 1, "quote": "root"}], "u3").startswith("rejected")
     assert fb.add("x", [], "u3").startswith("rejected")
-    assert "lib/Escaper.php:4" in fb.prompt_block() and len(fb.facts) == 1
+    assert "F1: escapeHtml" in fb.prompt_block() and "lib/Escaper.php:4" in fb.prompt_block()
+    assert len(fb.facts) == 1
 
 
 # ---------------------------------------------------------------- pipeline
@@ -169,9 +171,10 @@ def test_units_dedupe_handlers_and_order_by_exposure():
          "resolved": False},
     ]
     units = _units(entries)
-    assert [[e["id"] for e in u["entries"]] for u in units] == [["E2", "E3"], ["E4"], ["E1"], ["E5"]]
+    # exposure first: an unresolved public entry still comes before authenticated and privileged ones
+    assert [[e["id"] for e in u["entries"]] for u in units] == [["E2", "E3"], ["E5"], ["E4"], ["E1"]]
     assert units[0]["exposure"] == "public"  # the most exposed route of a handler decides
-    peers = _peers(units[1], entries)
+    peers = _peers(units[2], entries)  # the /V1/carts/:id/items unit
     assert any("/V1/carts/:id ->" in p for p in peers)
 
 
@@ -196,6 +199,7 @@ def test_recon_falls_back_to_codegraph_when_agent_finds_nothing(tmp_path, monkey
     assert e["id"] == "E1" and e["handler_file"] == "r.ts" and e["resolved"] is False
 
 
+@needs_rg
 def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
     from app.services.yasa_audit import pipeline
 
@@ -208,11 +212,21 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                  "for f in sorted(os.listdir(os.path.join(r, 'web')))]))")
     scripts = {
         "recon": [("run_extractor", {"name": "web", "code": extractor}),
+                  ("finish", {"notes": "too early"}),  # refused: no access model, no coverage check
+                  ("record_access_model", {"authentication": "none", "authorization": "none",
+                                           "permission_mapping": "none", "principals": "anyone",
+                                           "evidence": [{"file": "web/Home.php", "line": 3,
+                                                         "quote": "function execute()"}]}),
+                  ("check_coverage", {"request_read_pattern": r"\$_GET"}),
                   ("finish", {"notes": "web/<Name>.php::execute serves /<name>"})],
         "/download": [("record_card", {"function": "file download", "callers": "anyone",
                                        "authz_verdict": "ok", "hypotheses": [
                                            {"risk": "path traversal", "why": "name joins a path",
-                                            "status": "confirmed"}]}),
+                                            "status": "confirmed"}]}),  # refused: no anchor
+                      ("record_card", {"function": "file download", "callers": "anyone",
+                                       "authz_verdict": "ok", "facts_used": ["F9"], "hypotheses": [
+                                           {"risk": "path traversal", "anchor": "web/Download.php:4",
+                                            "why": "name joins a path", "status": "confirmed"}]}),
                       ("add_fact", {"statement": "Download reads files under /srv/files", "evidence": [
                           {"file": "web/Download.php", "line": 4, "quote": "readfile('/srv/files/'"}]}),
                       ("report_finding", {"vuln_type": "Path traversal", "cwe": "CWE-22",
@@ -222,27 +236,33 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
         "/home": [("record_card", {"function": "home page", "callers": "anyone", "authz_verdict": "ok",
                                    "hypotheses": []})],
     }
-    users = []
+    users, systems = [], []
 
     class Router(ScriptedLLM):
         def chat(self, messages, tools=None):
             if not self.script and len(messages) == 2:
                 user = messages[1]["content"]
                 users.append(user)
+                systems.append(messages[0]["content"])
                 key = next((k for k in ("/download", "/home") if f'"route": "{k}"' in user), "recon")
                 self.script = list(scripts[key])
             return super().chat(messages, tools)
 
     monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
-    cfg = AuditConfig(workers=1)
+    cfg = _cfg(workers=1)
     m = pipeline.run(cfg, proj, tmp_path / "out", deadline=time.time() + 600)
     assert m["recon"]["entries"] == 2 and m["recon"]["resolved"] == 2
+    assert m["recon"]["access_model"]["principals"] == "anyone" and m["recon"]["coverage"]["sites"] == 1
+    assert m["recon"]["notes"] == "web/<Name>.php::execute serves /<name>"  # the early finish was refused
+    assert "- principals: anyone" in systems[-1]  # reviewers get the access model
     assert m["review"]["units"] == 2 and m["review"]["reviewed_units"] == 2 and m["review"]["facts"] == 1
     data = json.loads((tmp_path / "out" / "review" / "findings.json").read_text())
     (f,) = data["findings"]
     assert f["cwe"] == "CWE-22" and f["handler"] == "web/Download.php::execute" and data["not_reviewed"] == []
     cards = json.loads((tmp_path / "out" / "review" / "cards.json").read_text())
-    assert {c["function"] for c in cards} == {"file download", "home page"}
+    assert {c["function"] for c in cards} == {"file download", "home page"}  # one card per unit
+    assert next(c for c in cards if c["function"] == "file download")["hypotheses"][0]["anchor"] == \
+        "web/Download.php:4"
     assert any("readfile('/srv/files/'" in u for u in users[1:])  # the handler's code is in the unit
     m2 = pipeline.run(cfg, proj, tmp_path / "out", deadline=time.time() + 600)  # recon reused
     assert m2["recon"].get("reused") is True
@@ -405,7 +425,7 @@ async def test_execute_yasa_task_saves_findings(tmp_path, monkeypatch):
                           timeout=60, temperature=0.1, max_tokens=4096)
     await ytask.execute_yasa_task(DB(), t, str(tmp_path), llm, Emitter(), lambda: False, save,
                                   lambda f: 42.0)
-    assert seen == {"workers": 6, "budget": 1200, "product": "public: /login"}
+    assert seen == {"workers": 16, "budget": 1200, "product": "public: /login"}
     assert [f["file_path"] for f in saved["findings"]] == ["A.java", "B.java"]
     assert t.findings_count == 2 and t.tokens_used == 150 and t.status == "completed"
     assert (t.high_count, t.medium_count) == (1, 1) and t.security_score == 42.0
@@ -492,14 +512,22 @@ def test_agent_loop_explains_unparsable_arguments_and_forces_finish(tmp_path):
     assert llm.seen[-1] == ["finish"] and res["finished"] and tb.notes == "two dispatchers"
 
 
+@needs_rg
 def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
     from app.services.yasa_audit import pipeline
 
-    _write(tmp_path, {"api/Posts.java": "class Posts { Mono<ServerResponse> list(ServerRequest r) { return null; } }"})
+    _write(tmp_path, {"api/Posts.java": "class Posts {\n  Mono<ServerResponse> list(ServerRequest r) {\n"
+                                        "    return r.queryParam(\"q\");\n  }\n}\n"})
     extractor = ("import json; print(json.dumps([{'route': '/apis/posts', 'handler_file': 'api/Posts.java', "
                  "'handler': 'list', 'exposure': 'authenticated'}]))")
-    script = [("finish", {"notes": "RouterFunction beans: /apis/posts -> Posts::list"}),  # pass 1: notes only
+    model = {"authentication": "session", "authorization": "RBAC filter", "permission_mapping": "verb+path",
+             "principals": "anonymous < user", "evidence": [{"file": "api/Posts.java", "line": 2,
+                                                             "quote": "list(ServerRequest r)"}]}
+    script = [("list_dir", {})] * 8 + [                       # pass 1 only reads (budget 2, +6 grace) ...
+              ("finish", {"notes": "RouterFunction beans: /apis/posts -> Posts::list"}),  # ... forced finish
               ("run_extractor", {"name": "router", "code": extractor}),                  # pass 2
+              ("record_access_model", model),
+              ("check_coverage", {"request_read_pattern": r"queryParam\("}),
               ("finish", {"notes": "RouterFunction beans, 1 extractor"})]
     llm = ScriptedLLM(script)
     seen = []
@@ -511,10 +539,63 @@ def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
 
     llm.chat = chat
     monkeypatch.setattr(pipeline, "LLM", lambda cfg: llm)
-    m = pipeline.recon(AuditConfig(), tmp_path, tmp_path / "recon")
+    cfg = _cfg(recon_budget=2)
+    m = pipeline.recon(cfg, tmp_path, tmp_path / "recon")
     assert m["passes"] == 2 and m["source"] == "agent" and m["entries"] == 1 and m["resolved"] == 1
     assert "/apis/posts -> Posts::list" in seen[-1] and m["notes"] == "RouterFunction beans, 1 extractor"
+    assert m["access_model"]["principals"] == "anonymous < user"
 
+
+def test_recon_finish_gates_and_access_model_evidence(tmp_path):
+    _write(tmp_path, {"Sec.java": "class Sec {\n  boolean allowed() { return true; }\n}\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    tb.finish_gates = [(lambda t: t.access_model is None, "record_access_model first")]
+    assert tb.finish("x") == "not finished: record_access_model first" and not tb.finished
+    base = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "d"}
+    assert tb.record_access_model(**base).startswith("rejected: evidence is required")
+    assert "quote not found" in tb.record_access_model(
+        **base, evidence=[{"file": "Sec.java", "line": 2, "quote": "denyAll"}])
+    assert tb.record_access_model(**base, evidence=[{"file": "Sec.java", "line": 2, "quote": "allowed()"}]) == \
+        "access model recorded"
+    assert tb.finish("done").startswith("finished") and tb.finished
+    tb2 = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    tb2.finish_gates = tb.finish_gates
+    tb2.finish("forced", _force=True)
+    assert tb2.finished and tb2.notes == "forced"
+
+
+def test_record_card_requires_anchors_and_counts_fact_citations(tmp_path):
+    _write(tmp_path, {"A.java": "a\nb\nc\n"})
+    fb = FactBook(tmp_path)
+    fb.add("first", [{"file": "A.java", "line": 1, "quote": "a"}], "u0")
+    fb.add("second", [{"file": "A.java", "line": 2, "quote": "b"}], "u0")
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path, facts=fb, unit="E1")
+    card = {"function": "f", "callers": "c", "authz_verdict": "ok"}
+    assert tb.record_card(**card, hypotheses=[{"risk": "sqli", "status": "rejected"}]).startswith("rejected")
+    assert tb.record_card(**card, hypotheses=[{"risk": "x", "anchor": "A.java:99", "status": "open"}]) \
+        .startswith("rejected")  # line out of range
+    assert "unknown fact ids ignored: ['F7']" in tb.record_card(
+        **card, hypotheses=[{"risk": "idor", "anchor": "A.java:3", "status": "open"}], facts_used=["F2", "F7"])
+    tb.record_card(**card, hypotheses=[], facts_used=["F2"])
+    assert len(tb.cards) == 1  # a later call replaces the card
+    block = fb.prompt_block()
+    assert block.index("F2: second") < block.index("F1: first")  # most cited first
+
+
+def test_adaptive_limiter_halves_on_rate_limit_and_grows_back():
+    from app.services.yasa_audit.llm import AdaptiveLimiter, _is_rate_limit
+
+    lim = AdaptiveLimiter(ceiling=16, grow_after=2)
+    for _ in range(3):
+        lim.acquire()
+    assert lim.stats()["peak_in_flight"] == 3
+    lim.release(rate_limited=True)
+    assert lim.limit == 8 and lim.stats()["rate_limited"] == 1
+    lim.release()
+    lim.release()
+    assert lim.limit == 9  # two successes in a row -> +1
+    err = type("RateLimitError", (Exception,), {})("slow down")
+    assert _is_rate_limit(err) and not _is_rate_limit(ValueError("boom"))
 
 def test_report_finding_requires_fields(tmp_path):
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path, unit="E1")

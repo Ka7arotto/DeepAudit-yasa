@@ -43,51 +43,89 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-class FactBook:
-    """Project facts shared by all review units. A fact is accepted only when every piece of evidence
-    (file, line, quote) is found in the code within a few lines, so reviewers cannot pass on guesses."""
+def verify_evidence(root: Path, evidence: list[dict]) -> str | None:
+    """None when every {file, line, quote} is found in the code within a few lines of `line`."""
+    if not evidence:
+        return "evidence is required: [{file, line, quote}]"
+    for ev in evidence:
+        if not isinstance(ev, dict):
+            return "each evidence item is an object {file, line, quote}"
+        p = (root / str(ev.get("file", "")).lstrip("/")).resolve()
+        if not p.is_relative_to(root) or not p.is_file():
+            return f"evidence file not found: {ev.get('file')}"
+        lines = p.read_text(errors="ignore").splitlines()
+        line, quote = int(ev.get("line") or 0), _norm(str(ev.get("quote") or ""))
+        if not quote:
+            return "each evidence item needs a quote copied from the code"
+        window = _norm(" ".join(lines[max(0, line - 4):line + 3]))
+        if quote not in window:
+            return f"quote not found near {ev.get('file')}:{line}"
+    return None
 
-    def __init__(self, root: Path, limit: int = 40):
-        self.root, self.limit = root, limit
+
+class FactBook:
+    """Project facts shared by all review units.
+
+    A fact is accepted only when every piece of evidence (file, line, quote) is found in the code, so
+    reviewers cannot pass on guesses. Facts are short and numbered; reviewers cite the ids they relied
+    on (record_card.facts_used), and the block given to later units keeps the most cited facts within a
+    character budget, so foundational facts are not pushed out by recent, narrow ones.
+    """
+
+    MAX_STATEMENT = 240
+
+    def __init__(self, root: Path, char_budget: int = 9000):
+        self.root, self.char_budget = root, char_budget
         self.facts: list[dict] = []
         self._lock = threading.Lock()
 
     def verify(self, evidence: list[dict]) -> str | None:
-        if not evidence:
-            return "a fact needs evidence: [{file, line, quote}]"
-        for ev in evidence:
-            p = (self.root / str(ev.get("file", "")).lstrip("/")).resolve()
-            if not p.is_relative_to(self.root) or not p.is_file():
-                return f"evidence file not found: {ev.get('file')}"
-            lines = p.read_text(errors="ignore").splitlines()
-            line, quote = int(ev.get("line") or 0), _norm(str(ev.get("quote") or ""))
-            if not quote:
-                return "each evidence item needs a quote copied from the code"
-            window = _norm(" ".join(lines[max(0, line - 4):line + 3]))
-            if quote not in window:
-                return f"quote not found near {ev.get('file')}:{line}"
-        return None
+        return verify_evidence(self.root, evidence)
 
     def add(self, statement: str, evidence: list[dict], unit: str) -> str:
+        statement = _norm(statement)
+        if len(statement) > self.MAX_STATEMENT:
+            return (f"rejected: the statement has {len(statement)} characters; state the fact in at most "
+                    f"{self.MAX_STATEMENT} (one claim, no explanation)")
         err = self.verify(evidence)
         if err:
             return f"rejected: {err}"
         with self._lock:
-            if any(_norm(f["statement"]).lower() == _norm(statement).lower() for f in self.facts):
-                return "already known"
-            self.facts.append({"statement": statement, "evidence": evidence, "unit": unit})
-        return f"accepted fact #{len(self.facts)}"
+            for f in self.facts:
+                if f["statement"].lower() == statement.lower():
+                    return f"already known as {f['id']}"
+            fid = f"F{len(self.facts) + 1}"
+            self.facts.append({"id": fid, "statement": statement, "evidence": evidence, "unit": unit,
+                               "cited": 0})
+        return f"accepted as {fid}"
+
+    def cite(self, ids: Any) -> list[str]:
+        """Count citations; returns the ids that do not exist."""
+        unknown = []
+        with self._lock:
+            by_id = {f["id"]: f for f in self.facts}
+            for i in ids if isinstance(ids, list) else []:
+                if str(i) in by_id:
+                    by_id[str(i)]["cited"] += 1
+                else:
+                    unknown.append(str(i))
+        return unknown
 
     def prompt_block(self) -> str:
         with self._lock:
-            facts = self.facts[-self.limit:]
-        if not facts:
-            return ""
-        rows = []
+            facts = sorted(self.facts, key=lambda f: (-f["cited"], int(f["id"][1:])))
+        rows, used = [], 0
         for f in facts:
-            where = ", ".join(f"{e.get('file')}:{e.get('line')}" for e in f["evidence"])
-            rows.append(f"- {f['statement']} ({where})")
-        return "Verified project facts (from earlier reviews; rely on them instead of re-deriving):\n" + "\n".join(rows)
+            where = ", ".join(f"{e.get('file')}:{e.get('line')}" for e in f["evidence"][:2])
+            row = f"- {f['id']}: {f['statement']} ({where})"
+            if used + len(row) > self.char_budget:
+                continue
+            rows.append(row)
+            used += len(row) + 1
+        if not rows:
+            return ""
+        return ("Verified project facts (rely on them instead of re-deriving; cite the ids you used in "
+                "record_card.facts_used):\n" + "\n".join(rows))
 
 
 class Toolbox:
@@ -105,6 +143,9 @@ class Toolbox:
         self.extractors: dict[str, dict] = {}  # name -> {"code", "entries"}
         self.manual: list[dict] = []
         self.coverage: dict | None = None
+        self.access_model: dict | None = None
+        # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
+        self.finish_gates: list[tuple[Any, str]] = []
 
     # ---------- helpers ----------
     def _safe(self, rel: str) -> Path:
@@ -382,10 +423,41 @@ class Toolbox:
         return clip(json.dumps(res, ensure_ascii=False, indent=1))
 
     # ---------- review / output ----------
+    def _anchor_ok(self, anchor: Any) -> bool:
+        m = re.match(r"^\s*([^:\s]+):(\d+)", str(anchor or ""))
+        if not m:
+            return False
+        try:
+            p = self._safe(m.group(1))
+        except ValueError:
+            return False
+        return p.is_file() and 0 < int(m.group(2)) <= len(p.read_text(errors="ignore").splitlines())
+
     def record_card(self, **card: Any) -> str:
+        """Record (or replace) this unit's card. Every hypothesis must name the operation that makes the
+        risk plausible, as file:line, so risks are derived from code rather than from a checklist."""
+        hyps = card.get("hypotheses") or []
+        bad = [str(h.get("risk", "?")) for h in hyps if isinstance(h, dict) and not self._anchor_ok(h.get("anchor"))]
+        if bad:
+            return ("rejected: these hypotheses have no anchor (file:line of the operation in the code that "
+                    f"makes the risk plausible): {bad[:6]}. Anchor them, or drop risks the code gives no "
+                    "reason to suspect.")
+        unknown = self.facts.cite(card.get("facts_used")) if self.facts is not None else []
         card["_unit"] = self.unit
-        self.cards.append(card)
-        return f"card recorded ({len(self.cards)})"
+        self.cards = [card]  # a later call updates the card
+        return "card recorded" + (f" (unknown fact ids ignored: {unknown})" if unknown else "")
+
+    def record_access_model(self, **model: Any) -> str:
+        """The project-wide model of how requests are authenticated and authorized (recon stage)."""
+        need = ("authentication", "authorization", "permission_mapping", "principals")
+        missing = [k for k in need if not str(model.get(k) or "").strip()]
+        if missing:
+            return f"rejected: missing {', '.join(missing)}"
+        err = verify_evidence(self.root, model.get("evidence") or [])
+        if err:
+            return f"rejected: {err}"
+        self.access_model = {k: model.get(k) for k in (*need, "public_by_default", "evidence")}
+        return "access model recorded"
 
     def report_finding(self, **finding: Any) -> str:
         missing = [k for k in FINDING_REQUIRED if finding.get(k) in (None, "")]
@@ -404,7 +476,10 @@ class Toolbox:
             evidence = [evidence]
         return self.facts.add(str(statement), evidence if isinstance(evidence, list) else [], self.unit)
 
-    def finish(self, notes: str = "") -> str:
+    def finish(self, notes: str = "", _force: bool = False) -> str:
+        for cond, msg in self.finish_gates:
+            if not _force and cond(self):
+                return f"not finished: {msg}"
         self.finished = True
         self.notes = notes
         return f"finished ({len(self.findings)} findings, {len(self.cards)} cards)"
@@ -453,6 +528,22 @@ def tool_schemas(role: str) -> list[dict]:
                "replaces the earlier version.", {"name": s, "code": s}, ["name", "code"]),
             fn("add_entries", "Add a few entries by hand (same keys as extractor output).",
                {"entries": {"type": "array", "items": entry}}, ["entries"]),
+            fn("record_access_model",
+               "Record how THIS project authenticates and authorizes requests, once, before finish. "
+               "Reviewers of every entry rely on it instead of re-reading the security chain.",
+               {"authentication": {"type": "string", "description": "how a request gets an identity "
+                                   "(sessions, tokens, filters) and what an anonymous request is"},
+                "authorization": {"type": "string", "description": "where access is decided (file:line) "
+                                  "and what happens when no rule matches"},
+                "permission_mapping": {"type": "string", "description": "how a request (method, path, "
+                                       "resource) is turned into the permission that is checked"},
+                "principals": {"type": "string", "description": "the roles/principals from least to most "
+                               "privileged, who gets each (any visitor, any registered user, ...), and how "
+                               "to tell from an entry's declaration which is the least one that can call it"},
+                "public_by_default": s,
+                "evidence": {"type": "array", "items": {"type": "object", "properties": {
+                    "file": s, "line": i, "quote": s}}}},
+               ["authentication", "authorization", "permission_mapping", "principals", "evidence"]),
             fn("check_coverage",
                "Coverage check: give a ripgrep pattern matching how THIS project reads request data "
                "(e.g. the request object's getter calls). Lists read sites not reachable from any "
@@ -462,7 +553,8 @@ def tool_schemas(role: str) -> list[dict]:
     else:
         tools += [
             fn("record_card",
-               "Record this entry's card once you understand it (call before finish).",
+               "Record this entry's card: first as soon as you know the scenario and access control, "
+               "then again with every hypothesis's final status (a later call replaces the card).",
                {"function": {"type": "string", "description": "what the entry does, in business terms"},
                 "callers": {"type": "string", "description": "who can call it, with the evidence"},
                 "authz_verdict": {"type": "string", "enum": ["ok", "missing_authentication",
@@ -472,8 +564,14 @@ def tool_schemas(role: str) -> list[dict]:
                 "inputs": s, "objects": {"type": "string", "description": "data/resources it reads or changes"},
                 "persists": {"type": "string", "description": "user-controlled values it stores, and where"},
                 "hypotheses": {"type": "array", "items": {"type": "object", "properties": {
-                    "risk": s, "why": s, "status": {"type": "string", "enum": ["confirmed", "rejected", "open"]},
-                    "evidence": s}}}},
+                    "risk": s,
+                    "anchor": {"type": "string", "description": "file:line of the operation that makes this "
+                               "risk plausible (where the request value is stored, queried, fetched, "
+                               "rendered, used to pick an object, ...)"},
+                    "why": s, "status": {"type": "string", "enum": ["confirmed", "rejected", "open"]},
+                    "evidence": s}, "required": ["risk", "anchor", "status"]}},
+                "facts_used": {"type": "array", "items": s,
+                               "description": "ids of verified facts you relied on (e.g. F3)"}},
                ["function", "callers", "authz_verdict", "hypotheses"]),
             fn("report_finding", "Record ONE vulnerability (access control or data flow) you confirmed or "
                "consider likely, with file:line hops.",
@@ -487,7 +585,8 @@ def tool_schemas(role: str) -> list[dict]:
                 "verdict": {"type": "string", "enum": ["confirmed", "likely"]}},
                ["vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege",
                 "verdict"]),
-            fn("add_fact", "Share a project fact other reviewers can rely on (e.g. how a helper escapes, "
+            fn("add_fact", "Share a project fact other reviewers can rely on: one claim, at most 240 "
+               "characters (e.g. how a helper escapes, that all data access goes through a typed query API, "
                "which base class enforces login). Rejected unless each quote is found at file:line.",
                {"statement": s, "evidence": {"type": "array", "items": {"type": "object", "properties": {
                    "file": s, "line": i, "quote": s}}}}, ["statement", "evidence"]),

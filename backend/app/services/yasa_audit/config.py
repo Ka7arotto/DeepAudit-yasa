@@ -70,7 +70,9 @@ class AuditConfig:
     recon_share: float = 0.25  # route reconnaissance may use this share of the budget
     recon_budget: int = 60  # tool calls of the recon agent
     review_budget: int = 18  # tool calls per entry review
-    workers: int = 6
+    workers: int = 16  # review units in parallel (a unit spends most of its time in tools, not the LLM)
+    # LLM requests in flight at most; halved automatically when the provider rate-limits
+    llm_concurrency: int = field(default_factory=lambda: int(os.environ.get("LLM_CONCURRENCY", "16")))
 
     # Cooperative cancellation: agent loops and the unit scheduler stop when this returns True.
     should_stop: Callable[[], bool] | None = field(default=None, repr=False, compare=False)

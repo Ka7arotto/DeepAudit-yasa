@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--deploy", default="", help="deployment context, e.g. 'Linux, nginx, PHP 8.3'")
             p.add_argument("--product", default="",
                            help="product context: roles, what is public by design, what input is trusted")
-            p.add_argument("--workers", type=int, default=6)
+            p.add_argument("--workers", type=int, default=16)
             p.add_argument("--time-budget", type=float, default=30.0,
                            help="wall-clock budget in minutes (default 30); unreviewed entries are listed")
     args = ap.parse_args(argv)

@@ -23,7 +23,7 @@ from pathlib import Path
 from .agent_loop import run_agent
 from .config import AuditConfig
 from .discovery import codegraph_db, codegraph_routes, snapshot_codegraph
-from .llm import LLM
+from .llm import LLM, limiter_for
 from .prompts import recon_prompt, review_prompt
 from .toolbox import FactBook, Toolbox, tool_schemas
 
@@ -82,6 +82,10 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
     except Exception:
         pass
     tb = Toolbox(cfg, root, out, unit="recon")
+    tb.finish_gates = [(lambda t: t.access_model is None,
+                        "record_access_model first (how requests are authenticated and authorized)"),
+                       (lambda t: (t.extractors or t.manual) and t.coverage is None,
+                        "run check_coverage once with a pattern for how this project reads request data")]
     llm = LLM(cfg)
     user = (f"Files by extension (vendored and VCS directories left out): {_ext_counts(root)}\n\n"
             f"Top-level layout:\n{tb.list_dir('.', 2)}\n\n"
@@ -123,6 +127,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
                        "resolved": sum(e["resolved"] for e in entries), "by_exposure": dict(by_exp),
                        "extractors": {k: len(v["entries"]) for k, v in tb.extractors.items()},
                        "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
+                       "access_model": tb.access_model,
                        "passes": passes, **res})
     (out / "recon.json").write_text(json.dumps(m, indent=1, ensure_ascii=False))
     return m
@@ -141,7 +146,7 @@ def _units(entries: list[dict]) -> list[dict]:
         exp = min((e.get("exposure", "unknown") for e in es), key=lambda x: EXPOSURE_RANK.get(x, 1))
         units.append({"handler_file": hf, "handler": h, "exposure": exp, "entries": es,
                       "resolved": all(e.get("resolved", True) for e in es)})
-    units.sort(key=lambda u: (not u["resolved"], EXPOSURE_RANK.get(u["exposure"], 1),
+    units.sort(key=lambda u: (EXPOSURE_RANK.get(u["exposure"], 1), not u["resolved"],
                               u["entries"][0].get("route", "")))
     return units
 
@@ -203,12 +208,12 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
 
 
 def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy: str = "", product: str = "",
-           surface_notes: str = "", deadline: float | None = None) -> dict:
+           surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     units = _units(entries)
     facts = FactBook(root)
-    system = review_prompt(cfg.review_budget, deploy, product, surface_notes)
+    system = review_prompt(cfg.review_budget, deploy, product, surface_notes, access_model)
     results, skipped = _schedule(
         units, lambda i, u: _review_unit(cfg, root, out / f"unit-{i:04d}", u, entries, facts, system, deadline),
         cfg.workers, deadline, cfg.stopped)
@@ -227,6 +232,7 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
          "errors": sum(1 for r in results if r.get("error")), "facts": len(facts.facts),
          "cards": len(cards), "n_findings": len(findings),
          "authz_verdicts": dict(collections.Counter(c.get("authz_verdict") for c in cards)),
+         "workers": cfg.workers, "llm_limiter": limiter_for(cfg).stats(),
          "wall_s": round(time.time() - t0, 1)}
     (out / "metrics.json").write_text(json.dumps(m, indent=1))
     return m
@@ -246,7 +252,8 @@ def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str 
     else:
         rec = recon(cfg, root, out / "recon", deploy, product, start + cfg.recon_share * (deadline - start))
     entries = json.loads(ef.read_text())
-    rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", deadline)
+    rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", deadline,
+                rec.get("access_model"))
     tok = lambda m, k: (m or {}).get(k, 0) or 0  # noqa: E731
     m = {"recon": rec, "review": rv,
          "total_tokens": sum(tok(x, "prompt_tokens") + tok(x, "completion_tokens") for x in (rec, rv)),
