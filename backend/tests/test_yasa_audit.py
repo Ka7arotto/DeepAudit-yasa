@@ -254,7 +254,9 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                       ("report_finding", {"vuln_type": "Path traversal", "cwe": "CWE-22",
                                           "sink_file": "web/Download.php", "sink_line": 4,
                                           "source": "$_GET['name']", "entry": "GET /download (public)",
-                                          "required_privilege": "none", "verdict": "confirmed"})],
+                                          "required_privilege": "none", "verdict": "confirmed",
+                                          "route_evidence": {"file": "web/Download.php", "line": 2,
+                                                             "quote": "class Download"}})],
         "/home": [("record_card", {"function": "home page", "callers": "anyone", "authz_verdict": "ok",
                                    "hypotheses": []})],
     }
@@ -624,9 +626,13 @@ def test_adaptive_limiter_halves_on_rate_limit_and_grows_back():
 def test_report_finding_requires_fields(tmp_path):
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path, unit="E1")
     assert tb.report_finding().startswith("rejected: missing vuln_type")
+    _write(tmp_path, {"Routes.java": "class Routes {\n  route(GET(\"/x\"), this::get);\n}\n"})
     full = {"vuln_type": "IDOR", "cwe": "CWE-639", "sink_file": "a.java", "sink_line": 3, "source": "id",
-            "entry": "GET /x", "required_privilege": "customer"}
+            "entry": "GET /x", "required_privilege": "customer",
+            "route_evidence": {"file": "Routes.java", "line": 2, "quote": 'GET("/x")'}}
     assert tb.report_finding(**full, verdict="false_positive").startswith("rejected: verdict")
+    phantom = dict(full, route_evidence={"file": "Routes.java", "line": 2, "quote": 'GET("/y")'})
+    assert "route_evidence: quote not found" in tb.report_finding(**phantom, verdict="confirmed")
     assert tb.report_finding(**full, verdict="likely") == "recorded #1" and tb.findings[0]["_unit"] == "E1"
 
 

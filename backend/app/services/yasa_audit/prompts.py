@@ -95,6 +95,10 @@ Method:
    you relied on, report_finding for each confirmed or likely vulnerability, add_fact for short reusable
    facts you verified, and finish.
 
+The entry list was produced by automated reconnaissance and can be wrong (a route that is not actually
+served, a wrong exposure). Before you report, find where the code registers or generates the route and
+check that it really serves the path you report; cite it as route_evidence.
+
 Who the attacker is: a remote user at the entry's exposure level. Input that only an operator controls
 (CLI arguments, deployment config files, installer steps) is trusted unless the product context says
 otherwise. A dangerous capability an administrator is meant to have (installing plugins, configuring

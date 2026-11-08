@@ -30,7 +30,8 @@ SKIP_DIRS = {".yasa", ".codegraph", "node_modules", ".git"}
 MAX_OUT = 8000
 ENTRY_KEYS = ("route", "method", "handler_file", "handler", "auth", "exposure", "declared_at", "kind")
 EXPOSURES = ("public", "authenticated", "privileged", "unknown")
-FINDING_REQUIRED = ("vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege", "verdict")
+FINDING_REQUIRED = ("vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege", "verdict",
+                    "route_evidence")
 
 
 def clip(text: str, limit: int = MAX_OUT) -> str:
@@ -465,6 +466,12 @@ class Toolbox:
             return f"rejected: missing {', '.join(missing)}; send the finding again with them"
         if finding.get("verdict") not in ("confirmed", "likely"):
             return "rejected: verdict must be confirmed or likely (record rejected risks in record_card)"
+        ev = finding.get("route_evidence")
+        err = verify_evidence(self.root, [ev] if isinstance(ev, dict) else (ev or []))
+        if err:
+            return (f"rejected: route_evidence: {err}. The entry list comes from automated recon and can be "
+                    "wrong: show where this route is registered or generated in the code (file, line, quote) "
+                    "and check that it really serves the path you report.")
         finding["_unit"] = self.unit
         self.findings.append(finding)
         return f"recorded #{len(self.findings)}"
@@ -585,9 +592,12 @@ def tool_schemas(role: str) -> list[dict]:
                                        "enum": ["none", "customer", "admin", "operator_or_cli"]},
                 "hops": {"type": "array", "items": s},
                 "sanitizers": s,
+                "route_evidence": {"type": "object", "description": "where the code registers or generates "
+                                   "the route you report (file, line, quote); the recon entry list can be wrong",
+                                   "properties": {"file": s, "line": i, "quote": s}},
                 "verdict": {"type": "string", "enum": ["confirmed", "likely"]}},
                ["vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege",
-                "verdict"]),
+                "verdict", "route_evidence"]),
             fn("add_fact", "Share a project fact other reviewers can rely on: one claim, at most 240 "
                "characters (e.g. how a helper escapes, that all data access goes through a typed query API, "
                "which base class enforces login). Rejected unless each quote is found at file:line.",
