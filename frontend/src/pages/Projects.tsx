@@ -278,7 +278,7 @@ export default function Projects() {
     return new Date(dateString).toLocaleDateString('zh-CN');
   };
 
-  const handleCreateTask = (projectId: string) => {
+  const handleCreateTask = () => {
     setShowCreateTaskDialog(true);
   };
 
@@ -883,7 +883,7 @@ export default function Projects() {
                     <ArrowUpRight className="w-3 h-3 ml-auto" />
                   </Button>
                 </Link>
-                <Button size="sm" className="cyber-btn-primary h-8 text-xs" onClick={() => handleCreateTask(project.id)}>
+                <Button size="sm" className="cyber-btn-primary h-8 text-xs" onClick={() => handleCreateTask()}>
                   <Shield className="w-3 h-3 mr-2" />
                   审计
                 </Button>

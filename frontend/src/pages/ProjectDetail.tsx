@@ -23,7 +23,6 @@ import {
   CheckCircle,
   Clock,
   XCircle,
-  FileText,
   Upload,
   GitBranch,
   Terminal
