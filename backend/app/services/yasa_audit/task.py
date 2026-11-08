@@ -1,9 +1,9 @@
-"""Run a DeepAudit agent task in YASA hybrid mode (task.audit_scope["mode"] == "yasa").
+"""Run a DeepAudit agent task in YASA mode (task.audit_scope["mode"] == "yasa").
 
 Stages, all bounded by one wall-clock budget (task.timeout_seconds, default 30 min):
-  1. yasa-mcp navigation cache
-  2. dataflow (agent builds engine rules -> YASA -> grouped triage)  } run side by side
-  3. access control (deterministic route table -> grouped review)   }
+  1. yasa-mcp navigation cache (codegraph index first; YASA's call graph continues in the background)
+  2. route reconnaissance: an agent works out the project's entry points
+  3. one review per entry: scenario, access control, plausible risks traced to a verdict
 Findings are saved through the regular agent_tasks._save_findings path, so the existing task pages,
 reports and finding status workflow work unchanged.
 
@@ -25,15 +25,7 @@ from pathlib import Path
 
 from .config import AuditConfig
 from .discovery import codegraph_ready, snapshot_codegraph
-from .runner import (
-    check_tools,
-    init_navigation,
-    run_authz,
-    run_dataflow,
-    split_workers,
-    summarize,
-    to_deepaudit_findings,
-)
+from .runner import check_tools, init_navigation, run_entry_audit, to_deepaudit_findings
 
 logger = logging.getLogger(__name__)
 SOURCE_EXT = {".java", ".jsp", ".jspx", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".php",
@@ -121,7 +113,6 @@ async def execute_yasa_task(
     from app.models.agent_task import AgentTaskPhase, AgentTaskStatus
 
     scope = task.audit_scope or {}
-    stages = scope.get("stages") or ["dataflow", "authz"]
     deploy = scope.get("deploy") or ""
     product = scope.get("product") or ""
     budget_s = int(task.timeout_seconds or 1800)
@@ -174,44 +165,28 @@ async def execute_yasa_task(
     if is_cancelled():
         raise asyncio.CancelledError("任务已取消")
 
-    df_cfg, az_cfg = split_workers(cfg) if len(stages) > 1 else (cfg, cfg)
-    await emitter.emit_phase_start("analysis", f"🔬 YASA: {' + '.join(stages)}, budget {budget_s // 60} min")
+    await emitter.emit_phase_start("analysis", f"🔬 YASA: route reconnaissance + entry review, "
+                                               f"budget {budget_s // 60} min")
     task.current_phase = AgentTaskPhase.ANALYSIS
     await db.commit()
-
-    async def stage(name: str, fn, *args):
-        if name not in stages:
-            return None
-        try:
-            r = await asyncio.to_thread(fn, *args)
-        except Exception as e:
-            logger.error("yasa %s stage failed: %s", name, e, exc_info=True)
-            await emitter.emit_error(f"YASA {name} stage failed: {e}")
-            return None
-        await emitter.emit_info(f"✅ YASA {name}: {len(r['findings'])} candidates reviewed, "
-                                f"{sum(f.get('verdict') in ('confirmed', 'likely') for f in r['findings'])} "
-                                f"reported, {len(r['not_reviewed'])} not reviewed")
-        return r
-
-    df, az = await asyncio.gather(
-        stage("dataflow", run_dataflow, df_cfg, root, out, deploy, start, deadline),
-        stage("authz", run_authz, az_cfg, root, out, deploy, product, deadline))
-    init_stop.set()
     try:
-        await init_job
-    except Exception as e:  # already reported, or a late failure that no longer matters
-        logger.info("yasa-mcp init ended: %s", e)
+        r = await asyncio.to_thread(run_entry_audit, cfg, root, out, deploy, product, start, deadline)
+    finally:
+        init_stop.set()
+        try:
+            await init_job
+        except Exception as e:  # already reported, or a late failure that no longer matters
+            logger.info("yasa-mcp init ended: %s", e)
     if is_cancelled():
         raise asyncio.CancelledError("任务已取消")
-    if df is None and az is None:
-        raise RuntimeError("all YASA stages failed")
-
-    findings = (to_deepaudit_findings(df["findings"], "dataflow") if df else []) + \
-               (to_deepaudit_findings(az["findings"], "authz") if az else [])
-    m = summarize(df, az, start)
-    if m["not_reviewed"]:
-        await emitter.emit_warning(f"⏱ time budget reached: {len(m['not_reviewed'])} candidates not "
-                                   f"reviewed (listed in {out})")
+    rec, rv = r["recon"], r["review"]
+    await emitter.emit_info(f"🧭 recon: {rec.get('entries', 0)} entries ({rec.get('resolved', 0)} resolved to code)")
+    await emitter.emit_info(f"✅ review: {rv['reviewed_units']} of {rv['units']} handlers reviewed, "
+                            f"{sum(f.get('verdict') in ('confirmed', 'likely') for f in r['findings'])} reported")
+    findings = to_deepaudit_findings(r["findings"])
+    if r["not_reviewed"]:
+        await emitter.emit_warning(f"⏱ time budget reached: {len(r['not_reviewed'])} entries not "
+                                   f"reviewed (listed in {out / 'review' / 'findings.json'})")
 
     await db.refresh(task)
     saved = await save_findings(db, task.id, findings, project_root=str(project_dir))
@@ -219,7 +194,7 @@ async def execute_yasa_task(
     task.completed_at = datetime.now(UTC)
     task.current_phase = AgentTaskPhase.REPORTING
     task.findings_count = saved
-    task.tokens_used = m["tokens"]
+    task.tokens_used = r["tokens"]
     task.analyzed_files = task.total_files
     task.files_with_findings = len({f["file_path"] for f in findings if f.get("file_path")})
     for f in findings:
@@ -229,5 +204,5 @@ async def execute_yasa_task(
     task.verified_count = 0
     task.security_score = task.quality_score = score(findings)
     await db.commit()
-    await emitter.emit_task_complete(findings_count=saved, duration_ms=int(m["wall_s"] * 1000))
-    logger.info("YASA task %s done: %s", task.id, m)
+    await emitter.emit_task_complete(findings_count=saved, duration_ms=int((time.time() - start) * 1000))
+    logger.info("YASA task %s done: %s", task.id, {k: v for k, v in r.items() if k != "findings"})

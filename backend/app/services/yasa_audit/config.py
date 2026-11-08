@@ -48,10 +48,10 @@ class AuditConfig:
     llm_temperature: float = field(
         default_factory=lambda: float(os.environ.get("LLM_TEMPERATURE", "0.1"))
     )
-    llm_max_tokens: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS", "4096")))
+    llm_max_tokens: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS", "8192")))
     llm_timeout_s: float = field(default_factory=lambda: float(os.environ.get("LLM_TIMEOUT", "150")))
 
-    # Tools
+    # Tools (yasa-mcp init uses the YASA engine to build its call graph for the navigation tools)
     yasa_bin: str = field(
         default_factory=lambda: os.environ.get("YASA_BIN", str(DEFAULT_TOOLS / "yasa" / "yasa"))
     )
@@ -67,13 +67,9 @@ class AuditConfig:
 
     # Budgets. Wall time is the hard constraint: one audit should finish within time_budget_s.
     time_budget_s: int = 1800
-    build_share: float = 0.35  # build stage (incl. engine runs) may use this share of the budget
-    yasa_timeout_s: int = 600
-    builder_max_yasa_runs: int = 2
-    builder_budget: int = 25
-    triage_budget: int = 10
-    triage_group_budget_cap: int = 24
-    trace_budget: int = 80
+    recon_share: float = 0.25  # route reconnaissance may use this share of the budget
+    recon_budget: int = 40  # tool calls of the recon agent
+    review_budget: int = 18  # tool calls per entry review
     workers: int = 6
 
     # Cooperative cancellation: agent loops and the unit scheduler stop when this returns True.

@@ -1,85 +1,53 @@
-"""Unit tests for app.services.yasa_audit (no LLM, no YASA binary needed)."""
+"""Unit tests for app.services.yasa_audit (no LLM, no YASA binary needed; ripgrep from PATH)."""
 
 import importlib.util
 import json
+import shutil
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from app.services.yasa_audit.config import AuditConfig
-from app.services.yasa_audit.jsp2java import class_name, convert
-from app.services.yasa_audit.pipeline import detect_lang, is_constant_call
-from app.services.yasa_audit.toolbox import Toolbox, parse_sarif, tool_schemas
+from app.services.yasa_audit.toolbox import FactBook, Toolbox, tool_schemas
 
 BENCH = Path(__file__).resolve().parents[1] / "benchmarks" / "yasa_audit" / "eval.py"
+RG = shutil.which("rg")
+needs_rg = pytest.mark.skipif(RG is None, reason="ripgrep not installed")
 
 
-@pytest.mark.parametrize(
-    "code,pat,expected",
-    [
-        ("res.sendFile(path.resolve('frontend/dist/frontend/index.html'))", r"res\.sendFile\(", True),
-        ("res.sendFile(path.resolve('ftp/', file))", r"res\.sendFile\(", False),
-        ("const answer = eval(expression).toString()", r"\beval\s*\(", False),
-        ("yaml.load(fs.readFileSync('./swagger.yml', 'utf8'))", r"yaml\.load\(", True),
-        ('<td><%=resultSet.getString("name") %></td>', r"<%=", False),
-        ("st.executeUpdate(sql);", r"\.execute(Query|Update)?\s*\(", False),
-        ('st.executeQuery("select count(*) from doc_info");', r"\.execute(Query|Update)?\s*\(", True),
-        ("models.sequelize.query(`SELECT * FROM U WHERE e = '${req.body.email}'`)",
-         r"sequelize\.query\(", False),
-    ],
-)
-def test_constant_call_prefilter(code, pat, expected):
-    assert is_constant_call(code, pat) is expected
+def _cfg(**kw) -> AuditConfig:
+    cfg = AuditConfig(**kw)
+    if RG:
+        cfg.rg_bin = RG
+    return cfg
 
 
-def test_jsp2java_preserves_lines():
-    jsp = (
-        '<%@ page import="java.sql.*" %>\n'
-        "<html>\n"
-        "<%\n"
-        'String name=request.getParameter("uname");\n'
-        "%>\n"
-        "<p><%= name %></p>\n"
-    )
-    java = convert(jsp, class_name("del-ptnt"))
-    lines = java.splitlines()
-    assert "public class Jsp_del_ptnt extends HttpServlet" in lines[0]
-    assert "import java.sql.*;" in lines[0]
-    assert 'request.getParameter("uname")' in lines[3]  # JSP line 4 == Java line 4
-    assert "out.print(name);" in lines[5]  # JSP line 6 == Java line 6
+def _write(root, files):
+    for rel, txt in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(txt)
 
 
-def _sarif(uri_hops, sink_uri, line):
-    hops = [{"location": {"physicalLocation": {"artifactLocation": {"uri": u},
-             "region": {"startLine": ln, "snippet": {"text": f"x\n  {ln}:  {tag}:  code",
-                                                     "affectedNodeName": n}}}}}
-            for u, ln, tag, n in uri_hops]
-    return {"message": {"text": "t"}, "entrypoint": {"filePath": "/a", "functionName": "f"},
-            "sinkInfo": {"sinkAttribute": ["Sql"]},
-            "codeFlows": [{"threadFlows": [{"locations": hops}]}],
-            "locations": [{"physicalLocation": {"artifactLocation": {"uri": sink_uri},
-                                                "region": {"startLine": line}}}]}
+def _call(name, args, cid="c1"):
+    return SimpleNamespace(id=cid, function=SimpleNamespace(name=name, arguments=json.dumps(args)))
 
 
-def test_parse_sarif_groups_by_sink_and_maps_jsp():
-    jsp_map = {"jsp/Jsp_success.java": "WebContent/success.jsp"}
+class ScriptedLLM:
+    """Returns the scripted tool calls in order, then finish."""
 
-    def norm(u):
-        u = u.replace("file://", "").replace("/tmp/src/", "").lstrip("/")
-        return jsp_map.get(u, u)
+    def __init__(self, script):
+        self.script = list(script)
+        self.usage = SimpleNamespace(prompt=0, completion=0, cached=0, reasoning=0, calls=0)
 
-    data = {"runs": [{"results": [
-        _sarif([("file:///jsp/Jsp_success.java", 13, "SOURCE", "getParameter(pwd)"),
-                ("file:///jsp/Jsp_success.java", 25, "SINK", "st.executeUpdate")],
-               "/tmp/src/jsp/Jsp_success.java", 25),
-        _sarif([("file:///jsp/Jsp_success.java", 14, "SOURCE", "getParameter(country)")],
-               "/tmp/src/jsp/Jsp_success.java", 25),
-    ]}]}
-    by_sink = parse_sarif(data, norm)
-    assert list(by_sink) == ["WebContent/success.jsp:25"]
-    item = by_sink["WebContent/success.jsp:25"]
-    assert len(item["sources"]) == 2
-    assert item["trace"][0].startswith("WebContent/success.jsp:13 SOURCE")
+    def chat(self, messages, tools=None):
+        self.usage.calls += 1
+        name, args = self.script.pop(0) if self.script else ("finish", {"notes": "done"})
+        return SimpleNamespace(content="", tool_calls=[_call(name, args, f"c{self.usage.calls}")])
+
+
+# ---------------------------------------------------------------- toolbox
 
 
 def test_toolbox_confines_paths(tmp_path):
@@ -87,7 +55,7 @@ def test_toolbox_confines_paths(tmp_path):
     (tmp_path / "proj" / "a.ts").write_text("x\ny\n")
     (tmp_path / "proj_evil").mkdir()
     (tmp_path / "proj_evil" / "secret.txt").write_text("s")
-    tb = Toolbox(AuditConfig(), tmp_path / "proj", tmp_path / "out", enable_yasa=False)
+    tb = Toolbox(AuditConfig(), tmp_path / "proj", tmp_path / "out")
     assert "a.ts lines 1-2" in tb.read_file("a.ts")
     with pytest.raises(ValueError):
         tb.read_file("../proj_evil/secret.txt")  # sibling dir with the same prefix
@@ -96,91 +64,191 @@ def test_toolbox_confines_paths(tmp_path):
         tb.read_file("link/secret.txt")
 
 
-def test_report_finding_requires_engine_ref_when_yasa_enabled(tmp_path):
-    tb = Toolbox(AuditConfig(), tmp_path, tmp_path, enable_yasa=True)
-    tb.registry["R1-F1"] = {"sink": "a.ts:3"}
-    assert tb.report_finding(verdict="confirmed", yasa_ref="R9-F9", sink_file="a.ts").startswith("rejected")
-    assert tb.report_finding(verdict="confirmed", yasa_ref="R1-F1", sink_file="a.ts") == "recorded #1"
-    assert tb.report_finding(verdict="false_positive", sink_file="b.ts") == "recorded #2"
+@needs_rg
+def test_grep_path_globs_match_relative_to_project(tmp_path):
+    """Regression: rg resolved globs containing '/' against the process cwd, so they never matched."""
+    _write(tmp_path, {"app/code/A/Ctrl.php": "<?php $this->getRequest()->getParam('id');\n",
+                      "lib/B.php": "<?php getParam('x');\n"})
+    tb = Toolbox(_cfg(), tmp_path, tmp_path)
+    assert tb.grep("getParam", glob="app/**/*.php").splitlines() == [
+        "app/code/A/Ctrl.php:1:<?php $this->getRequest()->getParam('id');"]
+    assert len(tb.grep_rows("getParam")) == 2
+    assert tb.grep("getparam") == "(no matches)"  # case-sensitive by default
+    assert len(tb.grep_rows("(?i)getparam")) == 2
 
 
-def test_tool_schemas_stage_specific():
-    names = {t["function"]["name"] for t in tool_schemas(enable_yasa=True, with_report=False)}
-    assert "yasa_run" in names and "report_finding" not in names
-    names = {t["function"]["name"] for t in tool_schemas(enable_yasa=False)}
-    assert "yasa_run" not in names and "report_finding" in names
+def test_tool_schemas_per_role():
+    recon = {t["function"]["name"] for t in tool_schemas("recon")}
+    review = {t["function"]["name"] for t in tool_schemas("review")}
+    assert {"run_extractor", "check_coverage", "codegraph_routes", "finish"} <= recon
+    assert {"record_card", "report_finding", "add_fact", "finish"} <= review
+    assert not recon & {"report_finding", "record_card"} and not review & {"run_extractor"}
 
 
-def test_detect_lang(tmp_path):
-    (tmp_path / "a.jsp").write_text("")
-    (tmp_path / "B.java").write_text("")
-    (tmp_path / "x.ts").write_text("")
-    assert detect_lang(tmp_path) == "java"
-
-
-def test_benchmark_scoring():
-    spec = importlib.util.spec_from_file_location("yasa_bench_eval", BENCH)
-    ev = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ev)
-    findings = [
-        {"sink_file": "routes/search.ts", "sink_line": 23, "cwe": "CWE-89", "verdict": "confirmed"},
-        {"sink_file": "routes/keyServer.ts", "sink_line": 14, "cwe": "CWE-22", "verdict": "likely"},
-        {"sink_file": "routes/trackOrder.ts", "sink_line": 18, "cwe": "CWE-89", "verdict": "false_positive"},
-        {"sink_file": "routes/vulnCodeFixes.ts", "sink_line": 83, "cwe": "CWE-22", "verdict": "likely"},
-    ]
-    r = ev.score("juice-mini", findings)
-    assert r["recall"] == "1/18"
-    assert [n["id"] for n in r["negative_hits"]] == ["JS-N02"]
-    assert r["wrongly_rejected"] == ["JS-E01"]
-    assert r["unmatched"] == []  # vulnCodeFixes is ambiguous, not counted
-    assert json.dumps(r)
-
-
-EXPRESS_BOOT = """import express from 'express'
-import * as security from './lib/insecurity'
-import { retrieveBasket } from './routes/basket'
-import dataErasure from './routes/dataErasure'
-import * as address from './routes/address'
-const app = express()
-app.use(security.updateAuthenticatedUsers())
-app.use('/rest/basket', security.isAuthorized(), security.appendUserId())
-app.use('/ftp', serveIndex('ftp', { icons: true }))
-app.get('/rest/basket/:id', utils.asyncHandler(retrieveBasket()))
-app.get('/api/Addresss/:id', security.appendUserId(), utils.asyncHandler(address.getAddressById()))
-app.use('/dataerasure', dataErasure)
+EXTRACTOR = """
+import json, os, sys
+root = sys.argv[1]
+out = []
+for d, _, fs in os.walk(os.path.join(root, 'controllers')):
+    for f in sorted(fs):
+        rel = os.path.relpath(os.path.join(d, f), root)
+        out.append({'route': '/' + f[:-4].lower(), 'method': 'GET', 'handler_file': rel,
+                    'handler': 'execute', 'exposure': 'public' if 'Public' in f else 'privileged',
+                    'auth': 'none' if 'Public' in f else 'ACL admin'})
+out.append({'route': '/ghost', 'handler_file': 'controllers/Missing.php', 'handler': 'execute'})
+out.append({'no_route': True})
+print(json.dumps(out))
 """
 
 
-def test_express_entries_effective_guards(tmp_path):
-    from app.services.yasa_audit.entrypoints import express_entries
+def test_run_extractor_runs_agent_code_and_checks_handlers(tmp_path):
+    proj, out = tmp_path / "p", tmp_path / "o"
+    out.mkdir()
+    _write(proj, {"controllers/PublicView.php": "<?php class PublicView { function execute() {} }",
+                  "controllers/AdminSave.php": "<?php class AdminSave { function execute() {} }",
+                  "controllers/Broken.php": "<?php class Broken { function run() {} }"})
+    tb = Toolbox(AuditConfig(), proj, out)
+    res = json.loads(tb.run_extractor("pages", EXTRACTOR))
+    assert res["entries"] == 4 and res["handler_resolved"] == 2 and res["handler_unresolved"] == 2
+    assert res["by_exposure"] == {"privileged": 2, "public": 1, "unknown": 1}
+    assert any("does not exist" in u for u in res["unresolved_samples"])
+    assert any("does not occur" in u for u in res["unresolved_samples"])  # Broken has no execute()
+    assert res["problems"] and len(res["random_resolved_samples_to_check_by_reading"]) == 2
+    assert (out / "extractors" / "pages.py").read_text() == EXTRACTOR
+    # same name replaces, another name adds; manual entries are merged and deduplicated
+    tb.run_extractor("pages", "import json; print(json.dumps([{'route': '/a', "
+                              "'handler_file': 'controllers/AdminSave.php'}]))")
+    tb.add_entries([{"route": "/a", "handler_file": "controllers/AdminSave.php"},
+                    {"route": "/b", "handler_file": "controllers/PublicView.php", "exposure": "public"}])
+    assert [e["route"] for e in tb.entries()] == ["/a", "/b"]
+    assert tb.run_extractor("bad name!", "").startswith("error")
+    assert "exited 1" in tb.run_extractor("boom", "raise SystemExit(1)")
+    assert "not JSON" in tb.run_extractor("text", "print('hello')")
 
-    (tmp_path / "server.ts").write_text(EXPRESS_BOOT)
-    routes = {r["route"]: r for r in express_entries(tmp_path)}
-    assert set(routes) == {"/ftp", "/rest/basket/:id", "/api/Addresss/:id", "/dataerasure"}
-    basket = routes["/rest/basket/:id"]
-    assert basket["file"] == "routes/basket.ts"
-    assert basket["guards"] == ["security.updateAuthenticatedUsers", "security.isAuthorized",
-                                "security.appendUserId"]  # inherited from the /rest/basket prefix
-    assert routes["/api/Addresss/:id"]["guards"] == ["security.updateAuthenticatedUsers",
-                                                     "security.appendUserId"]
-    assert routes["/dataerasure"]["file"] == "routes/dataErasure.ts"  # bare identifier handler
-    assert routes["/ftp"]["file"] == "server.ts" and "directory listing" in routes["/ftp"]["handler"]
+
+@needs_rg
+def test_check_coverage_reports_request_reads_outside_entries(tmp_path):
+    _write(tmp_path, {"web/Page.php": "<?php $r->getParam('a');\n",
+                      "api/Rest.php": "<?php $r->getParam('b');\n$r->getParam('c');\n"})
+    tb = Toolbox(_cfg(), tmp_path, tmp_path)
+    tb.add_entries([{"route": "/page", "handler_file": "web/Page.php", "handler": "getParam"}])
+    res = json.loads(tb.check_coverage(r"getParam\("))
+    assert (res["sites"], res["covered_sites"], res["uncovered_sites"]) == (3, 1, 2)
+    assert res["uncovered_by_directory"] == [["api", 2]]
 
 
-def test_java_entries(tmp_path):
-    from app.services.yasa_audit.entrypoints import java_entries
+def test_factbook_accepts_only_evidence_found_in_code(tmp_path):
+    _write(tmp_path, {"lib/Escaper.php": "<?php\nclass Escaper {\n  function escapeHtml($s) {\n"
+                                         "    return htmlspecialchars($s, ENT_QUOTES);\n  }\n}\n"})
+    fb = FactBook(tmp_path)
+    ok = [{"file": "lib/Escaper.php", "line": 4, "quote": "htmlspecialchars($s,   ENT_QUOTES)"}]
+    assert fb.add("escapeHtml HTML-escapes with ENT_QUOTES", ok, "u1").startswith("accepted")
+    assert fb.add("escapeHtml  html-escapes with ENT_QUOTES", ok, "u2") == "already known"
+    assert fb.add("x", [{"file": "lib/Escaper.php", "line": 4, "quote": "strip_tags"}], "u3").startswith("rejected")
+    assert fb.add("x", [{"file": "../etc/passwd", "line": 1, "quote": "root"}], "u3").startswith("rejected")
+    assert fb.add("x", [], "u3").startswith("rejected")
+    assert "lib/Escaper.php:4" in fb.prompt_block() and len(fb.facts) == 1
 
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "Login.java").write_text('@WebServlet(urlPatterns="/Plogin")\nclass Login {}\n')
-    (tmp_path / "WebContent").mkdir()
-    (tmp_path / "WebContent" / "delptnt.jsp").write_text("<% %>")
-    got = {(e["route"], e["file"]) for e in java_entries(tmp_path)}
-    assert got == {("/Plogin", "src/Login.java"), ("/delptnt.jsp", "WebContent/delptnt.jsp")}
+
+# ---------------------------------------------------------------- pipeline
+
+
+def test_units_dedupe_handlers_and_order_by_exposure():
+    from app.services.yasa_audit.pipeline import _peers, _units
+
+    entries = [
+        {"id": "E1", "route": "/admin/x", "handler_file": "a/Admin.php", "handler": "execute",
+         "exposure": "privileged"},
+        {"id": "E2", "route": "/V1/carts/:id", "handler_file": "q/Cart.php", "handler": "get",
+         "exposure": "authenticated"},
+        {"id": "E3", "route": "/V1/guest-carts/:id", "handler_file": "q/Cart.php", "handler": "get",
+         "exposure": "public"},
+        {"id": "E4", "route": "/V1/carts/:id/items", "handler_file": "q/Item.php", "handler": "save",
+         "exposure": "authenticated"},
+        {"id": "E5", "route": "/broken", "handler_file": "x/Gone.php", "handler": "run", "exposure": "public",
+         "resolved": False},
+    ]
+    units = _units(entries)
+    assert [[e["id"] for e in u["entries"]] for u in units] == [["E2", "E3"], ["E4"], ["E1"], ["E5"]]
+    assert units[0]["exposure"] == "public"  # the most exposed route of a handler decides
+    peers = _peers(units[1], entries)
+    assert any("/V1/carts/:id ->" in p for p in peers)
+
+
+def test_handler_snippet_starts_at_the_handler(tmp_path):
+    from app.services.yasa_audit.pipeline import _handler_snippet
+
+    _write(tmp_path, {"C.php": "<?php\n" + "// pad\n" * 30 + "    public function execute()\n    {\n"})
+    snip = _handler_snippet(tmp_path, {"handler_file": "C.php", "handler": "Ns\\C::execute"}, lines=3)
+    assert snip.startswith("C.php lines 32-33") and "public function execute()" in snip
+
+
+def test_recon_falls_back_to_codegraph_when_agent_finds_nothing(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: ScriptedLLM([]))
+    monkeypatch.setattr(pipeline, "codegraph_db", lambda root: Path("x"))
+    monkeypatch.setattr(pipeline, "codegraph_routes", lambda db, root: [
+        {"route": "/orders/:id", "method": "GET", "file": "r.ts", "handler": "show"}])
+    m = pipeline.recon(AuditConfig(), tmp_path, tmp_path / "recon")
+    assert m["source"] == "codegraph-fallback" and m["entries"] == 1
+    (e,) = json.loads((tmp_path / "recon" / "entries.json").read_text())
+    assert e["id"] == "E1" and e["handler_file"] == "r.ts" and e["resolved"] is False
+
+
+def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+
+    proj = tmp_path / "p"
+    _write(proj, {"web/Download.php": "<?php\nclass Download {\n  function execute() {\n"
+                                      "    readfile('/srv/files/' . $_GET['name']);\n  }\n}\n",
+                  "web/Home.php": "<?php\nclass Home {\n  function execute() { echo 'hi'; }\n}\n"})
+    extractor = ("import json, os, sys\nr = sys.argv[1]\nprint(json.dumps([{'route': '/' + f[:-4].lower(), "
+                 "'handler_file': 'web/' + f, 'handler': 'execute', 'exposure': 'public'} "
+                 "for f in sorted(os.listdir(os.path.join(r, 'web')))]))")
+    scripts = {
+        "recon": [("run_extractor", {"name": "web", "code": extractor}),
+                  ("finish", {"notes": "web/<Name>.php::execute serves /<name>"})],
+        "/download": [("record_card", {"function": "file download", "callers": "anyone",
+                                       "authz_verdict": "ok", "hypotheses": [
+                                           {"risk": "path traversal", "why": "name joins a path",
+                                            "status": "confirmed"}]}),
+                      ("add_fact", {"statement": "Download reads files under /srv/files", "evidence": [
+                          {"file": "web/Download.php", "line": 4, "quote": "readfile('/srv/files/'"}]}),
+                      ("report_finding", {"vuln_type": "Path traversal", "cwe": "CWE-22",
+                                          "sink_file": "web/Download.php", "sink_line": 4,
+                                          "source": "$_GET['name']", "entry": "GET /download (public)",
+                                          "required_privilege": "none", "verdict": "confirmed"})],
+        "/home": [("record_card", {"function": "home page", "callers": "anyone", "authz_verdict": "ok",
+                                   "hypotheses": []})],
+    }
+    users = []
+
+    class Router(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            if not self.script and len(messages) == 2:
+                user = messages[1]["content"]
+                users.append(user)
+                key = next((k for k in ("/download", "/home") if f'"route": "{k}"' in user), "recon")
+                self.script = list(scripts[key])
+            return super().chat(messages, tools)
+
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
+    cfg = AuditConfig(workers=1)
+    m = pipeline.run(cfg, proj, tmp_path / "out", deadline=time.time() + 600)
+    assert m["recon"]["entries"] == 2 and m["recon"]["resolved"] == 2
+    assert m["review"]["units"] == 2 and m["review"]["reviewed_units"] == 2 and m["review"]["facts"] == 1
+    data = json.loads((tmp_path / "out" / "review" / "findings.json").read_text())
+    (f,) = data["findings"]
+    assert f["cwe"] == "CWE-22" and f["handler"] == "web/Download.php::execute" and data["not_reviewed"] == []
+    cards = json.loads((tmp_path / "out" / "review" / "cards.json").read_text())
+    assert {c["function"] for c in cards} == {"file download", "home page"}
+    assert any("readfile('/srv/files/'" in u for u in users[1:])  # the handler's code is in the unit
+    m2 = pipeline.run(cfg, proj, tmp_path / "out", deadline=time.time() + 600)  # recon reused
+    assert m2["recon"].get("reused") is True
 
 
 def test_schedule_respects_deadline_and_order():
-    import time as _t
-
     from app.services.yasa_audit.pipeline import MIN_UNIT_S, _schedule
 
     seen = []
@@ -188,84 +256,30 @@ def test_schedule_respects_deadline_and_order():
                                  workers=1, deadline=None)
     assert seen == ["a", "b", "c"] and skipped == []
     results, skipped = _schedule(["a", "b"], lambda i, u: {"findings": [u]}, workers=2,
-                                 deadline=_t.time() + MIN_UNIT_S / 2)
+                                 deadline=time.time() + MIN_UNIT_S / 2)
     assert results == [] and sorted(skipped) == ["a", "b"]
 
 
-def test_candidate_rank_prefers_engine_then_severe_classes():
-    from app.services.yasa_audit.pipeline import _cand_rank
+def test_schedule_skips_when_stopped():
+    from app.services.yasa_audit.pipeline import _schedule
 
-    assert _cand_rank({"origin": "engine:R1-F1"}) == 0
-    assert _cand_rank({"origin": "residual:a.ts:1", "suspected_classes": ["CWE-89"]}) == 1
-    assert _cand_rank({"origin": "residual:a.ts:2", "suspected_classes": ["CWE-79"]}) == 3
+    results, skipped = _schedule([1, 2, 3], lambda i, u: {"u": u}, 2, None, stop=lambda: True)
+    assert results == [] and skipped == [1, 2, 3]
+
+
+# ---------------------------------------------------------------- agent loop and usage
 
 
 def test_agent_loop_stops_after_deadline(tmp_path):
-    import time as _t
-    from types import SimpleNamespace
-
     from app.services.yasa_audit.agent_loop import run_agent
 
-    class FakeLLM:
-        def chat(self, messages, tools=None):
-            call = SimpleNamespace(id="c1", function=SimpleNamespace(name="grep", arguments='{"pattern": "x"}'))
-            return SimpleNamespace(content="", tool_calls=[call])
-
-    tb = Toolbox(AuditConfig(), tmp_path, tmp_path, enable_yasa=False)
-    res = run_agent(FakeLLM(), tb, tool_schemas(enable_yasa=False), "sys", "user", budget=50,
-                    log_path=tmp_path / "t.jsonl", deadline=_t.time() - 120)
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    res = run_agent(ScriptedLLM([("list_dir", {})] * 5), tb, tool_schemas("review"), "sys", "user",
+                    budget=50, log_path=tmp_path / "t.jsonl", deadline=time.time() - 120)
     assert res["timed_out"] and res["steps"] == 0
 
 
-SPRING_CTRL = """package x;
-@Slf4j
-@RestController
-@RequestMapping("/user")
-public class UserInfoController {
-
-    /**
-     * list users
-     */
-    @GetMapping("/list")
-    public ResultDTO<List<User>> list(@RequestParam(required = false) String name) {
-        return null;
-    }
-
-    @PostMapping("/query")
-    @ApiPermission(name = "User-Query", requiredPermission = Permission.SU)
-    public ResultDTO<List<User>> query(@RequestBody Query q) {
-        return null;
-    }
-}
-"""
-
-SPRING_CFG = """public class WebConfig implements WebMvcConfigurer {
-    public void addInterceptors(InterceptorRegistry registry) {
-        registry.addInterceptor(authInterceptor)
-                .addPathPatterns("/**")
-                .excludePathPatterns("/css/**");
-    }
-}
-"""
-
-
-def test_spring_entries_and_global_guards(tmp_path):
-    from app.services.yasa_audit.entrypoints import java_global_guards, spring_entries
-
-    (tmp_path / "UserInfoController.java").write_text(SPRING_CTRL)
-    (tmp_path / "WebConfig.java").write_text(SPRING_CFG)
-    routes = {e["route"]: e for e in spring_entries(tmp_path)}
-    assert set(routes) == {"/user/list", "/user/query"}
-    assert routes["/user/list"]["guards"] == [] and routes["/user/list"]["handler"] == "list"
-    assert routes["/user/query"]["guards"][0].startswith("@ApiPermission")
-    assert routes["/user/query"]["method"] == "POST"
-    guards = java_global_guards(tmp_path)
-    assert len(guards) == 1 and 'addPathPatterns("/**")' in guards[0]
-
-
 def test_agent_loop_sends_reminder_once(tmp_path):
-    from types import SimpleNamespace
-
     from app.services.yasa_audit.agent_loop import run_agent
 
     seen_msgs = []
@@ -273,48 +287,13 @@ def test_agent_loop_sends_reminder_once(tmp_path):
     class FakeLLM:
         def chat(self, messages, tools=None):
             seen_msgs.append([m["content"] for m in messages if m["role"] == "user"])
-            call = SimpleNamespace(id="c", function=SimpleNamespace(name="grep", arguments='{"pattern": "x"}'))
-            return SimpleNamespace(content="", tool_calls=[call])
+            return SimpleNamespace(content="", tool_calls=[_call("list_dir", {})])
 
-    tb = Toolbox(AuditConfig(), tmp_path, tmp_path, enable_yasa=False)
-    run_agent(FakeLLM(), tb, tool_schemas(enable_yasa=False), "sys", "user", budget=6,
-              log_path=tmp_path / "t.jsonl", reminders=[(lambda steps, t: steps >= 2, "RUN THE ENGINE")])
-    assert sum(m.count("RUN THE ENGINE") for m in seen_msgs[-1:]) == 1
-    assert not any("RUN THE ENGINE" in m for m in seen_msgs[1])  # not before step 2
-
-
-# ---------------------------------------------------------------- DeepAudit task integration
-
-
-def test_to_deepaudit_findings_maps_and_filters():
-    from app.services.yasa_audit.runner import to_deepaudit_findings
-
-    raw = [
-        {"vuln_type": "SQL injection", "cwe": "CWE-89", "sink_file": "a/Dao.java", "sink_line": 12,
-         "source": "req.getParameter(id)", "hops": ["A:1", "B:2"], "verdict": "confirmed",
-         "yasa_ref": "R1-F0"},
-        {"cwe": "CWE-89", "sink_file": "a/Dao.java", "sink_line": 12, "verdict": "likely"},  # dup
-        {"cwe": "CWE-22", "sink_file": "b.ts", "sink_line": "7", "verdict": "likely"},
-        {"cwe": "CWE-78", "sink_file": "c.ts", "sink_line": 3, "verdict": "false_positive"},
-        {"cwe": "CWE-9999", "sink_file": "d.ts", "sink_line": None, "verdict": "confirmed"},
-    ]
-    out = to_deepaudit_findings(raw, "dataflow")
-    assert [f["file_path"] for f in out] == ["a/Dao.java", "b.ts", "d.ts"]
-    sqli, trav, other = out
-    assert sqli["vulnerability_type"] == "sql_injection" and sqli["severity"] == "high"
-    assert "R1-F0" in sqli["description"] and "1. A:1" in sqli["description"]
-    assert "verdict" not in sqli and "is_verified" not in sqli  # triage verdict is not verification
-    assert trav["severity"] == "medium" and trav["line_start"] == 7  # likely -> one level lower
-    assert other["vulnerability_type"] == "other" and other["line_start"] is None
-
-
-def test_split_workers_and_stop_flag():
-    from app.services.yasa_audit.runner import split_workers
-
-    cfg = AuditConfig(workers=6, should_stop=lambda: True)
-    df, az = split_workers(cfg)
-    assert (df.workers, az.workers) == (4, 2) and df.stopped() and az.stopped()
-    assert not AuditConfig().stopped()
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    run_agent(FakeLLM(), tb, tool_schemas("recon"), "sys", "user", budget=6,
+              log_path=tmp_path / "t.jsonl", reminders=[(lambda steps, t: steps >= 2, "WRITE AN EXTRACTOR")])
+    assert sum(m.count("WRITE AN EXTRACTOR") for m in seen_msgs[-1:]) == 1
+    assert not any("WRITE AN EXTRACTOR" in m for m in seen_msgs[1])  # not before step 2
 
 
 def test_agent_loop_stops_when_cancelled(tmp_path):
@@ -324,17 +303,51 @@ def test_agent_loop_stops_when_cancelled(tmp_path):
         def chat(self, messages, tools=None):  # pragma: no cover - must not be called
             raise AssertionError("LLM called after cancel")
 
-    tb = Toolbox(AuditConfig(should_stop=lambda: True), tmp_path, tmp_path, enable_yasa=False)
-    res = run_agent(FakeLLM(), tb, tool_schemas(enable_yasa=False), "s", "u", budget=5,
-                    log_path=tmp_path / "t.jsonl")
+    tb = Toolbox(AuditConfig(should_stop=lambda: True), tmp_path, tmp_path)
+    res = run_agent(FakeLLM(), tb, tool_schemas("review"), "s", "u", budget=5, log_path=tmp_path / "t.jsonl")
     assert res["steps"] == 0 and not res["finished"]
 
 
-def test_schedule_skips_when_stopped():
-    from app.services.yasa_audit.pipeline import _schedule
+def test_llm_usage_counts_cached_and_reasoning_tokens():
+    from app.services.yasa_audit.llm import Usage
 
-    results, skipped = _schedule([1, 2, 3], lambda i, u: {"u": u}, 2, None, stop=lambda: True)
-    assert results == [] and skipped == [1, 2, 3]
+    u = Usage()
+    u.add(SimpleNamespace(prompt_tokens=100, completion_tokens=20,
+                          prompt_tokens_details=SimpleNamespace(cached_tokens=64),
+                          completion_tokens_details=SimpleNamespace(reasoning_tokens=12)), 1.0)
+    u.add(SimpleNamespace(prompt_tokens=10, completion_tokens=5, prompt_tokens_details=None,
+                          completion_tokens_details=None), 1.0)
+    assert (u.prompt, u.completion, u.cached, u.reasoning, u.calls) == (110, 25, 64, 12, 2)
+
+
+# ---------------------------------------------------------------- DeepAudit task integration
+
+
+def test_to_deepaudit_findings_maps_privilege_and_filters():
+    from app.services.yasa_audit.runner import to_deepaudit_findings
+
+    raw = [
+        {"vuln_type": "SQL injection", "cwe": "CWE-89", "sink_file": "a/Dao.java", "sink_line": 12,
+         "source": "req.getParameter(id)", "hops": ["A:1", "B:2"], "verdict": "confirmed",
+         "required_privilege": "none", "entry": "GET /x"},
+        {"cwe": "CWE-89", "sink_file": "a/Dao.java", "sink_line": 12, "verdict": "likely"},  # dup
+        {"cwe": "CWE-22", "sink_file": "b.ts", "sink_line": "7", "verdict": "likely"},
+        {"cwe": "CWE-639", "sink_file": "c.php", "sink_line": 3, "verdict": "confirmed",
+         "required_privilege": "admin"},
+        {"cwe": "CWE-89", "sink_file": "setup/x.php", "sink_line": 3, "verdict": "confirmed",
+         "required_privilege": "operator_or_cli"},
+        {"cwe": "CWE-78", "sink_file": "d.ts", "sink_line": 3, "verdict": "false_positive"},
+        {"cwe": "CWE-9999", "sink_file": "e.ts", "sink_line": None, "verdict": "confirmed"},
+    ]
+    out = to_deepaudit_findings(raw)
+    assert [f["file_path"] for f in out] == ["a/Dao.java", "b.ts", "c.php", "setup/x.php", "e.ts"]
+    sqli, trav, idor, cli, other = out
+    assert sqli["vulnerability_type"] == "sql_injection" and sqli["severity"] == "high"
+    assert "1. A:1" in sqli["description"] and "Entry: GET /x" in sqli["description"]
+    assert "verdict" not in sqli and "is_verified" not in sqli  # static verdict is not verification
+    assert trav["severity"] == "medium" and trav["line_start"] == 7  # likely -> one level lower
+    assert idor["severity"] == "medium" and cli["severity"] == "low"
+    assert other["vulnerability_type"] == "other" and other["line_start"] is None
 
 
 def test_audit_scope_with_mode():
@@ -348,8 +361,6 @@ def test_audit_scope_with_mode():
 
 
 async def test_execute_yasa_task_saves_findings(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
     from app.services.yasa_audit import task as ytask
 
     monkeypatch.setattr(ytask, "RUNS_DIR", tmp_path / "runs")
@@ -357,20 +368,14 @@ async def test_execute_yasa_task_saves_findings(tmp_path, monkeypatch):
     monkeypatch.setattr(ytask, "init_navigation", lambda *a, **k: None)
     seen = {}
 
-    def fake_df(cfg, root, out, deploy, start, deadline):
-        seen["df_workers"], seen["budget"] = cfg.workers, round(deadline - start)
-        return {"build": {"yasa_runs": 1}, "triage": {"engine_candidates": 2, "units": 3},
-                "findings": [{"cwe": "CWE-89", "sink_file": "A.java", "sink_line": 5,
-                              "verdict": "confirmed"}], "not_reviewed": [], "tokens": 100}
+    def fake_audit(cfg, root, out, deploy, product, start, deadline):
+        seen["workers"], seen["budget"], seen["product"] = cfg.workers, round(deadline - start), product
+        return {"recon": {"entries": 3, "resolved": 3}, "review": {"units": 3, "reviewed_units": 2},
+                "findings": [{"cwe": "CWE-89", "sink_file": "A.java", "sink_line": 5, "verdict": "confirmed"},
+                             {"cwe": "CWE-862", "sink_file": "B.java", "sink_line": 9, "verdict": "likely"}],
+                "not_reviewed": ["E3"], "tokens": 150}
 
-    def fake_az(cfg, root, out, deploy, product, deadline):
-        seen["product"] = product
-        return {"authz": {"entries": 4}, "findings": [
-            {"cwe": "CWE-862", "sink_file": "B.java", "sink_line": 9, "verdict": "likely"}],
-            "not_reviewed": ["C.java"], "tokens": 50}
-
-    monkeypatch.setattr(ytask, "run_dataflow", fake_df)
-    monkeypatch.setattr(ytask, "run_authz", fake_az)
+    monkeypatch.setattr(ytask, "run_entry_audit", fake_audit)
 
     class DB:
         async def commit(self):
@@ -400,11 +405,11 @@ async def test_execute_yasa_task_saves_findings(tmp_path, monkeypatch):
                           timeout=60, temperature=0.1, max_tokens=4096)
     await ytask.execute_yasa_task(DB(), t, str(tmp_path), llm, Emitter(), lambda: False, save,
                                   lambda f: 42.0)
-    assert seen == {"df_workers": 4, "budget": 1200, "product": "public: /login"}
+    assert seen == {"workers": 6, "budget": 1200, "product": "public: /login"}
     assert [f["file_path"] for f in saved["findings"]] == ["A.java", "B.java"]
     assert t.findings_count == 2 and t.tokens_used == 150 and t.status == "completed"
     assert (t.high_count, t.medium_count) == (1, 1) and t.security_score == 42.0
-    assert "emit_task_complete" in events and "emit_warning" in events  # C.java not reviewed
+    assert "emit_task_complete" in events and "emit_warning" in events  # E3 not reviewed
 
 
 def test_count_sources_skips_vendor_dirs(tmp_path):
@@ -424,119 +429,28 @@ def test_scope_tree_applies_excludes_and_targets(tmp_path):
     for rel in ("src/A.java", "src/B.java", "node_modules/x/i.js", "app.log", "web/c.jsp"):
         (src / rel).parent.mkdir(parents=True, exist_ok=True)
         (src / rel).write_text("x")
-    # no pattern matches -> project dir used as is
     assert scope_tree(src, tmp_path / "s0", ["*.min.js"], None) == (src, 0)
-
     root, dropped = scope_tree(src, tmp_path / "s1", ["node_modules/**", "*.log"], None)
     kept = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
     assert kept == ["src/A.java", "src/B.java", "web/c.jsp"] and dropped == 2
-
     root, dropped = scope_tree(src, tmp_path / "s2", ["*.log"], ["src/A.java", "./web/c.jsp"])
     kept = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
     assert kept == ["src/A.java", "web/c.jsp"] and dropped == 3
 
 
-# ---------------------------------------------------------------- Python / PHP
-
-
-def _write(root, files):
-    for rel, txt in files.items():
-        (root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel).write_text(txt)
-
-
-def test_detect_lang_python_and_php(tmp_path):
-    from app.services.yasa_audit.pipeline import detect_lang
-
-    _write(tmp_path / "py", {"a.py": "", "b.py": "", "static/x.js": "", "venv/lib/c.js": "", "venv/lib/d.js": ""})
-    _write(tmp_path / "php", {"index.php": "", "vendor/a/x.php": "", "assets/app.js": ""})
-    _write(tmp_path / "php2", {"a.php": "", "b.php": "", "assets/app.js": ""})
-    assert detect_lang(tmp_path / "py") == "py"
-    assert detect_lang(tmp_path / "php2") == "php"
-
-
-def test_python_entries_flask_fastapi_django(tmp_path):
-    from app.services.yasa_audit.entrypoints import entries_for, global_guards_for
-
-    _write(tmp_path, {
-        "app.py": "bp = Blueprint('admin', __name__, url_prefix='/admin')\n"
-                  "@bp.route('/users', methods=['GET', 'POST'])\n@login_required\ndef users():\n    pass\n"
-                  "@app.before_request\ndef check():\n    pass\n",
-        "api.py": "router = APIRouter(prefix='/api')\n"
-                  "@router.get('/items/{id}')\nasync def item(id: int, user=Depends(current_user)):\n    pass\n",
-        "shop/urls.py": "urlpatterns = [path('orders/<int:pk>/', views.OrderView.as_view())]\n",
-        "shop/views.py": "class OrderView(LoginRequiredMixin, DetailView):\n    pass\n",
-    })
-    es = {e["route"]: e for e in entries_for(tmp_path, "py")}
-    assert es["/admin/users"]["method"] == "GET,POST" and es["/admin/users"]["guards"] == ["@login_required"]
-    assert es["/api/items/{id}"]["guards"] == ["Depends(current_user)"]
-    assert es["/orders/<int:pk>/"]["file"] == "shop/views.py"
-    assert es["/orders/<int:pk>/"]["guards"] == ["LoginRequiredMixin"]
-    assert any("before_request" in g for g in global_guards_for(tmp_path, "py"))
-
-
-def test_php_entries_plain_and_laravel(tmp_path):
-    from app.services.yasa_audit.entrypoints import entries_for
-
-    plain = tmp_path / "plain"
-    _write(plain, {
-        "admin.php": "<?php\nsession_start();\nrequire_once 'auth.php';\n"
-                     "if (!isset($_SESSION['u'])) { header('Location: login.php'); exit; }\n",
-        "view.php": "<?php include($_GET['p']);\n",
-        "vendor/lib/x.php": "<?php\n",
-    })
-    es = {e["route"]: e for e in entries_for(plain, "php")}
-    assert set(es) == {"/admin.php", "/view.php"}
-    assert len(es["/admin.php"]["guards"]) == 3 and es["/view.php"]["guards"] == []
-
-    lv = tmp_path / "lv"
-    _write(lv, {
-        "routes/web.php": "<?php\nRoute::get('/users/{id}', [UserController::class, 'show'])->middleware('auth');\n"
-                          "Route::post('login', [UserController::class, 'login']);\n",
-        "app/Http/Controllers/UserController.php": "<?php\nclass UserController {\n"
-                                                   "  public function show($id) {}\n  public function login() {}\n}\n",
-    })
-    es = {e["route"]: e for e in entries_for(lv, "php")}
-    assert es["/users/{id}"]["guards"] == ["'auth'"] and es["/users/{id}"]["line"] == 3
-    assert es["/login"]["method"] == "POST" and es["/login"]["guards"] == []
-
-
-def test_l0_inventory_python_php(tmp_path):
-    from app.services.yasa_audit.pipeline import inventory
-
-    _write(tmp_path, {
-        "app.py": "db.execute('SELECT * FROM t WHERE id=%s' % uid)\nopen('config.yaml')\n"
-                  "subprocess.check_output(cmd, shell=True)\nrender_template_string(tpl)\n",
-        "x.php": "<?php\nmysqli_query($c, \"SELECT * FROM t WHERE id='$id'\");\nsystem('ls ' . $d);\n"
-                 "include($_GET['p']);\necho $_GET['q'];\n",
-        "vendor/lib.php": "<?php system($x);\n",
-    })
-    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out", enable_yasa=False)
-    py = {(h["line"], c) for h in inventory(tb, "py", []) for c in h["classes"]}
-    assert {(1, "CWE-89"), (3, "CWE-78"), (4, "CWE-1336")} <= py and not any(ln == 2 for ln, _ in py)
-    php = {(h["file"], h["line"], c) for h in inventory(tb, "php", []) for c in h["classes"]}
-    assert {("x.php", 2, "CWE-89"), ("x.php", 3, "CWE-78"), ("x.php", 4, "CWE-98"),
-            ("x.php", 5, "CWE-79")} <= php
-    assert not any(f.startswith("vendor/") for f, _, _ in php)
-
-
-
-def test_inventory_not_truncated_on_many_hits(tmp_path):
-    from app.services.yasa_audit.pipeline import inventory
-
-    _write(tmp_path, {f"m{i:03d}.php": "<?php\n" + "".join(
-        f"mysqli_query($c, \"SELECT * FROM t{j} WHERE id='$id' AND padding_padding_padding_padding\");\n"
-        for j in range(5)) for i in range(120)})
-    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out", enable_yasa=False)
-    assert len(inventory(tb, "php", [])) == 600  # well beyond the agent grep's character clip
-
-
-def test_php_xss_and_redirect_patterns(tmp_path):
-    from app.services.yasa_audit.pipeline import inventory
-
-    _write(tmp_path, {"a.php": "<?php\n$html .= '<pre>Hello ' . $_GET['name'] . '</pre>';\n"
-                               "$html .= \"<pre>Hello {$name}</pre>\";\n"
-                               "header (\"location: \" . $_GET['redirect']);\n$html .= '<p>static</p>';\n"})
-    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out", enable_yasa=False)
-    got = {(h["line"], c) for h in inventory(tb, "php", []) for c in h["classes"]}
-    assert {(2, "CWE-79"), (3, "CWE-79"), (4, "CWE-601")} <= got and not any(ln == 5 for ln, _ in got)
+def test_benchmark_scoring():
+    spec = importlib.util.spec_from_file_location("yasa_bench_eval", BENCH)
+    ev = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ev)
+    findings = [
+        {"sink_file": "routes/search.ts", "sink_line": 23, "cwe": "CWE-89", "verdict": "confirmed"},
+        {"sink_file": "routes/keyServer.ts", "sink_line": 14, "cwe": "CWE-22", "verdict": "likely"},
+        {"sink_file": "routes/trackOrder.ts", "sink_line": 18, "cwe": "CWE-89", "verdict": "false_positive"},
+        {"sink_file": "routes/vulnCodeFixes.ts", "sink_line": 83, "cwe": "CWE-22", "verdict": "likely"},
+    ]
+    r = ev.score("juice-mini", findings)
+    assert r["recall"] == "1/18"
+    assert [n["id"] for n in r["negative_hits"]] == ["JS-N02"]
+    assert r["wrongly_rejected"] == ["JS-E01"]
+    assert r["unmatched"] == []
+    assert json.dumps(r)

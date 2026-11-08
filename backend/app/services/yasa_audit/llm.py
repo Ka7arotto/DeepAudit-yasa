@@ -14,6 +14,8 @@ from .config import AuditConfig
 class Usage:
     prompt: int = 0
     completion: int = 0
+    cached: int = 0  # prompt tokens served from the provider's prefix cache (billed lower)
+    reasoning: int = 0  # completion tokens spent on hidden reasoning
     calls: int = 0
     seconds: float = 0.0
 
@@ -23,6 +25,10 @@ class Usage:
         if usage:
             self.prompt += getattr(usage, "prompt_tokens", 0) or 0
             self.completion += getattr(usage, "completion_tokens", 0) or 0
+            ptd = getattr(usage, "prompt_tokens_details", None)
+            ctd = getattr(usage, "completion_tokens_details", None)
+            self.cached += (getattr(ptd, "cached_tokens", 0) or 0) if ptd else 0
+            self.reasoning += (getattr(ctd, "reasoning_tokens", 0) or 0) if ctd else 0
 
 
 @dataclass
