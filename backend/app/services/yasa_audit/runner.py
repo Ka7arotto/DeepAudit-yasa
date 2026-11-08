@@ -1,4 +1,4 @@
-"""Glue between the YASA hybrid pipeline and DeepAudit's task system.
+"""Glue between the entry-first audit pipeline and DeepAudit's task system.
 
 The pipeline itself is synchronous (threads + blocking HTTP). DeepAudit calls these helpers through
 asyncio.to_thread and emits task events between stages. `to_deepaudit_findings` maps pipeline
@@ -7,7 +7,6 @@ findings to the dict shape that agent_tasks._save_findings understands.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 import shutil
@@ -17,7 +16,7 @@ import time
 from pathlib import Path
 
 from .config import AuditConfig
-from .pipeline import authz, build, triage
+from .pipeline import run
 
 REPORTED = ("confirmed", "likely")
 
@@ -60,8 +59,7 @@ LOWER = {"critical": "high", "high": "medium", "medium": "low", "low": "low"}
 def check_tools(cfg: AuditConfig) -> list[str]:
     """Names of missing executables (empty when the pipeline can run)."""
     missing = []
-    for name, path in (("YASA_BIN", cfg.yasa_bin), ("YASAMCP_BIN", cfg.yasamcp_bin),
-                       ("YASA_RG_BIN", cfg.rg_bin)):
+    for name, path in (("YASAMCP_BIN", cfg.yasamcp_bin), ("YASA_RG_BIN", cfg.rg_bin)):
         if not (Path(path).is_file() or shutil.which(path)):
             missing.append(f"{name}={path}")
     return missing
@@ -102,56 +100,38 @@ def init_navigation(cfg: AuditConfig, root: Path, timeout_s: int = 600, stop=Non
         raise RuntimeError(f"yasa-mcp init exited with code {code}; log: {log_path}")
 
 
-def _load(out: Path) -> dict:
-    p = out / "findings.json"
-    return json.loads(p.read_text()) if p.exists() else {"findings": [], "not_reviewed": []}
+def run_entry_audit(cfg: AuditConfig, root: Path, out: Path, deploy: str, product: str, start: float,
+                    deadline: float) -> dict:
+    """Route reconnaissance, then one review per entry. Returns metrics plus the raw findings."""
+    m = run(cfg, root, out, deploy, product, start, deadline)
+    data = json.loads((out / "review" / "findings.json").read_text())
+    return {**m, "findings": data["findings"], "not_reviewed": data.get("not_reviewed", []),
+            "tokens": m["total_tokens"]}
 
 
-def run_dataflow(cfg: AuditConfig, root: Path, out: Path, deploy: str, start: float,
-                 deadline: float) -> dict:
-    """Build stage (rules + engine) then grouped triage. Returns metrics plus raw findings."""
-    build_deadline = start + cfg.build_share * (deadline - start)
-    b = build(cfg, root, out / "build", deploy, build_deadline)
-    t = triage(cfg, root, out / "build", out / "triage", "file", deploy, deadline)
-    data = _load(out / "triage")
-    return {"build": b, "triage": t, "findings": data["findings"],
-            "not_reviewed": data.get("not_reviewed", []),
-            "tokens": b["prompt_tokens"] + b["completion_tokens"]
-            + t["prompt_tokens"] + t["completion_tokens"]}
-
-
-def run_authz(cfg: AuditConfig, root: Path, out: Path, deploy: str, product: str,
-              deadline: float) -> dict:
-    m = authz(cfg, root, out / "authz", deploy, product, deadline=deadline)
-    data = _load(out / "authz")
-    return {"authz": m, "findings": data["findings"], "not_reviewed": data.get("not_reviewed", []),
-            "tokens": m["prompt_tokens"] + m["completion_tokens"]}
-
-
-def split_workers(cfg: AuditConfig) -> tuple[AuditConfig, AuditConfig]:
-    """Dataflow and access-control stages run side by side; give authz about a third."""
-    a = max(1, cfg.workers // 3)
-    return (dataclasses.replace(cfg, workers=max(1, cfg.workers - a)),
-            dataclasses.replace(cfg, workers=a))
-
-
-def _describe(f: dict, stage: str) -> str:
-    parts = [f"[yasa_audit/{stage}] verdict: {f.get('verdict')}"]
-    for key, label in (("source", "Source"), ("entry", "Entry"), ("sanitizers", "Guards/sanitizers")):
+def _describe(f: dict) -> str:
+    parts = [f"[yasa_audit/entry review] verdict: {f.get('verdict')}"]
+    if f.get("documented_intent"):
+        di = f["documented_intent"]
+        di = di if isinstance(di, dict) else (di or [{}])[0]
+        parts.append(f"Documented as intended by the project: {di.get('file')}:{di.get('line')} \"{di.get('quote')}\"")
+    if f.get("issue"):
+        parts.append(f"Root cause {f['issue']}: {f.get('root_cause') or '(see linked finding)'}")
+    for key, label in (("impact", "Impact"), ("entry", "Entry"), ("required_privilege", "Required privilege"),
+                       ("source", "Source"), ("sanitizers", "Guards/sanitizers"), ("handler", "Handler")):
         if f.get(key):
             parts.append(f"{label}: {f[key]}")
     if f.get("hops"):
         parts.append("Path:\n" + "\n".join(f"  {i + 1}. {h}" for i, h in enumerate(f["hops"])))
-    if f.get("yasa_ref"):
-        parts.append(f"Engine evidence: {f['yasa_ref']}")
     return "\n".join(parts)
 
 
-def to_deepaudit_findings(findings: list[dict], stage: str) -> list[dict]:
-    """Reported (confirmed/likely) pipeline findings in agent_tasks._save_findings' input shape.
+def to_deepaudit_findings(findings: list[dict]) -> list[dict]:
+    """Reported findings in agent_tasks._save_findings' input shape.
 
-    The pipeline's 'confirmed' is an LLM triage verdict, not a sandbox verification, so it maps to
-    confidence rather than to is_verified.
+    'confirmed' is a static LLM verdict, not an execution, so it maps to confidence rather than to
+    is_verified. Severity drops one step for 'likely' and for admin-only issues; issues that need
+    operator / CLI access are low.
     """
     out, seen = [], set()
     for f in findings:
@@ -165,6 +145,12 @@ def to_deepaudit_findings(findings: list[dict], stage: str) -> list[dict]:
         vtype, sev = CWE_MAP.get(cwe, ("other", "medium"))
         if f.get("verdict") == "likely":
             sev = LOWER[sev]
+        if f.get("documented_intent"):
+            sev = "low"
+        elif f.get("required_privilege") == "admin":
+            sev = LOWER[sev]
+        elif f.get("required_privilege") == "operator_or_cli":
+            sev = "low"
         line = f.get("sink_line")
         out.append({
             "title": f"{f.get('vuln_type') or vtype} ({cwe or 'CWE-?'})",
@@ -172,24 +158,9 @@ def to_deepaudit_findings(findings: list[dict], stage: str) -> list[dict]:
             "severity": sev,
             "file_path": f.get("sink_file"),
             "line_start": int(line) if str(line or "").isdigit() else None,
-            "description": _describe(f, stage),
+            "description": _describe(f),
             "confidence": 0.85 if f.get("verdict") == "confirmed" else 0.6,
             "cwe_id": cwe or None,
-            "verification_method": f"yasa_audit {stage} triage (static, not executed)",
+            "verification_method": "yasa_audit entry review (static, not executed)",
         })
     return out
-
-
-def summarize(df: dict | None, az: dict | None, start: float) -> dict:
-    m: dict = {"wall_s": round(time.time() - start, 1), "tokens": 0, "not_reviewed": []}
-    for part in (df, az):
-        if part:
-            m["tokens"] += part["tokens"]
-            m["not_reviewed"] += part["not_reviewed"]
-    if df:
-        m["engine_candidates"] = df["triage"].get("engine_candidates", 0)
-        m["dataflow_units"] = df["triage"].get("units", 0)
-        m["yasa_runs"] = df["build"].get("yasa_runs", 0)
-    if az:
-        m["authz_entries"] = az["authz"].get("entries", 0)
-    return m

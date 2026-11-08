@@ -22,17 +22,20 @@ def _compact(messages: list[dict], keep_last: int = 14, limit_chars: int = 160_0
             messages[i]["content"] = c[:400] + "\n...[older tool output elided]"
 
 
-Reminder = tuple[Callable[[int, Toolbox], bool], str]
+# (condition(steps, toolbox), message or message(toolbox)); sent once, the first time the condition holds
+Reminder = tuple[Callable[[int, Toolbox], bool], "str | Callable[[Toolbox], str]"]
 
 
 def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, budget: int,
               log_path: Path, deadline: float | None = None,
-              reminders: list[Reminder] | None = None) -> dict:
+              reminders: list[Reminder] | None = None,
+              updates: Callable[[], str | None] | None = None) -> dict:
     """Run until finish, the step budget, or the wall-clock deadline (epoch seconds).
 
     Near the deadline the agent is told to report and finish; 60 s after it the loop stops.
     `reminders` are (condition(steps, toolbox), message) pairs; each message is sent once, the first
-    time its condition holds.
+    time its condition holds. `updates()` is called before every model call; text it returns (e.g. facts
+    other agents verified meanwhile) is appended as a message, so parallel agents share what they learn.
     """
     pending = list(reminders or [])
     messages: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -54,8 +57,10 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                 messages.append({"role": "user", "content": "Time budget reached. Report what you "
                                  "have concluded now, then call finish."})
                 time_warned = warned = True
+            if updates is not None and steps and (news := updates()):
+                messages.append({"role": "user", "content": news})
             for rem in [r for r in pending if r[0](steps, tb)]:
-                messages.append({"role": "user", "content": rem[1]})
+                messages.append({"role": "user", "content": rem[1](tb) if callable(rem[1]) else rem[1]})
                 pending.remove(rem)
             if not warned and steps >= budget - 3:
                 messages.append({"role": "user", "content": "Budget nearly used. Report what you "
@@ -82,13 +87,39 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                 counts[name] = counts.get(name, 0) + 1
                 args = parse_args(tc.function.arguments)
                 fn = getattr(tb, name, None) if name in allowed else None
-                try:
-                    result = fn(**args) if fn and "_unparsed" not in args else f"error: bad call {name}"
-                except Exception as e:  # tool errors go back to the model
-                    result = f"error: {type(e).__name__}: {e}"
+                if fn is None:
+                    result = f"error: unknown tool {name}"
+                elif "_unparsed" in args:
+                    result = (f"error: the arguments of {name} were not valid JSON "
+                              f"({len(tc.function.arguments or '')} chars; probably cut off by the output "
+                              "limit). Send a shorter call, e.g. split a long program into several.")
+                else:
+                    args = {k: v for k, v in args.items() if not str(k).startswith("_")}  # private params
+                    try:
+                        result = fn(**args)
+                    except Exception as e:  # tool errors go back to the model
+                        result = f"error: {type(e).__name__}: {e}"
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
                 log.write(json.dumps({"t": round(time.time() - t0, 1), "role": "tool", "name": name,
                                       "args": args, "content": str(result)[:3000]},
                                      ensure_ascii=False) + "\n")
+        # Out of steps without finishing: one last turn that can only call finish, so the agent's
+        # conclusions (notes) are not lost. Not after a cancel or a timeout.
+        finish_only = [t for t in tools if t["function"]["name"] == "finish"]
+        if (not tb.finished and finish_only and not timed_out and not tb.cfg.stopped()
+                and (deadline is None or time.time() < deadline + 60)):
+            messages.append({"role": "user", "content": "Tool budget used up. Call finish now; put "
+                             "everything you concluded into its notes."})
+            try:
+                msg = llm.chat(messages, tools=finish_only)
+            except Exception:
+                msg = None
+            for tc in (msg.tool_calls or []) if msg else []:
+                if tc.function.name == "finish":
+                    args = parse_args(tc.function.arguments)
+                    tb.finish(**{k: v for k, v in args.items() if k == "notes"}, _force=True)
+                    log.write(json.dumps({"t": round(time.time() - t0, 1), "role": "tool", "name": "finish",
+                                          "args": args, "content": "forced finish"}, ensure_ascii=False) + "\n")
+                    break
     return {"steps": steps, "wall_s": round(time.time() - t0, 1), "tool_counts": counts,
             "finished": tb.finished, "timed_out": timed_out}

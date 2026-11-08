@@ -80,7 +80,7 @@ class AgentTaskCreate(BaseModel):
     max_iterations: int = Field(50, ge=1, le=200, description="最大迭代次数")
     timeout_seconds: int = Field(1800, ge=60, le=7200, description="超时时间（秒）")
 
-    # 审计引擎: agent = 动态 Agent 树; yasa = YASA 混合审计（Agent 建规则 + 引擎 + 分组复核 + 权限审计）
+    # 审计引擎: agent = 动态 Agent 树; yasa = 入口优先审计（Agent 路由侦查 + 逐入口审查）
     audit_mode: Literal["agent", "yasa"] = Field("agent", description="审计引擎")
 
 

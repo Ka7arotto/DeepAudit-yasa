@@ -1,15 +1,19 @@
-"""Hybrid audit pipeline (mode C) and the trace baseline (mode A).
+"""Entry-first audit: route reconnaissance, then one review per entry point.
 
-Stage 1 build   : an agent writes a YASA ruleConfig for this project and runs the engine (<= 2 runs).
-Stage 2 triage  : every engine finding is triaged in a fresh, bounded context, grouped by file.
-Stage 3 residual: sink sites from a deterministic L0 inventory that the engine did not report
-                  (after a constant-argument prefilter) are traced back to a source, grouped by file.
-Stages 2 and 3 run as one batch of per-file units.
+recon  : an agent works out how requests reach code in THIS project (directory layout, codegraph's route
+         evidence, navigation tools), writes extractor programs that enumerate every entry, and checks
+         them (handlers resolve to code, sampled entries read correctly, request-reading code is reachable
+         from some entry). Output: entries.json.
+review : each entry (entries sharing one handler are one unit) is reviewed in a fresh context: what it
+         does, who can call it, its access-control verdict, risks plausible for that function, each traced
+         to a confirmed path or rejected. Reviewers share verified project facts. No later re-review.
 """
 
 from __future__ import annotations
 
+import collections
 import json
+import os
 import re
 import threading
 import time
@@ -18,145 +22,15 @@ from pathlib import Path
 
 from .agent_loop import run_agent
 from .config import AuditConfig
-from .discovery import discover, reachable_files, snapshot_codegraph
-from .engine_scope import build_engine_src
-from .entrypoints import global_guards_for
-from .llm import LLM
-from .prompts import authz_prompt, builder_prompt, recon_prompt, trace_prompt, triage_prompt
-from .toolbox import Toolbox, tool_schemas
+from .discovery import codegraph_db, codegraph_routes, snapshot_codegraph
+from .llm import LLM, limiter_for
+from .prompts import access_model_text, access_prompt, recon_prompt, review_prompt
+from .toolbox import FactBook, IssueBoard, Toolbox, tool_schemas
 
-L0_SINKS: dict[str, list[tuple[str, str]]] = {
-    "ts": [
-        (r"\.query\s*\(\s*`", "CWE-89"), (r"sequelize\.query\(", "CWE-89"),
-        (r"\$where", "CWE-943"), (r"Collection\.(find|findOne|update|remove)\(", "CWE-943"),
-        (r"\beval\s*\(", "CWE-94"), (r"vm\.runIn\w*Context\(", "CWE-94"), (r"new Function\(", "CWE-94"),
-        (r"pug\.compile|pug\.render|ejs\.render|res\.render\(", "CWE-1336"),
-        (r"child_process|\bexecSync\(|\bspawn\(", "CWE-78"),
-        (r"res\.sendFile\(|createReadStream\(|createWriteStream\(|readFileSync\(|writeFileSync\(",
-         "CWE-22"),
-        (r"\bfetch\(|axios\.|request\(|http\.get\(", "CWE-918"),
-        (r"yaml\.load\(|libxml|parseXml|XmlDocument", "CWE-611"),
-        (r"res\.redirect\(", "CWE-601"),
-        (r"bypassSecurityTrust|innerHTML", "CWE-79"),
-    ],
-    "java": [
-        (r"\.execute(Query|Update)?\s*\(", "CWE-89"),
-        (r"Runtime\.getRuntime\(\)\.exec|ProcessBuilder", "CWE-78"),
-        (r"new File\(|FileInputStream\(|Paths\.get\(", "CWE-22"),
-        (r"openConnection\(|HttpClient", "CWE-918"),
-        (r"<%=", "CWE-79"), (r"sendRedirect\(", "CWE-601"), (r"readObject\(", "CWE-502"),
-    ],
-    "py": [
-        (r"\.execute(many)?\s*\(|\.raw\s*\(|\bextra\s*\(|text\s*\(\s*f?[\"']", "CWE-89"),
-        (r"os\.system\(|os\.popen\(|subprocess\.\w+\(|commands\.getoutput\(", "CWE-78"),
-        (r"(?<![\w.])(eval|exec)\s*\(", "CWE-94"),
-        (r"render_template_string\(|Template\s*\(|from_string\(|mark_safe\(|Markup\(|\|\s*safe", "CWE-1336"),
-        (r"(?<![\w.])open\s*\(|send_file\(|send_from_directory\(|FileResponse\(|os\.remove\(|shutil\.",
-         "CWE-22"),
-        (r"requests\.(get|post|put|request)\(|urlopen\(|httpx\.|aiohttp\.ClientSession", "CWE-918"),
-        (r"pickle\.loads?\(|yaml\.load\(|marshal\.loads\(|jsonpickle\.decode\(", "CWE-502"),
-        (r"etree\.(parse|fromstring)\(|xml\.dom\.minidom|XMLParser\(", "CWE-611"),
-        (r"(?<![\w.])redirect\s*\(|HttpResponseRedirect\(", "CWE-601"),
-    ],
-    "php": [
-        (r"mysqli?_query\s*\(|->query\s*\(|->exec\s*\(|pg_query\s*\(|DB::(raw|select|statement)\(|"
-         r"whereRaw\(|selectRaw\(|orderByRaw\(", "CWE-89"),
-        (r"(?<![\w>])(system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec)\s*\(|`[^`]*\$", "CWE-78"),
-        (r"(?<![\w>])(eval|assert|create_function)\s*\(|preg_replace\s*\(\s*['\"].*/e", "CWE-94"),
-        (r"(include|require)(_once)?\s*\(?\s*[^;]*\$", "CWE-98"),
-        (r"(?<![\w>])(file_get_contents|file_put_contents|fopen|readfile|unlink|move_uploaded_file|copy|"
-         r"file)\s*\(", "CWE-22"),
-        (r"curl_exec\s*\(|curl_setopt\s*\([^,]+,\s*CURLOPT_URL", "CWE-918"),
-        (r"(?<![\w>])unserialize\s*\(", "CWE-502"),
-        (r"simplexml_load_string\(|->loadXML\(|LIBXML_NOENT", "CWE-611"),
-        (r"(echo|print)\s+[^;]*\$_(GET|POST|REQUEST|COOKIE|SERVER)|<\?=\s*\$|\{!!", "CWE-79"),
-        # HTML assembled in a string with a variable: '<pre>' . $x, "<pre>{$x}", "<b>$x"
-        (r"['\"][^'\"]*<[a-zA-Z][^'\"]*(['\"]\s*\.\s*\$\w|\{\$\w|\$\w)", "CWE-79"),
-        (r"header\s*\(\s*['\"](?i:location)\s*:[^;]*\$", "CWE-601"),
-    ],
-}
-GLOBS = {"ts": ["*.ts", "*.js"], "java": ["*.java", "*.jsp"], "py": ["*.py"],
-         "php": ["*.php", "*.phtml", "*.inc"]}
-# Languages the YASA engine is used for. PHP script entries reach the engine through the Service
-# wrapper in engine_scope (the PHP analyzer ignores ruleConfig entrypoints).
-ENGINE_LANGS = {"ts", "java", "py", "php"}
-# Above this many source files the engine gets the entry-scoped copy instead of the whole tree.
-ENGINE_SCOPE_MIN_FILES = 1500
-EXT_LANG = {".ts": "ts", ".js": "ts", ".java": "java", ".jsp": "java", ".py": "py", ".php": "php",
-            ".phtml": "php"}
-SKIP_PARTS = {"node_modules", ".git", ".yasa", ".codegraph", "vendor", "venv", ".venv", "site-packages",
-              "__pycache__"}
-
-MODULE_NAMES = {"path", "fs", "os", "JSON", "subprocess", "shutil", "json", "yaml", "pickle", "None", "True",
-                "False", "settings", "BASE_DIR", "__file__", "__DIR__", "__FILE__", "Math", "console", "process", "Buffer", "Object", "Array",
-                "String", "Number", "Date", "Promise", "require", "true", "false", "null", "undefined",
-                "this", "new", "await"}
-STR_RE = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\$]|\$(?!\{))*`")
-ID_RE = re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)(?=\s*(\(|\.|))")
-
-
-def detect_lang(root: Path) -> str:
-    """Majority language among analysable source files: ts (JS/TS), java (incl. JSP), py, php."""
-    counts = dict.fromkeys(GLOBS, 0)
-    for p in root.rglob("*"):
-        if any(part in SKIP_PARTS for part in p.parts):
-            continue
-        lang = EXT_LANG.get(p.suffix)
-        if lang:
-            counts[lang] += 1
-    return max(counts, key=lambda k: counts[k])
-
-
-def is_constant_call(code: str, pat: str) -> bool:
-    """True when the arguments after the sink match contain no variable (literals, module names and
-    function names only), e.g. res.sendFile(path.resolve('frontend/index.html'))."""
-    m = re.search(pat, code)
-    if not m:
-        return False
-    if re.search(r"\$\w", m.group(0)):  # the match itself contains a variable (PHP echo $_GET[...])
-        return False
-    rest = code[m.end():]
-    if "(" not in code[m.start():m.end()] and "(" in rest:
-        rest = rest[rest.index("(") + 1:]
-    rest = STR_RE.sub("", rest)
-    for idm in ID_RE.finditer(rest):
-        name, follow = idm.group(1), idm.group(2)
-        if follow == "(" or name in MODULE_NAMES:
-            continue
-        return False
-    return True
-
-
-def inventory(tb: Toolbox, lang: str, extra_fsigs: list[str]) -> list[dict]:
-    """Deterministic sink inventory: L0 patterns plus wrapper sinks named in the builder's rules."""
-    pats = list(L0_SINKS[lang]) + [(re.escape(f.split(".")[-1]) + r"\s*\(", "wrapper")
-                                   for f in extra_fsigs]
-    hits: dict[tuple[str, int], dict] = {}
-    for pat, cwe in pats:
-        for g in GLOBS[lang]:
-            for line in tb.grep_rows(pat, glob=g):
-                m = re.match(r"^([^:]+):(\d+):(.*)$", line)
-                if (not m or "test" in m.group(1).lower() or is_constant_call(m.group(3), pat)
-                        or any(part in SKIP_PARTS for part in Path(m.group(1)).parts)):
-                    continue
-                key = (m.group(1), int(m.group(2)))
-                hits.setdefault(key, {"file": key[0], "line": key[1], "code": m.group(3).strip()[:200],
-                                      "classes": set()})
-                hits[key]["classes"].add(cwe)
-    return list(hits.values())
-
-
-# Lower is reviewed first: engine findings, then residual sinks by how bad the class usually is.
-CLASS_RANK = {"CWE-94": 1, "CWE-78": 1, "CWE-89": 1, "CWE-943": 1, "CWE-502": 1,
-              "CWE-611": 2, "CWE-22": 2, "CWE-918": 2, "CWE-1336": 2, "wrapper": 2,
-              "CWE-79": 3, "CWE-601": 3}
-MIN_UNIT_S = 90  # do not start a unit with less time left than this
-
-
-def _cand_rank(c: dict) -> int:
-    if c["origin"].startswith("engine:"):
-        return 0
-    return min((CLASS_RANK.get(k, 3) for k in c.get("suspected_classes", [])), default=3)
+MIN_UNIT_S = 60  # do not start a unit with less time left than this
+SKIP_PARTS = {"node_modules", ".git", ".yasa", ".codegraph", "vendor", "venv", ".venv", "__pycache__"}
+EXPOSURE_RANK = {"public": 0, "unknown": 1, "authenticated": 2, "privileged": 3}
+PEERS_MAX = 12
 
 
 def _schedule(units: list, work, workers: int, deadline: float | None,
@@ -175,428 +49,316 @@ def _schedule(units: list, work, workers: int, deadline: float | None,
         try:
             return work(i, unit)
         except Exception as e:  # keep the batch going
-            return {"findings": [], "prompt_tokens": 0, "completion_tokens": 0, "steps": 0,
-                    "error": str(e)}
+            return {"findings": [], "cards": [], "prompt_tokens": 0, "completion_tokens": 0,
+                    "cached_tokens": 0, "steps": 0, "error": f"{type(e).__name__}: {e}"}
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         results = [r for r in ex.map(guarded, enumerate(units)) if r is not None]
     return results, skipped
 
 
 def _metrics(llm: LLM, extra: dict) -> dict:
-    return {"prompt_tokens": llm.usage.prompt, "completion_tokens": llm.usage.completion,
-            "llm_calls": llm.usage.calls, **extra}
+    u = llm.usage
+    return {"prompt_tokens": u.prompt, "completion_tokens": u.completion, "cached_tokens": u.cached,
+            "reasoning_tokens": u.reasoning, "llm_calls": u.calls, **extra}
 
 
-RULE_DEFAULTS = Path(__file__).parent / "kb" / "rule_defaults"
-YASA_LANG = {"java": "java", "py": "python", "php": "php"}
-MAX_AUTO_ENTRYPOINTS = 60
+def _ext_counts(root: Path) -> list[tuple[str, int]]:
+    c: collections.Counter = collections.Counter()
+    for _d, ds, fs in os.walk(root):
+        ds[:] = [x for x in ds if x not in SKIP_PARTS and not x.startswith(".")]
+        c.update(os.path.splitext(f)[1] or f for f in fs)
+    return c.most_common(15)
+
+
+# ----------------------------------------------------------------- recon
+
+def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product: str,
+                  deadline: float | None, user: str, holder: dict) -> None:
+    """Works out the project-wide access-control model; publishes it in holder['model']."""
+    tb = Toolbox(cfg, root, out, unit="access")
+    tb.finish_gates = [(lambda t: t.access_model is None,
+                        "record_access_model first (how requests are authenticated and authorized)")]
+    llm = LLM(cfg)
+    try:
+        holder["res"] = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.access_budget, deploy, product),
+                                  user, cfg.access_budget, out / "transcript-access.jsonl", deadline=deadline)
+    except Exception as e:  # the surface agent and the review still run without a model
+        holder["error"] = f"{type(e).__name__}: {e}"
+    holder["model"], holder["llm"] = tb.access_model, llm
+    holder["done"].set()
 
 
 def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
           deadline: float | None = None) -> dict:
-    """Agent-authored routing recipe -> validated entries. The general replacement for hand-written,
-    per-framework extractors: the agent describes the project's routing, a deterministic executor
-    expands and resolves it. Falls back to the heuristic discover() when the agent finds little.
-
-    Writes entries.json (authoritative entry list) and recon.json (recipe + metrics) to out.
-    """
+    """Two agents in parallel: one maps the attack surface (entries.json), one the access-control model.
+    The model is sent to the surface agent as soon as it is recorded, for the entries' exposure."""
     out.mkdir(parents=True, exist_ok=True)
-    lang = detect_lang(root)
     try:
         snapshot_codegraph(root, out)
     except Exception:
         pass
-    heuristic, disc = discover(root, lang, cfg.yasamcp_bin, cfg.codegraph_bin)
-    tb = Toolbox(cfg, root, out, enable_yasa=False)
-    tools = tool_schemas(enable_yasa=False, with_report=False, with_recipe=True)
+    tb = Toolbox(cfg, root, out, unit="recon")
+    user = (f"Files by extension (vendored and VCS directories left out): {_ext_counts(root)}\n\n"
+            f"Top-level layout:\n{tb.list_dir('.', 2)}\n\n"
+            f"codegraph route evidence:\n{tb.codegraph_routes(limit=25)}")
+    holder: dict = {"model": None, "done": threading.Event()}
+    access = threading.Thread(target=_access_agent, daemon=True,
+                              args=(cfg, root, out, deploy, product, deadline, user, holder))
+    access.start()
+
+    tb.finish_gates = [(lambda t: (t.extractors or t.manual) and t.coverage is None,
+                        "run check_coverage once with a pattern for how this project reads request data")]
     llm = LLM(cfg)
-    config_hits = tb.grep("<request-map|servlet-mapping|@(Get|Post|Request|Put|Delete)Mapping|Route::|"
-                          "app\\.(get|post|use)\\(|@(app|router|blueprint)\\.(route|get|post)", max_results=20)
-    user = (f"Language: {lang}. Heuristic discovery found {disc.get('total', 0)} entries "
-            f"({disc.get('codegraph_routes', 0)} from codegraph). Route-config probe:\n{config_hits}\n"
-            f"Top-level listing:\n{tb.list_dir('.', 2)}")
-    res = run_agent(llm, tb, tools, recon_prompt(cfg.builder_budget, deploy, product), user,
-                    cfg.builder_budget, out / "transcript.jsonl", deadline=deadline)
-    recon_entries = tb.recon_entries
-    # Keep whichever surface is larger; merge heuristic annotations (dispatcher/guards) onto recon routes.
-    use_recon = len(recon_entries) > len(heuristic)
-    entries = recon_entries if use_recon else heuristic
-    for e in entries:
-        e.setdefault("via", "recipe")
+    no_extractor_yet = (lambda steps, t: steps >= cfg.recon_budget // 2 and not t.extractors and not t.manual,
+                        "Half of your tool budget is used and no extractor has run. Stop reading: write an "
+                        "extractor for the dispatcher you understand best and run it now, then refine.")
+    model_ready = (lambda steps, t: holder["done"].is_set() and holder["model"] is not None,
+                   lambda t: "The access-control model is ready. Use it to set each entry's exposure (the "
+                             "least privileged principal that can call it); re-run extractors if needed:\n"
+                             + access_model_text(holder["model"]))
+    res = run_agent(llm, tb, tool_schemas("recon"), recon_prompt(cfg.recon_budget, deploy, product), user,
+                    cfg.recon_budget, out / "transcript.jsonl", deadline=deadline,
+                    reminders=[no_extractor_yet, model_ready])
+    passes = 1
+    # Understood the dispatch but enumerated nothing: a second, fresh context that starts from the agent's
+    # own notes and only has to turn them into extractors.
+    if not tb.entries() and tb.notes and (deadline is None or time.time() < deadline - 120):
+        budget2 = max(10, cfg.recon_budget // 2)
+        tb.finished = False
+        res2 = run_agent(
+            llm, tb, tool_schemas("recon"), recon_prompt(budget2, deploy, product),
+            "An earlier pass worked out how requests reach code but did not enumerate any entries. Its "
+            f"notes:\n{tb.notes}\n\nWrite one extractor per dispatcher described there, run each with "
+            "run_extractor, fix what the checks report, then call finish with the notes (updated).",
+            budget2, out / "transcript-2.jsonl", deadline=deadline,
+            reminders=[model_ready] if holder["model"] is None else [])
+        res = {k: (res.get(k, 0) + res2.get(k, 0)) if isinstance(res2.get(k), (int, float)) and k != "finished"
+               else res2.get(k) for k in res2}
+        passes = 2
+    # the review needs the model: wait for the access agent within the deadline
+    holder["done"].wait(timeout=None if deadline is None else max(0.0, deadline + 60 - time.time()))
+    entries = tb.entries()
+    source = "agent"
+    if not entries:  # the agent produced nothing usable: keep codegraph's routes so review can start
+        db = codegraph_db(root)
+        entries = [{"route": r["route"], "method": r["method"], "handler_file": r["file"],
+                    "handler": r.get("handler", ""), "exposure": "unknown", "origin": "codegraph"}
+                   for r in (codegraph_routes(db, root) if db else [])]
+        source = "codegraph-fallback"
+    for i, e in enumerate(entries):
+        e["id"] = f"E{i + 1}"
+        e["resolved"] = tb._check_entry(e) is None
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
-    m = _metrics(llm, {"stage": "recon", "source": "recipe" if use_recon else "heuristic",
-                       "recipe": tb.recon_recipe, "entries": len(entries),
-                       "heuristic_entries": len(heuristic), "recon_entries": len(recon_entries),
-                       "resolved": sum(1 for e in entries if e.get("resolved")),
-                       "public": sum(1 for e in entries if e.get("public") is True),
-                       "discovery": disc, **res})
+    by_exp = collections.Counter(e["exposure"] for e in entries)
+    m = _metrics(llm, {"stage": "recon", "source": source, "entries": len(entries),
+                       "resolved": sum(e["resolved"] for e in entries), "by_exposure": dict(by_exp),
+                       "extractors": {k: len(v["entries"]) for k, v in tb.extractors.items()},
+                       "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
+                       "access_model": holder["model"], "access_error": holder.get("error"),
+                       "passes": passes, **res})
+    if holder.get("llm") is not None:  # both agents' tokens count
+        a = _metrics(holder["llm"], holder.get("res") or {})
+        for k in ("prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens", "llm_calls"):
+            m[k] = m.get(k, 0) + a.get(k, 0)
+        m["access_agent"] = {k: a.get(k) for k in ("steps", "wall_s", "tool_counts", "finished",
+                                                   "prompt_tokens", "llm_calls")}
     (out / "recon.json").write_text(json.dumps(m, indent=1, ensure_ascii=False))
     return m
 
 
-def auto_engine_plan(lang: str, entries: list[dict]) -> dict:
-    """Deterministic first engine run: default rules for the language plus the discovered entries.
+# ----------------------------------------------------------------- review
 
-    JS/TS: the engine only starts from listed entrypoints, and must start in the function whose body
-    registers the routes (a file-level start only defines that function: 0 sources on Ghost). Other
-    languages: the engine collects framework entries itself (Spring, Flask/Django, PHP *Service
-    wrappers from engine_scope).
+SPLIT_ROUTES = 8  # a handler serving more routes than this is generic: review it per resource
+
+
+def _resource_key(route: str) -> str:
+    """The route without its parameters and trailing id-like segments: /apis/g/v1/posts/{name}/x -> /apis/g/v1/posts."""
+    parts = [p for p in re.split(r"[/?]", route or "") if p]
+    while parts and (parts[-1].startswith(("{", ":", "<", "*")) or "{" in parts[-1]):
+        parts.pop()
+    keep = []
+    for p in parts:
+        if p.startswith(("{", ":", "<", "*")):
+            break
+        keep.append(p)
+    return "/" + "/".join(keep)
+
+
+def _handler_id(e: dict) -> tuple:
+    """What identifies the code an entry runs: file, name and first line. A name alone does not identify
+    anonymous code (callbacks, lambdas, closures: every route of a file may be 'app.post'), so the
+    handler_line, or else the registration line in the same file, is part of the identity."""
+    hf, h = e.get("handler_file") or "", e.get("handler") or ""
+    line = e.get("handler_line") or 0
+    if not line and e.get("declared_at"):
+        f, _, ln = str(e["declared_at"]).rpartition(":")
+        if f.lstrip("./") == hf and ln.isdigit():
+            line = int(ln)
+    return (hf, h, int(line or 0), "" if hf else e.get("route"))
+
+
+def _units(entries: list[dict]) -> list[dict]:
+    """One unit per handler (several routes can run the same code), most exposed first.
+
+    A generic handler (one function serving many resources, e.g. a CRUD dispatcher) is split into one
+    unit per resource: access control and object ownership differ per resource, and one context cannot
+    judge dozens of them.
     """
-    if lang == "ts":
-        ts = sum(1 for e in entries if str(e.get("registered_at") or e["file"]).split(":")[0].endswith((".ts", ".tsx")))
-        language = "typescript" if ts * 2 > len(entries) else "javascript"
-        eps, seen = [], set()
-        for e in entries:
-            site = str(e.get("registered_at") or "").split(":")[0] or e["file"]
-            fn = e.get("registration_fn") or ""
-            if fn.startswith("#") or not site:
-                continue  # private class members cannot be looked up through module exports
-            key = (site, fn)
-            if key in seen:
-                continue
-            seen.add(key)
-            ep = {"filePath": "/" + site, "attribute": "HTTP"}
-            if fn:
-                ep["functionName"] = fn
-            eps.append(ep)
-        rules = json.loads((RULE_DEFAULTS / "javascript.json").read_text())
-        for block in rules:
-            block["entrypoints"] = eps[:MAX_AUTO_ENTRYPOINTS]
-        return {"language": language, "rule_config": rules, "checker_ids": rules[0]["checkerIds"],
-                "entrypoint_mode": "ONLY_CUSTOM" if eps else "SELF_COLLECT", "entrypoints": len(eps)}
-    language = YASA_LANG.get(lang, "java")
-    rules = json.loads((RULE_DEFAULTS / f"{language}.json").read_text())
-    # Config-routed projects (recon model with handlers): the engine's own collection (Spring, etc.)
-    # misses handlers wired through config, so start from the model's resolved handlers. For Java the
-    # checker keys entrypoints by package + function; scripts start at their file.
-    eps, seen = [], set()
+    by_handler: dict[tuple, list[dict]] = {}
     for e in entries:
-        for h in (e.get("handlers") or []):
-            path, invoke = (h.get("path") or ""), (h.get("invoke") or "")
-            if language == "java" and path and invoke and "/" not in path and "." in path:
-                key = ("pkg", path, invoke)
-                if key not in seen:
-                    seen.add(key)
-                    eps.append({"packageName": path, "functionName": invoke, "attribute": "HTTP"})
-        if e.get("resolved") and str(e.get("file", "")).endswith((".groovy", ".py")):
-            key = ("file", e["file"])
-            if key not in seen:
-                seen.add(key)
-                eps.append({"filePath": "/" + e["file"], "attribute": "HTTP"})
-    if eps:
-        for block in rules:
-            block["entrypoints"] = eps[:MAX_AUTO_ENTRYPOINTS]
-        return {"language": language, "rule_config": rules, "checker_ids": rules[0]["checkerIds"],
-                "entrypoint_mode": "BOTH", "entrypoints": len(eps)}
-    return {"language": language, "rule_config": rules, "checker_ids": rules[0]["checkerIds"],
-            "entrypoint_mode": "SELF_COLLECT", "entrypoints": 0}
+        by_handler.setdefault(_handler_id(e), []).append(e)
+    groups: list[tuple[str, str, list[dict], bool]] = []
+    by_res: dict[str, list[dict]] = {}  # routes of generic handlers, by resource (all their verbs together)
+    for (hf, h, _line, _), es in by_handler.items():
+        if len(es) > SPLIT_ROUTES:
+            for e in es:
+                by_res.setdefault(_resource_key(e.get("route", "")), []).append(e)
+        else:
+            groups.append((hf, h, es, False))
+    for es in by_res.values():
+        groups.append((es[0].get("handler_file") or "", es[0].get("handler") or "", es, True))
+    units = []
+    for hf, h, es, generic in groups:
+        exp = min((e.get("exposure", "unknown") for e in es), key=lambda x: EXPOSURE_RANK.get(x, 1))
+        units.append({"handler_file": hf, "handler": h, "handler_line": _handler_id(es[0])[2] or None,
+                      "exposure": exp, "entries": es, "generic": generic,
+                      "handlers": sorted({f"{e.get('handler_file')}::{e.get('handler')}" for e in es}),
+                      "resolved": all(e.get("resolved", True) for e in es)})
+    units.sort(key=lambda u: (EXPOSURE_RANK.get(u["exposure"], 1), not u["resolved"],
+                              u["entries"][0].get("route", "")))
+    return units
 
 
-def _auto_engine_run(tb: Toolbox, plan: dict, window_end: float | None) -> str:
-    """Run the plan with at most half of the remaining build window, as one extra engine run."""
-    saved = tb.deadline
-    if window_end is not None:
-        tb.deadline = time.time() + max(0.0, (window_end - time.time()) / 2)
-    tb.max_yasa_runs += 1
-    try:
-        return tb.yasa_run(plan["rule_config"], plan["language"], checker_ids=plan["checker_ids"],
-                           entrypoint_mode=plan["entrypoint_mode"],
-                           preprocess_jsp=plan["language"] == "java" and any((tb.engine_root or tb.root).rglob("*.jsp")))
-    except Exception as e:  # the agent still gets its own runs
-        return f"error: automatic engine run failed: {type(e).__name__}: {e}"
-    finally:
-        tb.deadline = saved
+def _route_key(route: str, n: int = 2) -> str:
+    return "/".join([p for p in re.split(r"[/?]", route or "") if p][:n])
 
 
-def build(cfg: AuditConfig, root: Path, out: Path, deploy: str = "",
-          deadline: float | None = None, entries_file: Path | None = None) -> dict:
+def _peers(unit: dict, entries: list[dict]) -> list[str]:
+    """Similar entries for access-control comparison: same route prefix, then same handler directory."""
+    keys = {_route_key(e.get("route", "")) for e in unit["entries"]}
+    hdir = os.path.dirname(unit["handler_file"])
+    own = {id(e) for e in unit["entries"]}
+    near = [e for e in entries if id(e) not in own and _route_key(e.get("route", "")) in keys]
+    near += [e for e in entries if id(e) not in own and e not in near and hdir
+             and os.path.dirname(e.get("handler_file") or "") == hdir]
+    return [f"{e.get('method', 'ANY')} {e.get('route')} -> {e.get('handler_file')}::{e.get('handler', '')} "
+            f"auth={e.get('auth', '?')} exposure={e.get('exposure')}" for e in near[:PEERS_MAX]]
+
+
+def _handler_snippet(root: Path, unit: dict, lines: int = 70) -> str:
+    """The handler's code, so the reviewer starts reading the right place."""
+    f = root / unit["handler_file"] if unit["handler_file"] else None
+    if f is None or not f.is_file():
+        return ""
+    text = f.read_text(errors="ignore").splitlines()
+    name = re.escape((unit["handler"] or "").split("::")[-1].split(".")[-1])
+    start = 0
+    if unit.get("handler_line"):
+        start = max(0, min(len(text) - 1, int(unit["handler_line"]) - 1))
+    elif name:
+        rx = re.compile(rf"(function|def|func|fn|sub)\s+&?{name}\b|\b{name}\s*[:=]\s*(async\s*)?(function|\()"
+                        rf"|\b(public|private|protected|static|async)\b[^;=]*\b{name}\s*\(")
+        start = next((i for i, ln in enumerate(text) if rx.search(ln)), 0)
+    body = "\n".join(f"{i + 1:5d}| {text[i]}" for i in range(start, min(len(text), start + lines)))
+    return f"{unit['handler_file']} lines {start + 1}-{min(len(text), start + lines)} of {len(text)}:\n{body}"
+
+
+def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: list[dict], facts: FactBook,
+                 system: str, deadline: float | None, issues: IssueBoard | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
-    lang = detect_lang(root)
-    if lang not in ENGINE_LANGS:  # no engine for this language: triage covers residual sinks only
-        m = {"stage": "build", "skipped": f"no engine support for {lang}", "language": lang,
-             "prompt_tokens": 0, "completion_tokens": 0, "llm_calls": 0, "yasa_runs": 0,
-             "engine_findings": 0, "steps": 0, "wall_s": 0.0, "finished": True, "timed_out": False}
-        (out / "metrics.json").write_text(json.dumps(m, indent=1))
-        return m
-    tb = Toolbox(cfg, root, out, enable_yasa=True)
-    tb.deadline = deadline
-    try:
-        snapshot_codegraph(root, out)
-    except Exception:  # discovery falls back to the live index
-        pass
-    try:
-        entries, disc = load_entries(cfg, root, lang, entries_file)
-    except Exception as e:  # never lose the stage over entry discovery
-        entries, disc = [], {"error": f"{type(e).__name__}: {e}", "codegraph_routes": 0, "yasamcp_apis": 0,
-                             "dispatchers": 0}
-    scope_note = ""
-    n_src = sum(1 for p in root.rglob("*") if p.suffix in EXT_LANG and not any(x in SKIP_PARTS for x in p.parts))
-    if entries and (lang == "php" or n_src > ENGINE_SCOPE_MIN_FILES):
-        scope = build_engine_src(root, out / "engine_src", entries)
-        if scope["files"]:
-            tb.engine_root = out / "engine_src"
-            scope_note = (
-                f"\nThe engine runs on a scoped copy: {scope['files']} files that codegraph links to the "
-                f"{len(entries)} discovered entries (of {n_src} source files); source_subdir is relative to it."
-                + (f" {scope['php_wrapped']} PHP entry scripts are wrapped as YasaEntry*Service::run() so the "
-                   "PHP checker collects them (use entrypoint_mode SELF_COLLECT; superglobal sources are "
-                   "self-collected, so list sinks and sanitizers)." if scope["php_wrapped"] else ""))
-        (out / "engine_scope.json").write_text(json.dumps(scope, indent=1))
-    (out / "discovery.json").write_text(json.dumps(disc, indent=1))
-    sample = "\n".join(f"  {e.get('method', 'ANY')} {e['route']} -> "
-                       f"{e.get('file')}:{e.get('line')} ({e.get('via', '?')})" for e in entries[:40])
-    plan = auto_engine_plan(lang, entries)
-    auto = _auto_engine_run(tb, plan, deadline)
-    (out / "auto_run.txt").write_text(auto)
-    t_start = time.time()
-    tools = tool_schemas(enable_yasa=True, with_report=False)
+    uid = ",".join(e["id"] for e in unit["entries"][:5])
+    tb = Toolbox(cfg, root, out, facts=facts, unit=uid, issues=issues)
     llm = LLM(cfg)
+    entry_view = {"routes": [{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
+                                                     "declared_at") if e.get(k)} for e in unit["entries"][:20]],
+                  "more_routes": max(0, len(unit["entries"]) - 20),
+                  "handler_file": unit["handler_file"], "handler": unit["handler"]}
+    if unit.get("generic"):
+        entry_view["handlers"] = unit["handlers"][:10]
+        entry_view["note"] = ("these handlers are shared by many resources; review them for the resource of "
+                              "these routes only (its access rules, ownership and stored data)")
+    peers = _peers(unit, entries)
+    user = "\n\n".join(x for x in (
+        "Entry to review:\n" + json.dumps(entry_view, ensure_ascii=False),
+        ("Similar entries (peers):\n" + "\n".join(peers)) if peers else "",
+        facts.prompt_block(),
+        issues.prompt_block() if issues is not None else "",
+        _handler_snippet(root, unit)) if x)
+    seen_facts = {f["id"] for f in facts.facts}
+    seen_issues = {i["id"] for i in issues.issues} if issues is not None else set()
 
-    def _late_without_own_run(steps: int, t: Toolbox) -> bool:
-        if deadline is None or t.yasa_runs > 1:
-            return False
-        return time.time() > t_start + 0.6 * max(0.0, deadline - t_start)
+    def updates() -> str | None:
+        """What other units verified or reported since this one started (units run in parallel)."""
+        nf = facts.since(seen_facts, uid)
+        ni = issues.since(seen_issues, uid) if issues is not None else []
+        rows = [f"- {f['id']}: {f['statement']}" for f in nf]
+        rows += [f"- {i['id']} ({i['cwe']}, {i['where']}): {i['root_cause']} -> use same_as={i['id']} if this "
+                 "entry has the same root cause" for i in ni]
+        return ("New from reviewers working in parallel:\n" + "\n".join(rows)) if rows else None
 
-    res = run_agent(llm, tb, tools, builder_prompt(cfg.builder_budget, cfg.builder_max_yasa_runs, deploy),
-                    f"Build engine rules for the project. Top-level listing:\n{tb.list_dir('.', 1)}\n"
-                    f"Discovered entries ({len(entries)}; {json.dumps({k: disc.get(k, 0) for k in ('codegraph_routes', 'yasamcp_apis', 'dispatchers')})}):\n"
-                    f"{sample}{scope_note}\n\nEngine run #1 was made automatically with the default "
-                    f"{plan['language']} rules and {plan['entrypoints'] or 'self-collected'} entrypoints "
-                    f"(mode {plan['entrypoint_mode']}); its output, findings registered as R1-F*:\n{auto[:6000]}\n"
-                    "Improve on it: add the project's sources, sinks and sanitizers, fix entrypoints that "
-                    "were not found, then run again.",
-                    cfg.builder_budget, out / "transcript.jsonl", deadline=deadline,
-                    reminders=[(lambda steps, t: steps >= cfg.builder_budget // 2 and t.yasa_runs <= 1,
-                                "You have used half of your budget without running the engine. Stop "
-                                "exploring: write the ruleConfig now from what you know and call yasa_run."),
-                               (_late_without_own_run,
-                                "60% of the build time is gone and you have not run the engine yourself. Call "
-                                "yasa_run now; a run started with less than two minutes left is refused.")])
-    m = _metrics(llm, {"stage": "build", "yasa_runs": tb.yasa_runs, "auto_run": plan | {"rule_config": None},
-                       "engine_findings": len(tb.registry), **res})
-    (out / "metrics.json").write_text(json.dumps(m, indent=1))
-    return m
-
-
-def _wrapper_sinks(engine_dir: Path, lang: str) -> list[str]:
-    generic = {"print", "write", "append", "execute", "send", "json", "log"}
-    found = set()
-    for rc in sorted(engine_dir.glob("yasa-*/rule_config.json")):
-        for block in json.loads(rc.read_text()):
-            for s in (block.get("sinks") or {}).get("FuncCallTaintSink", []):
-                fsig = s.get("fsig", "")
-                probe = "x." + fsig + "(`"
-                if fsig and fsig.split(".")[-1] not in generic and not any(
-                        re.search(p, probe) for p, _ in L0_SINKS[lang]):
-                    found.add(fsig)
-    return sorted(found)
+    res = run_agent(llm, tb, tool_schemas("review"), system, user, cfg.review_budget, out / "transcript.jsonl",
+                    deadline=deadline, updates=updates)
+    for x in tb.findings + tb.cards:
+        x["entries"] = [e["id"] for e in unit["entries"]]
+        x["handler"] = f"{unit['handler_file']}::{unit['handler']}"
+    return {"findings": tb.findings, "cards": tb.cards, **_metrics(llm, res)}
 
 
-def _triage_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, budget: int, deploy: str,
-                 deadline: float | None = None) -> dict:
-    out.mkdir(parents=True, exist_ok=True)
-    tb = Toolbox(cfg, root, out, enable_yasa=False)
-    tools = [t for t in tool_schemas(enable_yasa=False) if t["function"]["name"] != "list_dir"]
-    llm = LLM(cfg)
-    res = run_agent(llm, tb, tools, triage_prompt(budget, deploy),
-                    json.dumps(unit, ensure_ascii=False, indent=1), budget, out / "transcript.jsonl",
-                    deadline=deadline)
-    for f in tb.findings:
-        f["_unit"] = unit["origin"]
-    return {"findings": tb.findings, **_metrics(llm, res)}
-
-
-def triage(cfg: AuditConfig, root: Path, engine_dir: Path, out: Path, group: str = "file",
-           deploy: str = "", deadline: float | None = None) -> dict:
+def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy: str = "", product: str = "",
+           surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    lang = detect_lang(root)
-    reg_path = engine_dir / "yasa_registry.json"
-    registry = json.loads(reg_path.read_text()) if reg_path.exists() else {}
-    eng_by_sink: dict[str, tuple[str, dict]] = {}
-    for fid in sorted(registry, key=lambda k: (-int(k.split("-")[0][1:]), k)):  # newest run first
-        eng_by_sink.setdefault(registry[fid]["sink"], (fid, registry[fid]))
-
-    cands = [{"origin": f"engine:{fid}", "yasa_ref": fid, "sink": sink,
-              "engine_attribute": it.get("attribute"), "engine_trace": it.get("trace", [])[:12],
-              "engine_sources": sorted(set(it.get("sources", [])))[:5]}
-             for sink, (fid, it) in sorted(eng_by_sink.items())]
-    eng_locs = {(s.rsplit(":", 1)[0], int(s.rsplit(":", 1)[1])) for s in eng_by_sink}
-    tb = Toolbox(cfg, root, out, enable_yasa=False)
-    inv = inventory(tb, lang, _wrapper_sinks(engine_dir, lang))
-    residual = [h for h in inv
-                if not any(h["file"] == f and abs(h["line"] - ln) <= 3 for f, ln in eng_locs)]
-    cands += [{"origin": f"residual:{h['file']}:{h['line']}", "sink": f"{h['file']}:{h['line']}",
-               "code": h["code"], "suspected_classes": sorted(h["classes"])} for h in residual]
-    (out / "candidates.json").write_text(json.dumps(cands, indent=1, ensure_ascii=False))
-
-    units: list[tuple[dict, int, int]] = []  # (unit, budget, priority)
-    if group == "file":
-        by_file: dict[str, list[dict]] = {}
-        for c in cands:
-            by_file.setdefault(c["sink"].rsplit(":", 1)[0], []).append(c)
-        for f, cs in sorted(by_file.items()):
-            rank = min(_cand_rank(c) for c in cs)
-            if len(cs) == 1:
-                units.append((cs[0], cfg.triage_budget, rank))
-            else:
-                units.append(({"origin": f"group:{f}", "candidates": cs},
-                              min(cfg.triage_budget + 4 * (len(cs) - 1), cfg.triage_group_budget_cap),
-                              rank))
-    else:
-        units = [(c, cfg.triage_budget, _cand_rank(c)) for c in cands]
-    # Engine first, then the worst residual classes; within a class, sinks in files that codegraph
-    # links to a discovered entry come first (a tie-breaker only: dynamic dispatch hides edges).
-    try:  # ordering aid only: any index problem must not stop the stage
-        snapshot_codegraph(root, out)
-        reach = reachable_files(root, [e["file"] for e in discover(root, lang, "", "")[0]])
-    except Exception:
-        reach = set()
-    if reach:
-        def _file(u: dict) -> str:
-            return (u.get("candidates") or [u])[0]["sink"].rsplit(":", 1)[0]
-        units.sort(key=lambda u: (u[2], _file(u[0]) not in reach))
-    else:
-        units.sort(key=lambda u: u[2])
-
+    units = _units(entries)
+    facts = FactBook(root)
+    issues = IssueBoard()
+    system = review_prompt(cfg.review_budget, deploy, product, surface_notes, access_model)
     results, skipped = _schedule(
-        units, lambda i, u: _triage_unit(cfg, root, out / f"unit-{i:03d}", u[0], u[1], deploy, deadline),
+        units, lambda i, u: _review_unit(cfg, root, out / f"unit-{i:04d}", u, entries, facts, system, deadline,
+                                  issues),
         cfg.workers, deadline, cfg.stopped)
-    not_reviewed = [c["origin"] for u, _, _ in skipped for c in u.get("candidates", [u])]
-
     findings = [f for r in results for f in r["findings"]]
+    cards = [c for r in results for c in r["cards"]]
+    not_reviewed = [e["id"] for u in skipped for e in u["entries"]]
     (out / "findings.json").write_text(json.dumps({"findings": findings, "not_reviewed": not_reviewed},
                                                   indent=1, ensure_ascii=False))
-    m = {"stage": "triage", "engine_candidates": len(eng_by_sink), "inventory": len(inv),
-         "residual": len(residual), "units": len(units), "group": group,
-         "skipped_units": len(skipped), "not_reviewed": len(not_reviewed),
-         "prompt_tokens": sum(r["prompt_tokens"] for r in results),
-         "completion_tokens": sum(r["completion_tokens"] for r in results),
-         "steps": sum(r["steps"] for r in results), "errors": sum(1 for r in results if r.get("error")),
-         "wall_s": round(time.time() - t0, 1), "n_findings": len(findings)}
+    (out / "cards.json").write_text(json.dumps(cards, indent=1, ensure_ascii=False))
+    (out / "facts.json").write_text(json.dumps(facts.facts, indent=1, ensure_ascii=False))
+    (out / "issues.json").write_text(json.dumps(issues.issues, indent=1, ensure_ascii=False))
+    s = lambda k: sum(r.get(k, 0) for r in results)  # noqa: E731
+    m = {"stage": "review", "entries": len(entries), "units": len(units), "reviewed_units": len(results),
+         "skipped_units": len(skipped), "not_reviewed_entries": len(not_reviewed),
+         "prompt_tokens": s("prompt_tokens"), "completion_tokens": s("completion_tokens"),
+         "cached_tokens": s("cached_tokens"), "reasoning_tokens": s("reasoning_tokens"), "steps": s("steps"),
+         "errors": sum(1 for r in results if r.get("error")), "facts": len(facts.facts),
+         "cards": len(cards), "n_findings": len(findings), "root_causes": len(issues.issues),
+         "authz_verdicts": dict(collections.Counter(c.get("authz_verdict") for c in cards)),
+         "workers": cfg.workers, "llm_limiter": limiter_for(cfg).stats(),
+         "wall_s": round(time.time() - t0, 1)}
     (out / "metrics.json").write_text(json.dumps(m, indent=1))
     return m
 
 
-ROUTE_TABLE_CAP = 200
+# ----------------------------------------------------------------- both
 
-
-def load_entries(cfg: AuditConfig, root: Path, lang: str,
-                 entries_file: Path | None = None) -> tuple[list[dict], dict]:
-    """Entries for a stage: a shared recon entries.json if given, else heuristic discover()."""
-    if entries_file and entries_file.exists():
-        entries = json.loads(entries_file.read_text())
-        return entries, {"source": "recon", "file": str(entries_file), "total": len(entries)}
-    return discover(root, lang, cfg.yasamcp_bin, cfg.codegraph_bin)
-
-
-def _entry_row(e: dict) -> str:
-    """One route-table line, for either entry shape (heuristic guards, or recipe auth/handler/view)."""
-    loc = f"{e.get('file')}:{e.get('line')}" if e.get("file") else "?"
-    row = f"{e.get('method', 'ANY')} {e['route']} -> {loc}"
-    if "public" in e and e["public"] is not None:
-        row += f" public={e['public']}"
-    if e.get("auth_raw"):
-        row += f" security={e['auth_raw']}"
-    if e.get("views"):
-        row += f" view={e['views']}"
-    if e.get("handlers"):
-        row += f" handler={[h.get('invoke') or h.get('path') for h in e['handlers']][:3]}"
-    if e.get("guards"):
-        row += f" guards={e['guards']}"
-    if e.get("dispatcher"):
-        row += f" dispatcher={e['dispatcher']!r}"
-    if e.get("web_server_denied"):
-        row += f" web_server_denied={e['web_server_denied']!r}"
-    return row
-
-
-def _peer_table(table: list[str], batch_files: list[str]) -> list[str] | dict:
-    """Full table when small; otherwise the rows of the batch's directories plus a sample, so every
-    unit can still compare peers without the prompt growing with the project."""
-    if len(table) <= ROUTE_TABLE_CAP:
-        return table
-    dirs = {f.rsplit("/", 1)[0] if "/" in f else "" for f in batch_files}
-    near = [r for r in table if any(f" -> {d}/" in r or (not d and "/" not in r.split(" -> ")[1].split(":")[0])
-                                    for d in dirs)]
-    rest = [r for r in table if r not in near]
-    step = max(1, len(rest) // max(1, ROUTE_TABLE_CAP - len(near)))
-    return {"rows_near_this_batch": near[:ROUTE_TABLE_CAP], "sample_of_other_rows": rest[::step][:ROUTE_TABLE_CAP],
-            "total_rows": len(table)}
-
-
-def authz(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
-          batch: int = 3, budget: int = 16, deadline: float | None = None,
-          entries_file: Path | None = None) -> dict:
-    """Access-control stage: deterministic entry inventory, then grouped review in fresh contexts.
-
-    Every unit gets the full route table so reviewers can compare peers. No RAG index is needed:
-    with the route table in hand, reviewers given a semantic search tool used it 0-1 times per run
-    (see benchmarks/yasa_audit/README.md).
-    """
-    out.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-    lang = detect_lang(root)
-    try:
-        snapshot_codegraph(root, out)
-        entries, discovery = load_entries(cfg, root, lang, entries_file)
-    except Exception as e:  # fall back to the regex extractors
-        from .entrypoints import entries_for
-        entries, discovery = entries_for(root, lang), {"error": f"{type(e).__name__}: {e}"}
-    global_guards = global_guards_for(root, lang)
-    table = [_entry_row(e) for e in entries]
-    (out / "discovery.json").write_text(json.dumps(discovery, indent=1))
-    by_file: dict[str, list[dict]] = {}
-    for e in entries:
-        by_file.setdefault(e["file"], []).append(e)
-    files = sorted(by_file)
-    # Dispatchers first: one of them can stand for hundreds of targets.
-    files.sort(key=lambda f: (not any(e.get("dispatcher") for e in by_file[f]), f))
-    units = [{"origin": f"authz:{','.join(files[i:i + batch])}", "batch_files": files[i:i + batch],
-              "entries": [e for f in files[i:i + batch] for e in by_file[f]],
-              "global_guards": global_guards, "route_table": _peer_table(table, files[i:i + batch])}
-             for i in range(0, len(files), batch)]
-    (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
-
-    def review(i: int, unit: dict) -> dict:
-        sub = out / f"unit-{i:03d}"
-        sub.mkdir(parents=True, exist_ok=True)
-        tb = Toolbox(cfg, root, sub, enable_yasa=False)
-        tools = [t for t in tool_schemas(enable_yasa=False) if t["function"]["name"] != "list_dir"]
-        llm = LLM(cfg)
-        res = run_agent(llm, tb, tools, authz_prompt(budget, deploy, product),
-                        json.dumps(unit, ensure_ascii=False, indent=1), budget, sub / "transcript.jsonl",
-                        deadline=deadline)
-        for f in tb.findings:
-            f["_unit"] = unit["origin"]
-        return {"findings": tb.findings, **_metrics(llm, res)}
-
-    results, skipped = _schedule(units, review, cfg.workers, deadline, cfg.stopped)
-    not_reviewed = [f for u in skipped for f in u["batch_files"]]
-    findings = [f for r in results for f in r["findings"]]
-    (out / "findings.json").write_text(json.dumps({"findings": findings, "not_reviewed": not_reviewed},
-                                                  indent=1, ensure_ascii=False))
-    m = {"stage": "authz", "entries": len(entries), "units": len(units), "skipped_units": len(skipped),
-         "prompt_tokens": sum(r["prompt_tokens"] for r in results),
-         "completion_tokens": sum(r["completion_tokens"] for r in results),
-         "steps": sum(r["steps"] for r in results), "wall_s": round(time.time() - t0, 1),
-         "n_findings": len(findings)}
-    (out / "metrics.json").write_text(json.dumps(m, indent=1))
-    return m
-
-
-def trace(cfg: AuditConfig, root: Path, out: Path, deploy: str = "",
-          deadline: float | None = None) -> dict:
-    """Mode A baseline: one agent traces source -> sink with navigation tools only."""
-    out.mkdir(parents=True, exist_ok=True)
-    tb = Toolbox(cfg, root, out, enable_yasa=False)
-    llm = LLM(cfg)
-    res = run_agent(llm, tb, tool_schemas(enable_yasa=False), trace_prompt(cfg.trace_budget, deploy),
-                    f"Audit the project. Top-level listing:\n{tb.list_dir('.', 1)}",
-                    cfg.trace_budget, out / "transcript.jsonl", deadline=deadline)
-    (out / "findings.json").write_text(json.dumps({"findings": tb.findings}, indent=1,
-                                                  ensure_ascii=False))
-    m = _metrics(llm, {"stage": "trace", "n_findings": len(tb.findings), **res})
-    (out / "metrics.json").write_text(json.dumps(m, indent=1))
+def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
+        start: float | None = None, deadline: float | None = None) -> dict:
+    """recon (reused when out/recon/entries.json exists) then review, within one wall-clock budget."""
+    start = start or time.time()
+    deadline = deadline or start + cfg.time_budget_s
+    ef = out / "recon" / "entries.json"
+    if ef.exists():
+        rec = json.loads((out / "recon" / "recon.json").read_text()) if (out / "recon" / "recon.json").exists() else {}
+        rec.setdefault("reused", True)
+    else:
+        rec = recon(cfg, root, out / "recon", deploy, product, start + cfg.recon_share * (deadline - start))
+    entries = json.loads(ef.read_text())
+    rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", deadline,
+                rec.get("access_model"))
+    tok = lambda m, k: (m or {}).get(k, 0) or 0  # noqa: E731
+    m = {"recon": rec, "review": rv,
+         "total_tokens": sum(tok(x, "prompt_tokens") + tok(x, "completion_tokens") for x in (rec, rv)),
+         "total_cached_tokens": sum(tok(x, "cached_tokens") for x in (rec, rv)),
+         "total_wall_s": round(time.time() - start, 1), "time_budget_s": round(deadline - start)}
+    (out / "metrics.json").write_text(json.dumps(m, indent=1, ensure_ascii=False))
     return m

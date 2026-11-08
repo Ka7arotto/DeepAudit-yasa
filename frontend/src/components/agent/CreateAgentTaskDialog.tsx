@@ -72,7 +72,7 @@ export default function CreateAgentTaskDialog({
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [excludePatterns, setExcludePatterns] = useState(DEFAULT_EXCLUDES);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  // 审计引擎：agent = 动态 Agent 树；yasa = YASA 混合审计（规则 + 引擎 + 分组复核 + 权限审计）
+  // 审计引擎：agent = 动态 Agent 树；yasa = 入口优先审计（Agent 路由侦查 + 逐入口审查：场景、权限、漏洞假设追踪）
   const [productContext, setProductContext] = useState("");
   const [creating, setCreating] = useState(false);
 
