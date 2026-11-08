@@ -89,12 +89,11 @@ def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
     holder["done"].set()
 
 
-def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Path,
-                    settled: bool = False) -> dict:
+def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Path) -> dict:
     """Run the access agent's who-can-call program on every entry and compare it with the exposure the
-    surface agent declared: two independent readings of the access rules. Before they are reconciled the
-    declared exposure stands (a resolver that misreads one route shape would otherwise relabel hundreds of
-    entries); once reconciled, the less privileged of the two orders the review. Both stay visible."""
+    surface agent declared: two independent readings of the access rules. The declared exposure stands
+    (a resolver that misreads one request shape would otherwise relabel hundreds of entries) until the
+    reconcile pass decides the disagreements; both stay visible to reviewers."""
     if not code or not entries:
         return {"installed": bool(code)}
     (out / "resolver.py").write_text(code)
@@ -104,24 +103,50 @@ def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Pat
     groups: dict[tuple, list[dict]] = {}
     unknown: dict[str, list[dict]] = {}
     for e, r in zip(entries, res, strict=True):
+        if e.get("exposure_declared"):  # a previous application: start again from the declared exposure
+            e["exposure"] = e.pop("exposure_declared")
         e["who_can_call"] = r
-        declared = e.get("exposure_declared") or e.get("exposure") or "unknown"
+        declared = e.get("exposure") or "unknown"
         lp = r["least_privileged"]
         if lp == "unknown":
             unknown.setdefault(str(e.get("kind") or _route_key(e.get("route", ""), 1)), []).append(e)
-            continue
-        if declared == "unknown":
+        elif declared == "unknown":
             if lp in EXPOSURES:
                 e["exposure"] = lp
-            continue
-        if lp != declared:
+        elif lp != declared:
             e["exposure_declared"] = declared
             groups.setdefault((declared, lp, r["rule"][:100]), []).append(e)
-            if settled and lp in EXPOSURES:
-                e["exposure"] = min(declared, lp, key=lambda x: EXPOSURE_RANK.get(x, 1))
-    return {"installed": True, "entries": len(entries), "settled": settled,
+    return {"installed": True, "entries": len(entries),
             "disagreements": sum(len(v) for v in groups.values()),
             "unknown": sum(len(v) for v in unknown.values()), "_groups": groups, "_unknown": unknown}
+
+
+def _apply_decisions(entries: list[dict], groups: dict[str, list[str]], decisions: dict[str, dict]) -> dict:
+    """Apply the access agent's per-group verdicts to the entries that still disagree."""
+    verdict_of = {eid: decisions[g] for g, ids in groups.items() if g in decisions for eid in ids}
+    c: collections.Counter = collections.Counter()
+    for e in entries:
+        if not e.get("exposure_declared"):
+            continue
+        d = verdict_of.get(e.get("id"))
+        lp = e["who_can_call"]["least_privileged"]
+        if d is None:
+            c["undecided"] += 1
+        elif d["verdict"] == "resolver_wrong":  # the declared exposure stands; the wrong answer goes
+            e.pop("exposure_declared")
+            e["who_can_call"] = {"least_privileged": "unknown", "principals": [],
+                                 "rule": "resolver wrong for this entry: " + d["reason"][:150]}
+            c["resolver_wrong"] += 1
+        elif d["verdict"] == "declared_wrong" and lp in EXPOSURES:
+            e["exposure"] = lp
+            e.pop("exposure_declared")
+            c["declared_wrong"] += 1
+        else:  # inconsistent code: keep both, review it as the more exposed one
+            if lp in EXPOSURES:
+                e["exposure"] = min(e["exposure"], lp, key=lambda x: EXPOSURE_RANK.get(x, 1))
+            e["access_inconsistency"] = d["reason"]
+            c["inconsistent_code"] += 1
+    return dict(c)
 
 
 def _sample(e: dict) -> str:
@@ -129,45 +154,58 @@ def _sample(e: dict) -> str:
     return f"{e.get('method', '')} {e.get('route', '')} -> {where} {e.get('handler', '')}".strip()
 
 
-def _reconcile_message(entries: list[dict], applied: dict, code: str, model: dict | None) -> str:
-    rows = []
-    for (declared, lp, rule), es in sorted(applied["_groups"].items(), key=lambda kv: -len(kv[1]))[:12]:
-        rows.append(f"- {len(es)} entries: declared {declared}, resolver {lp} (rule: {rule})")
+def _reconcile_message(entries: list[dict], applied: dict, code: str, model: dict | None
+                       ) -> tuple[str, dict[str, list[str]]]:
+    rows, ids = [], {}
+    for n, ((declared, lp, rule), es) in enumerate(
+            sorted(applied["_groups"].items(), key=lambda kv: -len(kv[1]))[:12], 1):
+        ids[f"G{n}"] = [e["id"] for e in es if e.get("id")]
+        rows.append(f"- G{n}: {len(es)} entries, declared {declared}, resolver {lp} (rule: {rule})")
         rows += [f"    {_sample(e)}" for e in es[:3]]
     for kind, es in sorted(applied["_unknown"].items(), key=lambda kv: -len(kv[1]))[:6]:
         rows.append(f"- {len(es)} entries of kind/prefix {kind!r}: resolver unknown")
         rows += [f"    {_sample(e)}  request fields: "
                  + json.dumps({k: e.get(k) for k in ("method", "route", *Toolbox.RESOLVER_FIELDS) if e.get(k)},
                               ensure_ascii=False) for e in es[:2]]
-    return (f"The surface agent enumerated {len(entries)} entries and declared each one's exposure, "
-            f"independently of you. Your resolver disagrees on {applied['disagreements']} of them and answers "
-            f"unknown for {applied['unknown']}. The groups:\n" + "\n".join(rows) +
-            "\n\nFor each group, read the handler of a sample or two and decide which reading is right:\n"
-            "- the resolver is wrong (it misses a check, misreads a request shape, ...): fix it and install it "
-            "again with write_access_resolver (samples from these groups);\n"
-            "- the declared exposure is wrong: leave the resolver;\n"
-            "- both are right about different parts of the code (the code is inconsistent): that is a likely "
-            "access-control bug, leave it.\n"
-            "Then finish, with one line per group: your decision and why.\n\n"
-            + (access_model_text(model) + "\n\n" if model else "") + "Your current resolver:\n" + code)
+    msg = (f"The surface agent enumerated {len(entries)} entries and declared each one's exposure, "
+           f"independently of you. Your resolver disagrees on {applied['disagreements']} of them and answers "
+           f"unknown for {applied['unknown']}. The groups:\n" + "\n".join(rows) +
+           "\n\nFor each group G<n>, read the handler of a sample or two and settle it:\n"
+           "- resolver_wrong (it misses a check, misreads a request shape, ...): the declared exposure stands;\n"
+           "- declared_wrong: the resolver is right;\n"
+           "- inconsistent_code: both follow real code that disagrees (a likely access-control bug).\n"
+           "Where the resolver is wrong or answers unknown and you can fix it within your budget, install the "
+           "fixed version with write_access_resolver (samples from these groups). Then finish.\n\n"
+           + (access_model_text(model) + "\n\n" if model else "") + "Your current resolver:\n" + code)
+    return msg, ids
 
 
 def _reconcile(cfg: AuditConfig, out: Path, entries: list[dict], holder: dict, applied: dict,
                deadline: float | None, deploy: str = "", product: str = "") -> dict:
     """The access agent settles its disagreements with the surface agent (a fresh, short context)."""
     tb: Toolbox = holder["tb"]
-    tb.finished, tb.finish_gates = False, []
+    msg, tb.reconcile_groups = _reconcile_message(entries, applied, tb.resolver_code or "", holder.get("model"))
+    tb.decisions = {}
+    tb.finished = False
+    tb.finish_gates = [(lambda t: any(g not in t.decisions for g in t.reconcile_groups),
+                        lambda t: "settle every group first; undecided: "
+                                  + ", ".join(g for g in t.reconcile_groups if g not in t.decisions))]
     llm = holder.get("llm") or LLM(cfg)
-    res = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.reconcile_budget, deploy, product),
-                    _reconcile_message(entries, applied, tb.resolver_code or "", holder.get("model")),
+    res = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.reconcile_budget, deploy, product), msg,
                     cfg.reconcile_budget, out / "transcript-reconcile.jsonl", deadline=deadline)
+    changed = tb.resolver_code != holder.get("resolver")
     holder["resolver"] = tb.resolver_code
-    return {"steps": res.get("steps"), "finished": res.get("finished"), "notes": (tb.notes or "")[:3000],
-            "resolver_changed": tb.resolver_code != applied.get("_code")}
+    return {"steps": res.get("steps"), "finished": res.get("finished"), "resolver_changed": changed,
+            "groups": {g: {"entries": len(ids), **tb.decisions.get(g, {})}
+                       for g, ids in tb.reconcile_groups.items()}, "notes": (tb.notes or "")[:2000],
+            "_ids": tb.reconcile_groups, "_decisions": tb.decisions}
+
+
+RECONCILE_S = 240  # wall-clock slice of the reconcile pass, outside the agents' recon share
 
 
 def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
-          deadline: float | None = None) -> dict:
+          deadline: float | None = None, hard_deadline: float | None = None) -> dict:
     """Two agents in parallel: one maps the attack surface (entries.json), one the access-control model.
     The model is sent to the surface agent as soon as it is recorded, for the entries' exposure."""
     out.mkdir(parents=True, exist_ok=True)
@@ -236,19 +274,17 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         e["resolved"] = tb._check_entry(e) is None
     resolver = _apply_resolver(tb, entries, holder.get("resolver"), out)
     reconcile = None
+    hard = hard_deadline or deadline
     if (resolver.get("disagreements") or resolver.get("unknown")) and holder.get("tb") is not None \
-            and (deadline is None or time.time() < deadline - 300):
-        resolver["_code"] = holder["resolver"]
-        try:
-            reconcile = _reconcile(cfg, out, entries, holder, resolver, deadline, deploy, product)
-        except Exception as e:  # keep the unreconciled answers
-            reconcile = {"error": f"{type(e).__name__}: {e}"}
+            and (hard is None or time.time() < hard - 3 * RECONCILE_S):
         before = {k: resolver.get(k) for k in ("disagreements", "unknown")}
-        for e in entries:
-            if e.get("exposure_declared"):
-                e["exposure"] = e.pop("exposure_declared")
-        resolver = _apply_resolver(tb, entries, holder.get("resolver"), out,
-                                   settled=bool(reconcile.get("finished")))
+        try:
+            reconcile = _reconcile(cfg, out, entries, holder, resolver, time.time() + RECONCILE_S, deploy,
+                                   product)
+            resolver = _apply_resolver(tb, entries, holder.get("resolver"), out)
+            reconcile["applied"] = _apply_decisions(entries, reconcile.pop("_ids"), reconcile.pop("_decisions"))
+        except Exception as e:  # keep the unreconciled answers (declared exposure stands)
+            reconcile = {"error": f"{type(e).__name__}: {e}"}
         reconcile["before"] = before
     resolver = {k: v for k, v in resolver.items() if not k.startswith("_")}
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
@@ -480,7 +516,8 @@ def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str 
         rec = json.loads((out / "recon" / "recon.json").read_text()) if (out / "recon" / "recon.json").exists() else {}
         rec.setdefault("reused", True)
     else:
-        rec = recon(cfg, root, out / "recon", deploy, product, start + cfg.recon_share * (deadline - start))
+        rec = recon(cfg, root, out / "recon", deploy, product, start + cfg.recon_share * (deadline - start),
+                    hard_deadline=deadline)
     entries = json.loads(ef.read_text())
     rf = out / "recon" / "resolver.py"
     rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", deadline,

@@ -286,8 +286,7 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
     assert m["recon"]["access_model"]["principals"] == "anyone" and m["recon"]["coverage"]["sites"] == 1
     assert m["recon"]["notes"] == "web/<Name>.php::execute serves /<name>"  # the early finish was refused
     assert "- principals: anyone" in systems[-1]  # reviewers get the access model
-    assert m["recon"]["resolver"] == {"installed": True, "entries": 2, "settled": False, "disagreements": 0,
-                                      "unknown": 0}
+    assert m["recon"]["resolver"] == {"installed": True, "entries": 2, "disagreements": 0, "unknown": 0}
     assert m["recon"]["reconcile"] is None  # nothing to reconcile
     assert any('"who_can_call": {"least_privileged": "public"' in u for u in users[1:])
     assert m["review"]["units"] == 2 and m["review"]["reviewed_units"] == 2 and m["review"]["facts"] == 1
@@ -836,17 +835,36 @@ def test_resolver_disagreement_keeps_declared_until_settled(tmp_path):
           {"route": "/posts", "exposure": "public"}]
     out = _apply_resolver(tb, es, RESOLVER, tmp_path)
     assert {k: v for k, v in out.items() if not k.startswith("_")} == \
-        {"installed": True, "entries": 3, "settled": False, "disagreements": 1, "unknown": 0}
+        {"installed": True, "entries": 3, "disagreements": 1, "unknown": 0}
     assert list(out["_groups"]) == [("authenticated", "privileged", "Rbac.java:3")]
     # not reconciled: a resolver that misreads routes must not relabel the surface
     assert es[0]["exposure"] == "authenticated" and es[0]["exposure_declared"] == "authenticated"
     assert es[0]["who_can_call"]["least_privileged"] == "privileged"
     assert es[1]["exposure"] == "authenticated" and "exposure_declared" not in es[1]
     assert es[2]["who_can_call"]["rule"] == "Rbac.java:1"
-    es = [{"route": "/admin/x", "exposure": "public"}, {"route": "/posts", "exposure": "privileged"}]
-    _apply_resolver(tb, es, RESOLVER, tmp_path, settled=True)  # reconciled: the less privileged orders
-    assert [e["exposure"] for e in es] == ["public", "public"]
-    assert [e["exposure_declared"] for e in es] == ["public", "privileged"]
+    assert _apply_resolver(tb, es, RESOLVER, tmp_path)["disagreements"] == 1  # idempotent
+    assert es[0]["exposure"] == "authenticated"
+
+
+def test_reconcile_decisions_are_applied_per_group():
+    from app.services.yasa_audit.pipeline import _apply_decisions
+
+    def e(i, declared, lp):
+        return {"id": i, "exposure": declared, "exposure_declared": declared,
+                "who_can_call": {"least_privileged": lp, "principals": [], "rule": "r"}}
+
+    es = [e("E1", "privileged", "authenticated"), e("E2", "privileged", "public"),
+          e("E3", "authenticated", "public"), e("E4", "public", "privileged")]
+    out = _apply_decisions(es, {"G1": ["E1"], "G2": ["E2"], "G3": ["E3"]},
+                           {"G1": {"verdict": "resolver_wrong", "reason": "misses #[RequiresAdmin] a.php:3"},
+                            "G2": {"verdict": "declared_wrong", "reason": "b.php:9"},
+                            "G3": {"verdict": "inconsistent_code", "reason": "c.php:2 vs d.php:5"}})
+    assert out == {"resolver_wrong": 1, "declared_wrong": 1, "inconsistent_code": 1, "undecided": 1}
+    assert es[0]["exposure"] == "privileged" and "exposure_declared" not in es[0]  # declared stands
+    assert es[0]["who_can_call"]["least_privileged"] == "unknown"  # the wrong answer is not shown
+    assert es[1]["exposure"] == "public" and "exposure_declared" not in es[1]
+    assert es[2]["exposure"] == "public" and es[2]["access_inconsistency"] == "c.php:2 vs d.php:5"
+    assert es[3]["exposure"] == "public" and es[3]["exposure_declared"] == "public"  # undecided: declared
 
 
 def test_reconcile_lets_the_access_agent_fix_its_resolver(tmp_path, monkeypatch):
@@ -876,6 +894,10 @@ def test_reconcile_lets_the_access_agent_fix_its_resolver(tmp_path, monkeypatch)
                   ("check_coverage", {"request_read_pattern": r"\$_GET"}),
                   ("finish", {"notes": "web/*.php"})],
         "reconcile": [("read_file", {"path": "web/Admin.php"}),
+                      ("finish", {"notes": "too early"}),  # refused: G1 not settled
+                      ("settle", {"group": "G9", "verdict": "resolver_wrong", "reason": "x"}),  # no such group
+                      ("settle", {"group": "G1", "verdict": "resolver_wrong",
+                                  "reason": "web/Admin.php:3 require_admin() in the handler"}),
                       ("write_access_resolver", {"code": reads_handler, "samples": [
                           {"route": "/admin", "handler_file": "web/Admin.php"},
                           {"route": "/home", "handler_file": "web/Home.php"}, {"route": "/x"}]}),
@@ -896,12 +918,12 @@ def test_reconcile_lets_the_access_agent_fix_its_resolver(tmp_path, monkeypatch)
     monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
     m = pipeline.recon(_cfg(), proj, tmp_path / "out", deadline=time.time() + 900)
     msg = next(u for u in users if "independently of you" in u)
-    assert "1 entries: declared privileged, resolver public (rule: no gate)" in msg
+    assert "G1: 1 entries, declared privileged, resolver public (rule: no gate)" in msg
     assert "/admin -> web/Admin.php execute" in msg and gate_only in msg  # samples and current code
     rc = m["reconcile"]
     assert rc["before"] == {"disagreements": 1, "unknown": 0} and rc["resolver_changed"] and rc["finished"]
-    assert "fixed" in rc["notes"]
-    assert m["resolver"]["disagreements"] == 0 and m["resolver"]["settled"] is True
+    assert "fixed" in rc["notes"] and rc["groups"]["G1"]["verdict"] == "resolver_wrong"
+    assert m["resolver"]["disagreements"] == 0 and rc["applied"] == {}  # the fixed resolver agrees
     es = json.loads((tmp_path / "out" / "entries.json").read_text())
     assert {e["route"]: e["exposure"] for e in es} == {"/admin": "privileged", "/home": "public"}
     assert not any(e.get("exposure_declared") for e in es)

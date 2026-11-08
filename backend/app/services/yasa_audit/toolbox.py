@@ -205,7 +205,9 @@ class Toolbox:
         self.resolver_code: str | None = None
         self.known_entries: dict[tuple, dict] = {}  # (METHOD, route) -> entry, so who_can_call sees the handler
         self.extractor_best: dict[str, int] = {}  # most entries any version of each extractor produced
-        self.regressions_shown: set[tuple] = set()  # the access agent's who-can-call program
+        self.regressions_shown: set[tuple] = set()
+        self.reconcile_groups: dict[str, list[str]] = {}  # group id -> entry ids (reconcile pass)
+        self.decisions: dict[str, dict] = {}  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
 
@@ -606,6 +608,18 @@ class Toolbox:
         self.cards = [card]  # a later call updates the card
         return "card recorded" + (f" (unknown fact ids ignored: {unknown})" if unknown else "")
 
+    SETTLE_VERDICTS = ("resolver_wrong", "declared_wrong", "inconsistent_code")
+
+    def settle(self, group: str, verdict: str, reason: str = "") -> str:
+        """Decide one group of disagreements between the resolver and the declared exposure."""
+        if group not in self.reconcile_groups:
+            return f"error: unknown group {group!r}; groups: {', '.join(self.reconcile_groups)}"
+        if verdict not in self.SETTLE_VERDICTS:
+            return f"error: verdict must be one of {', '.join(self.SETTLE_VERDICTS)}"
+        self.decisions[group] = {"verdict": verdict, "reason": str(reason)[:400]}
+        left = [g for g in self.reconcile_groups if g not in self.decisions]
+        return f"{group}: {verdict}" + (f"; undecided: {', '.join(left)}" if left else "; all groups decided")
+
     def record_access_model(self, **model: Any) -> str:
         """The project-wide model of how requests are authenticated and authorized (recon stage)."""
         need = ("authentication", "authorization", "permission_mapping", "principals")
@@ -708,6 +722,14 @@ def tool_schemas(role: str) -> list[dict]:
                "role definitions, middleware or filter order, checks in handlers) as you read them. It is run "
                "on your samples now, and later on every entry and by reviewers.",
                {"code": s, "samples": {"type": "array", "items": req}}, ["code", "samples"]),
+            fn("settle",
+               "Only when asked to reconcile: decide one group of disagreements. resolver_wrong: the declared "
+               "exposure is right (fix the resolver too if you can); declared_wrong: the resolver is right; "
+               "inconsistent_code: both readings follow real code that disagrees (a likely access-control bug).",
+               {"group": s, "verdict": {"type": "string", "enum": ["resolver_wrong", "declared_wrong",
+                                                                   "inconsistent_code"]},
+                "reason": {"type": "string", "description": "the code that decides it (file:line)"}},
+               ["group", "verdict", "reason"]),
             fn("record_access_model",
                "Record how THIS project authenticates and authorizes requests, once, before finish. "
                "Reviewers of every entry rely on it instead of re-reading the security chain.",
