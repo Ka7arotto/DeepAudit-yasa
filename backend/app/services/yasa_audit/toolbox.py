@@ -130,13 +130,56 @@ class FactBook:
                 "record_card.facts_used):\n" + "\n".join(rows))
 
 
+class IssueBoard:
+    """Root causes already reported in this run, shared with later reviewers.
+
+    The same flaw often appears behind several entries (one helper, one pattern copied into sibling
+    modules). A reviewer whose entry has a known root cause links its finding to it (same_as) instead
+    of re-deriving the shared part, and the output groups findings by root cause.
+    """
+
+    def __init__(self) -> None:
+        self.issues: list[dict] = []
+        self._lock = threading.Lock()
+
+    def register(self, finding: dict) -> str:
+        """Attach the finding to an existing issue (same_as) or open a new one; returns the issue id."""
+        with self._lock:
+            ref = str(finding.get("same_as") or "")
+            issue = next((i for i in self.issues if i["id"] == ref), None)
+            if issue is None:
+                issue = {"id": f"I{len(self.issues) + 1}", "root_cause": _norm(str(finding.get("root_cause"))),
+                         "cwe": finding.get("cwe"), "where": f"{finding.get('sink_file')}:{finding.get('sink_line')}",
+                         "entries": []}
+                self.issues.append(issue)
+            issue["entries"].append(finding.get("entry"))
+            return issue["id"]
+
+    def prompt_block(self, char_budget: int = 4000) -> str:
+        with self._lock:
+            issues = list(self.issues)
+        rows, used = [], 0
+        for i in issues:
+            row = f"- {i['id']} ({i['cwe']}, {i['where']}, {len(i['entries'])} entries): {i['root_cause']}"
+            if used + len(row) > char_budget:
+                break
+            rows.append(row)
+            used += len(row) + 1
+        if not rows:
+            return ""
+        return ("Root causes already reported in this run (if this entry has one of them, report it with "
+                "same_as=<id> and this entry's own route and evidence; do not re-derive the shared part):\n"
+                + "\n".join(rows))
+
+
 class Toolbox:
     def __init__(self, cfg: AuditConfig, root: str | Path, run_dir: Path, facts: FactBook | None = None,
-                 unit: str = ""):
+                 unit: str = "", issues: IssueBoard | None = None):
         self.cfg = cfg
         self.root = Path(root).resolve()
         self.run_dir = run_dir
         self.facts = facts
+        self.issues = issues
         self.unit = unit
         self.findings: list[dict] = []
         self.cards: list[dict] = []
@@ -417,20 +460,18 @@ class Toolbox:
         handlers = sorted({e["handler_file"] for e in self.entries() if e.get("handler_file")})
         reach = reachable_files(self.root, handlers, depth=int(depth)) or set(handlers)
         unc = [s for s in sites if s[0] not in reach]
-        by_dir: dict[str, int] = {}
-        for s in unc:
-            d = "/".join(s[0].split("/")[:-1]) or "."
-            by_dir[d] = by_dir.get(d, 0) + 1
         self.coverage = {"pattern": request_read_pattern, "sites": len(sites), "files": len(files),
                          "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc)}
-        share = len(unc) / len(sites) if sites else 0.0
-        res = {**self.coverage, "uncovered_share": round(share, 2),
-               "reading": ("most request reads are not reachable from your entries: some dispatcher or "
-                           "area is missing, or entries point at the wrong handlers" if share > 0.5 else
-                           "some request reads are not reachable: look at the directories below" if share > 0.1
-                           else "request reads are covered"),
-               "uncovered_by_directory": sorted(by_dir.items(), key=lambda kv: -kv[1])[:20],
-               "uncovered_samples": [":".join(s)[:200] for s in unc[:10]]}
+        by_file: dict[str, list[str]] = {}
+        for f, ln, code in unc:
+            by_file.setdefault(f, []).append(f"{ln}: {code.strip()[:120]}")
+        res = {**self.coverage,
+               "uncovered_files": len(by_file),
+               "account_for_each": ("each file below reads request data but no entry reaches it: add the "
+                                    "entries that reach it, or say in your finish notes why it is not "
+                                    "request-reachable (test, CLI, dead code)") if by_file else "",
+               "uncovered": [{"file": f, "reads": rows[:3], "more": max(0, len(rows) - 3)}
+                             for f, rows in sorted(by_file.items(), key=lambda kv: -len(kv[1]))[:25]]}
         return clip(json.dumps(res, ensure_ascii=False, indent=1))
 
     # ---------- review / output ----------
@@ -482,9 +523,20 @@ class Toolbox:
             return (f"rejected: route_evidence: {err}. The entry list comes from automated recon and can be "
                     "wrong: show where this route is registered or generated in the code (file, line, quote) "
                     "and check that it really serves the path you report.")
+        if not str(finding.get("root_cause") or "").strip() and not finding.get("same_as"):
+            return "rejected: root_cause is required (one sentence: the underlying flaw), or same_as=<issue id>"
+        if len(_norm(str(finding.get("root_cause") or ""))) > 240:
+            return "rejected: root_cause is one sentence of at most 240 characters"
+        if finding.get("documented_intent"):
+            di = finding["documented_intent"]
+            err = verify_evidence(self.root, [di] if isinstance(di, dict) else di)
+            if err:
+                return f"rejected: documented_intent: {err}"
         finding["_unit"] = self.unit
+        if self.issues is not None:
+            finding["issue"] = self.issues.register(finding)
         self.findings.append(finding)
-        return f"recorded #{len(self.findings)}"
+        return f"recorded #{len(self.findings)}" + (f" as part of {finding['issue']}" if finding.get("issue") else "")
 
     def add_fact(self, statement: str, evidence: Any) -> str:
         if self.facts is None:
@@ -603,6 +655,14 @@ def tool_schemas(role: str) -> list[dict]:
                                        "enum": ["none", "customer", "admin", "operator_or_cli"]},
                 "hops": {"type": "array", "items": s},
                 "sanitizers": s,
+                "root_cause": {"type": "string", "description": "one sentence naming the underlying flaw, so "
+                               "the same flaw behind other entries is recognised"},
+                "same_as": {"type": "string", "description": "id of an already reported root cause (e.g. I2) "
+                            "that this entry also suffers from"},
+                "documented_intent": {"type": "object", "description": "where the project states this behaviour "
+                                      "is intended or accepted (code comment, doc), if it does (file, line, "
+                                      "quote); the finding is then reported as an accepted risk",
+                                      "properties": {"file": s, "line": i, "quote": s}},
                 "route_evidence": {"type": "object", "description": "where the code registers or generates "
                                    "the route you report (file, line, quote); the recon entry list can be wrong",
                                    "properties": {"file": s, "line": i, "quote": s}},

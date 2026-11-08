@@ -154,7 +154,8 @@ def test_check_coverage_reports_request_reads_outside_entries(tmp_path):
     tb.add_entries([{"route": "/page", "handler_file": "web/Page.php", "handler": "getParam"}])
     res = json.loads(tb.check_coverage(r"getParam\("))
     assert (res["sites"], res["covered_sites"], res["uncovered_sites"]) == (3, 1, 2)
-    assert res["uncovered_by_directory"] == [["api", 2]]
+    assert res["uncovered_files"] == 1 and res["uncovered"][0]["file"] == "api/Rest.php"
+    assert len(res["uncovered"][0]["reads"]) == 2 and res["account_for_each"]
 
 
 def test_factbook_accepts_only_evidence_found_in_code(tmp_path):
@@ -255,6 +256,7 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                                           "sink_file": "web/Download.php", "sink_line": 4,
                                           "source": "$_GET['name']", "entry": "GET /download (public)",
                                           "required_privilege": "none", "verdict": "confirmed",
+                                          "root_cause": "file name from the query joined to a path",
                                           "route_evidence": {"file": "web/Download.php", "line": 2,
                                                              "quote": "class Download"}})],
         "/home": [("record_card", {"function": "home page", "callers": "anyone", "authz_verdict": "ok",
@@ -628,7 +630,7 @@ def test_report_finding_requires_fields(tmp_path):
     assert tb.report_finding().startswith("rejected: missing vuln_type")
     _write(tmp_path, {"Routes.java": "class Routes {\n  route(GET(\"/x\"), this::get);\n}\n"})
     full = {"vuln_type": "IDOR", "cwe": "CWE-639", "sink_file": "a.java", "sink_line": 3, "source": "id",
-            "entry": "GET /x", "required_privilege": "customer",
+            "entry": "GET /x", "required_privilege": "customer", "root_cause": "no owner check",
             "route_evidence": {"file": "Routes.java", "line": 2, "quote": 'GET("/x")'}}
     assert tb.report_finding(**full, verdict="false_positive").startswith("rejected: verdict")
     phantom = dict(full, route_evidence={"file": "Routes.java", "line": 2, "quote": 'GET("/y")'})
@@ -715,3 +717,30 @@ def test_anonymous_handlers_are_told_apart_by_line(tmp_path):
     assert _handler_snippet(tmp_path, u, lines=2).startswith("app-sync.ts lines 205-206")
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
     assert tb._check_entry({"handler_file": "app-sync.ts", "handler_line": 999}) == "handler_line is outside handler_file"
+
+
+def test_issue_board_links_findings_by_root_cause(tmp_path):
+    from app.services.yasa_audit.runner import to_deepaudit_findings
+    from app.services.yasa_audit.toolbox import IssueBoard
+
+    _write(tmp_path, {"r.js": "app.post('/a', h)\napp.post('/b', h)\n// NOTE: intentionally no admin check (wontfix)\n"})
+    board = IssueBoard()
+    ev = lambda line, q: {"file": "r.js", "line": line, "quote": q}  # noqa: E731
+    base = {"vuln_type": "IDOR", "cwe": "CWE-639", "sink_file": "s.js", "sink_line": 9, "source": "id",
+            "required_privilege": "customer", "verdict": "likely"}
+    t1 = Toolbox(AuditConfig(), tmp_path, tmp_path, unit="E1", issues=board)
+    assert t1.report_finding(**base, entry="POST /a", route_evidence=ev(1, "app.post('/a'")).startswith("rejected: root_cause")
+    assert t1.report_finding(**base, entry="POST /a", route_evidence=ev(1, "app.post('/a'"),
+                             root_cause="optional header skips the ownership check") == "recorded #1 as part of I1"
+    t2 = Toolbox(AuditConfig(), tmp_path, tmp_path, unit="E2", issues=board)
+    assert t2.report_finding(**base, entry="POST /b", route_evidence=ev(2, "app.post('/b'"), same_as="I1") == \
+        "recorded #1 as part of I1"
+    assert board.issues[0]["entries"] == ["POST /a", "POST /b"] and "I1 (CWE-639" in board.prompt_block()
+    assert "documented_intent: quote not found" in t2.report_finding(
+        **base, entry="POST /b", route_evidence=ev(2, "app.post('/b'"), root_cause="x",
+        documented_intent=ev(3, "by design"))
+    t2.report_finding(**dict(base, sink_line=10), entry="POST /b", route_evidence=ev(2, "app.post('/b'"),
+                      root_cause="user list open", documented_intent=ev(3, "intentionally no admin check"))
+    out = to_deepaudit_findings(t1.findings + t2.findings)
+    assert out[-1]["severity"] == "low" and "Documented as intended" in out[-1]["description"]
+    assert "Root cause I1" in out[0]["description"]

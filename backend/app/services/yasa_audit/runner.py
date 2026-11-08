@@ -111,6 +111,12 @@ def run_entry_audit(cfg: AuditConfig, root: Path, out: Path, deploy: str, produc
 
 def _describe(f: dict) -> str:
     parts = [f"[yasa_audit/entry review] verdict: {f.get('verdict')}"]
+    if f.get("documented_intent"):
+        di = f["documented_intent"]
+        di = di if isinstance(di, dict) else (di or [{}])[0]
+        parts.append(f"Documented as intended by the project: {di.get('file')}:{di.get('line')} \"{di.get('quote')}\"")
+    if f.get("issue"):
+        parts.append(f"Root cause {f['issue']}: {f.get('root_cause') or '(see linked finding)'}")
     for key, label in (("entry", "Entry"), ("required_privilege", "Required privilege"),
                        ("source", "Source"), ("sanitizers", "Guards/sanitizers"), ("handler", "Handler")):
         if f.get(key):
@@ -139,7 +145,9 @@ def to_deepaudit_findings(findings: list[dict]) -> list[dict]:
         vtype, sev = CWE_MAP.get(cwe, ("other", "medium"))
         if f.get("verdict") == "likely":
             sev = LOWER[sev]
-        if f.get("required_privilege") == "admin":
+        if f.get("documented_intent"):
+            sev = "low"
+        elif f.get("required_privilege") == "admin":
             sev = LOWER[sev]
         elif f.get("required_privilege") == "operator_or_cli":
             sev = "low"

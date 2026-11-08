@@ -25,7 +25,7 @@ from .config import AuditConfig
 from .discovery import codegraph_db, codegraph_routes, snapshot_codegraph
 from .llm import LLM, limiter_for
 from .prompts import access_model_text, access_prompt, recon_prompt, review_prompt
-from .toolbox import FactBook, Toolbox, tool_schemas
+from .toolbox import FactBook, IssueBoard, Toolbox, tool_schemas
 
 MIN_UNIT_S = 60  # do not start a unit with less time left than this
 SKIP_PARTS = {"node_modules", ".git", ".yasa", ".codegraph", "vendor", "venv", ".venv", "__pycache__"}
@@ -265,10 +265,10 @@ def _handler_snippet(root: Path, unit: dict, lines: int = 70) -> str:
 
 
 def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: list[dict], facts: FactBook,
-                 system: str, deadline: float | None) -> dict:
+                 system: str, deadline: float | None, issues: IssueBoard | None = None) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     uid = ",".join(e["id"] for e in unit["entries"][:5])
-    tb = Toolbox(cfg, root, out, facts=facts, unit=uid)
+    tb = Toolbox(cfg, root, out, facts=facts, unit=uid, issues=issues)
     llm = LLM(cfg)
     entry_view = {"routes": [{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
                                                      "declared_at") if e.get(k)} for e in unit["entries"][:20]],
@@ -283,6 +283,7 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
         "Entry to review:\n" + json.dumps(entry_view, ensure_ascii=False),
         ("Similar entries (peers):\n" + "\n".join(peers)) if peers else "",
         facts.prompt_block(),
+        issues.prompt_block() if issues is not None else "",
         _handler_snippet(root, unit)) if x)
     res = run_agent(llm, tb, tool_schemas("review"), system, user, cfg.review_budget, out / "transcript.jsonl",
                     deadline=deadline)
@@ -298,9 +299,11 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
     t0 = time.time()
     units = _units(entries)
     facts = FactBook(root)
+    issues = IssueBoard()
     system = review_prompt(cfg.review_budget, deploy, product, surface_notes, access_model)
     results, skipped = _schedule(
-        units, lambda i, u: _review_unit(cfg, root, out / f"unit-{i:04d}", u, entries, facts, system, deadline),
+        units, lambda i, u: _review_unit(cfg, root, out / f"unit-{i:04d}", u, entries, facts, system, deadline,
+                                  issues),
         cfg.workers, deadline, cfg.stopped)
     findings = [f for r in results for f in r["findings"]]
     cards = [c for r in results for c in r["cards"]]
@@ -309,13 +312,14 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
                                                   indent=1, ensure_ascii=False))
     (out / "cards.json").write_text(json.dumps(cards, indent=1, ensure_ascii=False))
     (out / "facts.json").write_text(json.dumps(facts.facts, indent=1, ensure_ascii=False))
+    (out / "issues.json").write_text(json.dumps(issues.issues, indent=1, ensure_ascii=False))
     s = lambda k: sum(r.get(k, 0) for r in results)  # noqa: E731
     m = {"stage": "review", "entries": len(entries), "units": len(units), "reviewed_units": len(results),
          "skipped_units": len(skipped), "not_reviewed_entries": len(not_reviewed),
          "prompt_tokens": s("prompt_tokens"), "completion_tokens": s("completion_tokens"),
          "cached_tokens": s("cached_tokens"), "reasoning_tokens": s("reasoning_tokens"), "steps": s("steps"),
          "errors": sum(1 for r in results if r.get("error")), "facts": len(facts.facts),
-         "cards": len(cards), "n_findings": len(findings),
+         "cards": len(cards), "n_findings": len(findings), "root_causes": len(issues.issues),
          "authz_verdicts": dict(collections.Counter(c.get("authz_verdict") for c in cards)),
          "workers": cfg.workers, "llm_limiter": limiter_for(cfg).stats(),
          "wall_s": round(time.time() - t0, 1)}
