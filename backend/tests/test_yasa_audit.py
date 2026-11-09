@@ -234,7 +234,7 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
     scripts = {
         "access": [("finish", {"notes": "too early"}),  # refused: no access model yet
                    ("record_access_model", {"authentication": "none", "authorization": "none",
-                                            "permission_mapping": "none", "principals": "anyone",
+                                            "permission_mapping": "none", "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "anyone",
                                             "evidence": [{"file": "web/Home.php", "line": 3,
                                                           "quote": "function execute()"}]}),
                    ("write_access_resolver", {"code": "import json,sys; r=json.load(sys.stdin); print(json.dumps("
@@ -555,7 +555,7 @@ def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
     extractor = ("import json; print(json.dumps([{'route': '/apis/posts', 'handler_file': 'api/Posts.java', "
                  "'handler': 'list', 'exposure': 'authenticated'}]))")
     model = {"authentication": "session", "authorization": "RBAC filter", "permission_mapping": "verb+path",
-             "principals": "anonymous < user", "evidence": [{"file": "api/Posts.java", "line": 2,
+             "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "anonymous < user", "evidence": [{"file": "api/Posts.java", "line": 2,
                                                              "quote": "list(ServerRequest r)"}]}
     script = [("list_dir", {})] * 8 + [                       # pass 1 only reads (budget 2, +6 grace) ...
               ("finish", {"notes": "RouterFunction beans: /apis/posts -> Posts::list"}),  # ... forced finish
@@ -586,7 +586,7 @@ def test_recon_finish_gates_and_access_model_evidence(tmp_path):
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
     tb.finish_gates = [(lambda t: t.access_model is None, "record_access_model first")]
     assert tb.finish("x") == "not finished: record_access_model first" and not tb.finished
-    base = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "d"}
+    base = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "d"}
     assert tb.record_access_model(**base).startswith("rejected: evidence is required")
     assert "quote not found" in tb.record_access_model(
         **base, evidence=[{"file": "Sec.java", "line": 2, "quote": "denyAll"}])
@@ -656,7 +656,7 @@ def test_recon_sends_access_model_to_the_surface_agent(tmp_path, monkeypatch):
 
     _write(tmp_path, {"Sec.java": "class Sec {\n  boolean allowed() { return true; }\n}\n"})
     recorded = threading.Event()
-    model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "anon < admin",
+    model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "anon < admin",
              "evidence": [{"file": "Sec.java", "line": 2, "quote": "allowed()"}]}
 
     class Access(ScriptedLLM):
@@ -884,7 +884,7 @@ def test_reconcile_lets_the_access_agent_fix_its_resolver(tmp_path, monkeypatch)
                      "{'least_privileged': 'unknown'} for q in r]))")
     scripts = {
         "access": [("record_access_model", {"authentication": "session", "authorization": "in handlers",
-                                            "permission_mapping": "require_admin()", "principals": "anyone, admin",
+                                            "permission_mapping": "require_admin()", "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "anyone, admin",
                                             "evidence": [{"file": "web/Admin.php", "line": 3,
                                                           "quote": "require_admin()"}]}),
                    ("write_access_resolver", {"code": gate_only, "samples": [{"route": "/a"}, {"route": "/b"},
@@ -1030,7 +1030,7 @@ def test_ladder_orders_units_within_a_level_and_is_shown(tmp_path):
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
     _write(tmp_path, {"a.js": "x\n"})
     assert tb.record_access_model(authentication="session", authorization="grants", permission_mapping="doc.method",
-                                  principals="visitor < contributor < editor < owner",
+                                  shared_protections="none", principals="visitor < contributor < editor < owner",
                                   ladder=["Visitor", "Contributor", "Editor", "Super Editor", "Owner"],
                                   evidence=[{"file": "a.js", "line": 1, "quote": "x"}]) == "access model recorded"
     assert "ladder (least to most privileged): Visitor < Contributor < Editor < Super Editor < Owner" in \
@@ -1064,7 +1064,7 @@ def test_reconcile_shows_new_groups_after_the_resolver_changes(tmp_path, monkeyp
     seen = []
     scripts = {
         "access": [("record_access_model", {"authentication": "s", "authorization": "a", "permission_mapping": "p",
-                                            "principals": "anyone, admin", "evidence": [
+                                            "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "anyone, admin", "evidence": [
                                                 {"file": "web/Admin.php", "line": 2, "quote": "require_admin()"}]}),
                    ("write_access_resolver", {"code": public_all, "samples": [{"route": "/a"}, {"route": "/b"},
                                                                               {"route": "/c"}]}),
@@ -1105,7 +1105,7 @@ def test_access_model_carries_shared_protections_and_cards_quote_the_registratio
 
     _write(tmp_path, {"routes.js": "const r = express.Router();\nr.get('/posts', auth, posts.browse);\n"})
     tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
-    tb.record_access_model(authentication="a", authorization="b", permission_mapping="c", principals="d",
+    tb.record_access_model(authentication="a", authorization="b", permission_mapping="c", principals="d", ladder=["a", "b"],
                            shared_protections="ids validated globally (validators/all.ts:27)",
                            evidence=[{"file": "routes.js", "line": 2, "quote": "r.get('/posts'"}])
     assert "- shared protections: ids validated globally (validators/all.ts:27)" in access_model_text(tb.access_model)
@@ -1151,7 +1151,7 @@ def test_budget_end_offers_the_tools_a_closed_gate_needs(tmp_path):
             prompts.append(messages[-1].get("content") or "")
             return super().chat(messages, tools)
 
-    model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "anon < admin",
+    model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "anon < admin",
              "evidence": [{"file": "Sec.java", "line": 2, "quote": "allowed()"}]}
     llm = LLM([("list_dir", {"path": "."})] * 8 + [("record_access_model", model)])
     res = run_agent(llm, tb, tool_schemas("access"), "sys", "go", 2, tmp_path / "log.jsonl")
@@ -1166,3 +1166,13 @@ def test_access_notes_reach_reviewers_when_no_model_was_recorded():
 
     text = access_model_text({"unverified_notes": "ACCESS MODEL: session cookie; canThis(...) in pipeline"})
     assert text.startswith("(the access agent ran out of budget") and "canThis(...)" in text
+
+
+def test_access_model_requires_ladder_and_shared_protections(tmp_path):
+    _write(tmp_path, {"a.js": "x\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    base = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "d",
+            "evidence": [{"file": "a.js", "line": 1, "quote": "x"}]}
+    assert tb.record_access_model(**base) == "rejected: missing shared_protections, ladder"
+    assert tb.record_access_model(**base, shared_protections="s", ladder="anon < admin") == "rejected: missing ladder"
+    assert tb.record_access_model(**base, shared_protections="s", ladder=["anon", "admin"]) == "access model recorded"

@@ -641,18 +641,17 @@ class Toolbox:
 
     def record_access_model(self, **model: Any) -> str:
         """The project-wide model of how requests are authenticated and authorized (recon stage)."""
-        need = ("authentication", "authorization", "permission_mapping", "principals")
-        missing = [k for k in need if not str(model.get(k) or "").strip()]
+        need = ("authentication", "authorization", "permission_mapping", "principals", "shared_protections")
+        ladder = [str(x).strip() for x in (model.get("ladder") or []) if str(x).strip()] \
+            if isinstance(model.get("ladder"), list) else []
+        missing = [k for k in need if not str(model.get(k) or "").strip()] + ([] if ladder else ["ladder"])
         if missing:
             return f"rejected: missing {', '.join(missing)}"
         err = verify_evidence(self.root, model.get("evidence") or [])
         if err:
             return f"rejected: {err}"
-        self.access_model = {k: model.get(k) for k in (*need, "public_by_default", "shared_protections",
-                                                       "evidence")}
-        ladder = [str(x).strip() for x in (model.get("ladder") or []) if str(x).strip()]
-        if ladder:
-            self.access_model["ladder"] = ladder[:12]
+        self.access_model = {k: model.get(k) for k in (*need, "public_by_default", "evidence")}
+        self.access_model["ladder"] = ladder[:12]
         return "access model recorded"
 
     def report_finding(self, **finding: Any) -> str:
@@ -781,7 +780,8 @@ def tool_schemas(role: str) -> list[dict]:
                            "the resolver's principals use these names"},
                 "evidence": {"type": "array", "items": {"type": "object", "properties": {
                     "file": s, "line": i, "quote": s}}}},
-               ["authentication", "authorization", "permission_mapping", "principals", "evidence"]),
+               ["authentication", "authorization", "permission_mapping", "principals", "ladder",
+                "shared_protections", "evidence"]),
         ]
     elif role == "recon":
         tools += [
