@@ -28,8 +28,9 @@ There is no list of frameworks to pick from. Work it out from this project's own
    field) selects which file / class / function, and where that mapping is written down (code, config
    files, naming conventions, schemas, dependency-injection bindings). A project often has several
    independent dispatchers (pages, REST, GraphQL, admin area, user area, ...); find each one.
-3. Spend at most about half of your budget on steps 1-2. For each dispatcher, write a small extractor
-   program and run it with run_extractor. The program applies the mapping to the whole project and prints
+3. Spend at most about half of your budget on steps 1-2 (run_probe runs a throwaway program when reading
+   is too slow; its output is not part of the surface). For each dispatcher, write a small extractor
+   program and run it with run_extractor: what an extractor prints IS the surface. The program applies the mapping to the whole project and prints
    every entry: where the code ends up (handler_file + handler + handler_line: the concrete function that
    runs and its first line, not an interface or a base class; for anonymous code such as a callback, the
    line where it starts), what the declaration says about access (auth), and exposure = the LEAST
@@ -64,7 +65,16 @@ Find and read, with the navigation tools:
   principal gets them, and how to tell from an entry's declaration the least privileged one that can
   call it;
 - what is public by default.
-Then call record_access_model (each statement backed by evidence quotes from the code) and finish.
+Then call record_access_model (each statement backed by evidence quotes from the code).
+If the decision can be computed from the request, its handler and the code or configuration (route
+tables, role and permission definitions, middleware or filter order, annotations, the checks a handler
+makes), write it as a program with write_access_resolver and test it on sample requests of every
+privilege level, including ones you expect to be denied; fix it until each result matches what the code
+does. Its answer for a request is who can get the handler's operation done, not only who passes the
+first gate. Every entry of the surface will go through it, in the shapes the surface agent writes
+(HTTP routes, RPC or tool names, ...): answer unknown for shapes you do not handle. It is compared with
+the exposure the surface agent declared and answers reviewers' who_can_call questions, so prefer reading
+the real rule sources over hard-coding routes. Then finish.
 Use at most {budget} tool calls.
 {context}"""
 
@@ -77,6 +87,13 @@ How the project controls access (established once for the whole project; rely on
 security chain unless the code of this entry contradicts it):
 {access_model}
 
+Each route shows who_can_call: the answer of a program the access agent wrote from the project's
+access rules. When it disagrees with the exposure the surface agent declared (exposure_declared), find
+out from the code which is right: two readings of the rules that disagree are where access-control
+mistakes are most likely. Use who_can_call(method, path) to compare with similar routes, including other
+paths that reach the same handler. Put who can actually call the entry in the card
+(least_privileged_caller); a wrong exposure in the entry list is not a finding.
+
 Method:
 1. Scenario: read the handler and what it calls. What does it do in business terms, which inputs it
    takes, which data or resources it reads, changes or exposes, and which user-controlled values it
@@ -85,7 +102,8 @@ Method:
    at what the handler itself must still enforce and whether it does: ownership or tenancy of objects
    selected by request values, state or workflow rules, limits on what a lower role may change. Compare
    with the similar entries listed (peers).
-3. record_card with the scenario and the access-control verdict as soon as you have them.
+3. record_card with the scenario, the access-control verdict and least_privileged_caller as soon as
+   you have them.
 4. Hypotheses come from the code you read, not from a list of vulnerability classes: for each place
    where a request value is stored, used in a query/command/template, fetched, written to a file,
    rendered, used to redirect, or used to select an object, ask what could go wrong THERE. Each

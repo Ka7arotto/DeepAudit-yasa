@@ -202,6 +202,12 @@ class Toolbox:
         self.manual: list[dict] = []
         self.coverage: dict | None = None
         self.access_model: dict | None = None
+        self.resolver_code: str | None = None
+        self.known_entries: dict[tuple, dict] = {}  # (METHOD, route) -> entry, so who_can_call sees the handler
+        self.extractor_best: dict[str, int] = {}  # most entries any version of each extractor produced
+        self.regressions_shown: set[tuple] = set()
+        self.reconcile_groups: dict[str, list[str]] = {}  # group id -> entry ids (reconcile pass)
+        self.decisions: dict[str, dict] = {}  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
 
@@ -341,14 +347,27 @@ class Toolbox:
         return clip(head + ("\n" + "\n".join(rows) if rows else ""))
 
     def entries(self) -> list[dict]:
-        """Union of all extractor outputs and manual entries, deduplicated."""
-        seen, out = set(), []
-        for e in [x for ex in self.extractors.values() for x in ex["entries"]] + self.manual:
-            key = (e.get("method", "ANY"), e.get("route"), e.get("handler_file"), e.get("handler"))
-            if key not in seen:
-                seen.add(key)
-                out.append(e)
+        """Union of all extractor outputs and manual entries. One entry per (method, route, handler file):
+        the most recently run extractor wins, and an entry whose handler does not resolve is dropped when
+        another one for the same request does (two services may serve the same path from different files)."""
+        runs = sorted(self.extractors.values(), key=lambda ex: ex.get("run", 0))
+        by_req: dict[tuple, dict[str, dict]] = {}
+        for e in [x for ex in runs for x in ex["entries"]] + self.manual:  # later ones replace earlier ones
+            by_req.setdefault((e.get("method", "ANY"), e.get("route")), {})[str(e.get("handler_file"))] = e
+        out = []
+        for cands in by_req.values():
+            ok = [e for e in cands.values() if self._check_entry(e) is None]
+            out += ok or list(cands.values())
         return out
+
+    def overlaps(self) -> list[tuple]:
+        """Requests that several extractors map to different handlers."""
+        seen: dict[tuple, set] = {}
+        for name, ex in self.extractors.items():
+            for e in ex["entries"]:
+                seen.setdefault((e.get("method", "ANY"), e.get("route")), set()).add(
+                    (name, e.get("handler_file"), e.get("handler")))
+        return [(k, v) for k, v in seen.items() if len({(f, h) for _, f, h in v}) > 1 and len({n for n, _, _ in v}) > 1]
 
     def _check_entry(self, e: dict) -> str | None:
         """None when the handler is concrete code in the project, else the reason it is not."""
@@ -407,29 +426,110 @@ class Toolbox:
                     f"auth={e.get('auth', '?')} exposure={e['exposure']}"
                     for e in rnd.sample(ok, min(8, len(ok)))]}
 
+    def _run_python(self, code: str, prefix: str, stdin: str = "", timeout: int = 180) -> tuple[bool, str]:
+        """Run a program an agent wrote: `python -I <script> <project root>`, standard library only,
+        in a scratch directory. Returns (ok, stdout) or (False, error text)."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=f"{prefix}-", dir=str(self.run_dir)))
+        script = work / f"{prefix}.py"
+        script.write_text(code)
+        env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
+        try:
+            r = subprocess.run([sys.executable, "-I", str(script), str(self.root)], capture_output=True,
+                               text=True, timeout=timeout, cwd=work, env=env, input=stdin)
+        except subprocess.TimeoutExpired:
+            return False, f"error: program ran longer than {timeout} s"
+        if r.returncode:
+            return False, clip(f"error: program exited {r.returncode}\n{r.stderr[-3000:]}", 4000)
+        return True, r.stdout
+
+    RESOLVER_FIELDS = ("kind", "handler_file", "handler", "handler_line")
+
+    def resolve_access(self, requests: list[dict], code: str | None = None) -> list[dict] | str:
+        """Run the who-can-call program on requests ({method, route} plus, when known, the entry's kind and
+        handler location); a list of results in the same order, or an error text. Each result:
+        least_privileged (public|authenticated|privileged|denied|unknown), principals (list), rule (where
+        the decision comes from)."""
+        code = code or self.resolver_code
+        if not code:
+            return "error: no resolver"
+        reqs = []
+        for r in requests:
+            q = {"method": str(r.get("method") or "GET").upper(), "route": str(r.get("route") or "")}
+            q.update({k: r[k] for k in self.RESOLVER_FIELDS if r.get(k) not in (None, "")})
+            reqs.append(q)
+        ok, out = self._run_python(code, "resolver", json.dumps(reqs), timeout=120)
+        if not ok:
+            return out
+        try:
+            res = json.loads(out)
+        except json.JSONDecodeError as e:
+            return clip(f"error: stdout is not JSON ({e}); first bytes: {out[:300]!r}", 2000)
+        if not isinstance(res, list) or len(res) != len(reqs):
+            return f"error: expected a JSON list of {len(reqs)} results (one per request, same order)"
+        clean = []
+        for r in res:
+            r = r if isinstance(r, dict) else {}
+            lp = str(r.get("least_privileged") or "unknown")
+            clean.append({"least_privileged": lp if lp in (*EXPOSURES, "denied") else "unknown",
+                          "principals": [str(p) for p in (r.get("principals") or [])][:8],
+                          "rule": str(r.get("rule") or "")[:200]})
+        return clean
+
+    def write_access_resolver(self, code: str, samples: Any) -> str:
+        """Install the who-can-call program after running it on sample requests."""
+        samples = [x for x in (samples or []) if isinstance(x, dict) and x.get("route")]
+        if len(samples) < 3:
+            return ("rejected: give at least 3 sample requests {method, route, handler_file, handler, ...}, of "
+                    "different privilege levels")
+        res = self.resolve_access(samples, code)
+        if isinstance(res, str):
+            return res
+        self.resolver_code = code
+        (self.run_dir / "resolver.py").write_text(code)
+        rows = [f"{s.get('method', 'GET')} {s['route']} -> {r['least_privileged']} {r['principals']} ({r['rule']})"
+                for s, r in zip(samples, res, strict=True)]
+        unknown = sum(r["least_privileged"] == "unknown" for r in res)
+        return clip("resolver installed. Check each result against the code you read; fix and resend if any is "
+                    f"wrong{' (unknown results: ' + str(unknown) + ')' if unknown else ''}:\n" + "\n".join(rows))
+
+    def who_can_call(self, method: str, path: str) -> str:
+        req = {**self.known_entries.get((str(method or "GET").upper(), str(path)), {}),
+               "method": method, "route": path}
+        res = self.resolve_access([req])
+        if isinstance(res, str):
+            return res + ("; work it out from the access model" if "no resolver" in res else "")
+        return json.dumps(res[0], ensure_ascii=False)
+
+    def run_probe(self, code: str) -> str:
+        """Run a throwaway Python program over the project (root in sys.argv[1]) and show its output.
+        Nothing it prints becomes part of the surface."""
+        ok, out = self._run_python(code, "probe", timeout=120)
+        return clip(out, 6000) or "(no output)"
+
+    def drop_extractor(self, name: str) -> str:
+        if self.extractors.pop(str(name), None) is None:
+            return f"error: no extractor {name!r}; extractors: {', '.join(self.extractors) or 'none'}"
+        self.extractor_best.pop(str(name), None)
+        return f"dropped {name}; total entries now {len(self.entries())}"
+
     def run_extractor(self, name: str, code: str) -> str:
         """Run a Python program the agent wrote. It receives the project root as sys.argv[1] and must
         print a JSON list of entries. The result replaces any earlier extractor of the same name."""
         if not re.fullmatch(r"[\w-]{1,40}", str(name)):
             return "error: name must be 1-40 letters, digits, '-' or '_'"
-        work = Path(tempfile.mkdtemp(prefix="extractor-", dir=str(self.run_dir)))
-        script = work / f"{name}.py"
-        script.write_text(code)
-        env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
+        ok, out = self._run_python(code, "extractor")
+        if not ok:
+            return out
         try:
-            r = subprocess.run([sys.executable, "-I", str(script), str(self.root)], capture_output=True,
-                               text=True, timeout=180, cwd=work, env=env)
-        except subprocess.TimeoutExpired:
-            return "error: extractor ran longer than 180 s"
-        if r.returncode:
-            return clip(f"error: extractor exited {r.returncode}\n{r.stderr[-3000:]}", 4000)
-        try:
-            raw = json.loads(r.stdout)
+            raw = json.loads(out)
         except json.JSONDecodeError as e:
-            return clip(f"error: stdout is not JSON ({e}); first bytes: {r.stdout[:300]!r}", 2000)
+            return clip(f"error: stdout is not JSON ({e}); first bytes: {out[:300]!r}", 2000)
         entries, problems = self._clean(raw, f"extractor:{name}")
         prev = self.extractors.get(name)
-        self.extractors[name] = {"code": code, "entries": entries}
+        self._runs = getattr(self, "_runs", 0) + 1
+        self.extractors[name] = {"code": code, "entries": entries, "run": self._runs}
+        self.extractor_best[name] = max(self.extractor_best.get(name, 0), len(entries))
         (self.run_dir / "extractors").mkdir(exist_ok=True)
         (self.run_dir / "extractors" / f"{name}.py").write_text(code)
         res = {"extractor": name, **self._summary(entries), "problems": problems[:5],
@@ -451,6 +551,30 @@ class Toolbox:
                                   "one; check that this was intended (a bug in the rewrite, an exception "
                                   "caught too broadly, a changed path) before you finish")
         return clip(json.dumps(res, ensure_ascii=False, indent=1))
+
+    def extractor_regressions(self) -> list[str]:
+        """Extractors whose latest version yields far fewer entries than an earlier version did, not yet
+        pointed out to the agent. Each is pointed out once: a smaller surface can be the right answer."""
+        out = []
+        for name, best in self.extractor_best.items():
+            es = self.extractors.get(name, {}).get("entries", [])
+            now = len(es)
+            if best - now > max(5, best // 5) and (name, now) not in self.regressions_shown:
+                self.regressions_shown.add((name, now))
+                out.append(f"{name} now yields {now} entries, an earlier version yielded {best}")
+            bad = sum(self._check_entry(e) is not None for e in es)
+            if now and bad * 2 > now and (name, "unresolved", now) not in self.regressions_shown:
+                self.regressions_shown.add((name, "unresolved", now))
+                out.append(f"{name}: {bad} of {now} entries do not resolve to code (fix it, or drop_extractor "
+                           "if it was a probe)")
+        ov = self.overlaps()
+        if ov and ("overlaps", len(ov)) not in self.regressions_shown:
+            self.regressions_shown.add(("overlaps", len(ov)))
+            (m, r), v = ov[0]
+            out.append(f"{len(ov)} requests are mapped to different handlers by different extractors, e.g. {m} {r}: "
+                       + "; ".join(f"{n} -> {f}::{h}" for n, f, h in sorted(v, key=str)[:4])
+                       + " (drop or fix the extractors that are wrong)")
+        return out
 
     def add_entries(self, entries: list[dict]) -> str:
         """Add entries by hand (a few special ones an extractor would not cover)."""
@@ -474,7 +598,8 @@ class Toolbox:
         reach = reachable_files(self.root, handlers, depth=int(depth)) or set(handlers)
         unc = [s for s in sites if s[0] not in reach]
         result = {"pattern": request_read_pattern, "sites": len(sites), "files": len(files),
-                  "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc)}
+                  "covered_sites": len(sites) - len(unc), "uncovered_sites": len(unc),
+                  "handler_files_matched": len(set(files) & set(handlers)), "handler_files": len(handlers)}
         # A narrower pattern finds fewer reads, not better coverage: the broadest check is the record.
         if self.coverage is None or result["sites"] >= self.coverage["sites"]:
             self.coverage = result
@@ -482,6 +607,10 @@ class Toolbox:
             result["note"] = (f"this pattern matches fewer read sites than an earlier check "
                               f"({self.coverage['sites']}: {self.coverage['pattern']}); the earlier, broader "
                               "check stays the recorded coverage")
+        if len(handlers) >= 10 and result["handler_files_matched"] * 4 < len(handlers):
+            result["note"] = (f"the pattern matches request reads in only {result['handler_files_matched']} of "
+                              f"{len(handlers)} handler files, so most handlers read requests some other way "
+                              "and this check says little; use a pattern that matches how they read it")
         by_file: dict[str, list[str]] = {}
         for f, ln, code in unc:
             by_file.setdefault(f, []).append(f"{ln}: {code.strip()[:120]}")
@@ -518,6 +647,26 @@ class Toolbox:
         card["_unit"] = self.unit
         self.cards = [card]  # a later call updates the card
         return "card recorded" + (f" (unknown fact ids ignored: {unknown})" if unknown else "")
+
+    SETTLE_VERDICTS = ("resolver_wrong", "declared_wrong", "inconsistent_code")
+
+    def settle(self, decisions: Any) -> str:
+        """Decide groups of disagreements between the resolver and the declared exposure, in one call."""
+        if isinstance(decisions, dict):
+            decisions = [decisions]
+        errors = []
+        for d in decisions if isinstance(decisions, list) else []:
+            d = d if isinstance(d, dict) else {}
+            g, v = str(d.get("group", "")), d.get("verdict")
+            if g not in self.reconcile_groups:
+                errors.append(f"unknown group {g!r}")
+            elif v not in self.SETTLE_VERDICTS:
+                errors.append(f"{g}: verdict must be one of {', '.join(self.SETTLE_VERDICTS)}")
+            else:
+                self.decisions[g] = {"verdict": v, "reason": str(d.get("reason", ""))[:400]}
+        left = [g for g in self.reconcile_groups if g not in self.decisions]
+        return "; ".join(errors + [f"decided: {len(self.decisions)}",
+                                   f"undecided: {', '.join(left)}" if left else "all groups decided"])
 
     def record_access_model(self, **model: Any) -> str:
         """The project-wide model of how requests are authenticated and authorized (recon stage)."""
@@ -568,7 +717,7 @@ class Toolbox:
     def finish(self, notes: str = "", _force: bool = False) -> str:
         for cond, msg in self.finish_gates:
             if not _force and cond(self):
-                return f"not finished: {msg}"
+                return f"not finished: {msg(self) if callable(msg) else msg}"
         self.finished = True
         self.notes = notes
         return f"finished ({len(self.findings)} findings, {len(self.cards)} cards)"
@@ -603,8 +752,33 @@ def tool_schemas(role: str) -> list[dict]:
         "auth": {"type": "string", "description": "what the code/config says about authentication or "
                  "authorization for this entry, verbatim where possible"},
         "exposure": {"type": "string", "enum": list(EXPOSURES)}}}
+    req = {"type": "object", "properties": {"method": s, "route": s, "kind": s, "handler_file": s, "handler": s,
+                                            "handler_line": i}}
     if role == "access":
         tools += [
+            fn("write_access_resolver",
+               "Install a who-can-call program: Python 3 (standard library only) that gets the project root "
+               "as sys.argv[1], reads a JSON list of requests from stdin and prints a JSON list with one "
+               "result per request, same order. A request is an entry of the attack surface: method, route "
+               "(in whatever shape the surface agent wrote it), and when known kind, handler_file, handler, "
+               "handler_line. A result is {least_privileged: public|authenticated|privileged|denied|unknown, "
+               "principals: [roles or principal kinds allowed], rule: where the decision comes from (file:line "
+               "or config key)}. least_privileged is the least privileged principal whose request gets the "
+               "handler's operation done: count the shared gates AND the checks the handler itself makes (the "
+               "program can read the handler's code). Answer unknown for requests whose shape you do not "
+               "recognise, rather than guessing. It applies the project's real access rules (route tables, "
+               "role definitions, middleware or filter order, checks in handlers) as you read them. It is run "
+               "on your samples now, and later on every entry and by reviewers.",
+               {"code": s, "samples": {"type": "array", "items": req}}, ["code", "samples"]),
+            fn("settle",
+               "Only when asked to reconcile: decide groups of disagreements, all in one call. resolver_wrong: "
+               "the declared exposure is right; declared_wrong: the resolver is right; inconsistent_code: both "
+               "readings follow real code that disagrees (a likely access-control bug).",
+               {"decisions": {"type": "array", "items": {"type": "object", "properties": {
+                   "group": s, "verdict": {"type": "string", "enum": ["resolver_wrong", "declared_wrong",
+                                                                      "inconsistent_code"]},
+                   "reason": {"type": "string", "description": "the code that decides it (file:line)"}},
+                   "required": ["group", "verdict", "reason"]}}}, ["decisions"]),
             fn("record_access_model",
                "Record how THIS project authenticates and authorizes requests, once, before finish. "
                "Reviewers of every entry rely on it instead of re-reading the security chain.",
@@ -626,6 +800,11 @@ def tool_schemas(role: str) -> list[dict]:
         tools += [
             fn("codegraph_routes", "Routes that codegraph's framework resolvers recognised. Evidence only: "
                "may be empty or incomplete for this project.", {"contains": s, "limit": i}, []),
+            fn("run_probe", "Run a throwaway Python 3 program (standard library; project root in sys.argv[1]) "
+               "to explore the code, e.g. list files or test a regex; prints its output. Nothing becomes an "
+               "entry: use it instead of run_extractor while you are still finding out.", {"code": s}, ["code"]),
+            fn("drop_extractor", "Remove an extractor and its entries (e.g. one used as a probe).",
+               {"name": s}, ["name"]),
             fn("run_extractor",
                "Run a Python 3 program you wrote that enumerates entries of THIS project. It gets the "
                "project root as sys.argv[1], may read any file there (standard library only, no network) "
@@ -650,6 +829,10 @@ def tool_schemas(role: str) -> list[dict]:
                "then again with every hypothesis's final status (a later call replaces the card).",
                {"function": {"type": "string", "description": "what the entry does, in business terms"},
                 "callers": {"type": "string", "description": "who can call it, with the evidence"},
+                "least_privileged_caller": {"type": "string", "description": "who can actually call it, as you "
+                                            "established from the code (put a wrong recon exposure right "
+                                            "here, not in report_finding)",
+                                            "enum": ["public", "authenticated", "privileged", "denied"]},
                 "authz_verdict": {"type": "string", "enum": ["ok", "missing_authentication",
                                                              "missing_authorization", "object_level",
                                                              "unclear"]},
@@ -671,8 +854,9 @@ def tool_schemas(role: str) -> list[dict]:
                {"vuln_type": s, "cwe": s, "sink_file": s, "sink_line": i,
                 "source": {"type": "string", "description": "attacker-controlled input and where"},
                 "entry": {"type": "string", "description": "route and who can reach it"},
-                "required_privilege": {"type": "string",
-                                       "enum": ["none", "customer", "admin", "operator_or_cli"]},
+                "required_privilege": {"type": "string", "description": "least privileged principal that can "
+                                       "exploit it", "enum": ["public", "authenticated", "privileged",
+                                                              "operator_or_cli"]},
                 "hops": {"type": "array", "items": s},
                 "sanitizers": s,
                 "impact": {"type": "string", "description": "what the attacker concretely gains: data read, "
@@ -691,6 +875,8 @@ def tool_schemas(role: str) -> list[dict]:
                 "verdict": {"type": "string", "enum": ["confirmed", "likely"]}},
                ["vuln_type", "cwe", "sink_file", "sink_line", "source", "entry", "required_privilege",
                 "verdict", "route_evidence", "impact"]),
+            fn("who_can_call", "Who can call a request (method, path) under the project's access rules, "
+               "computed by the access agent's resolver program.", {"method": s, "path": s}, ["method", "path"]),
             fn("add_fact", "Share a project fact other reviewers can rely on: one claim, at most 240 "
                "characters (e.g. how a helper escapes, that all data access goes through a typed query API, "
                "which base class enforces login). Rejected unless each quote is found at file:line.",
