@@ -213,6 +213,7 @@ class Toolbox:
         self.regressions_shown: set[tuple] = set()
         self.reconcile_groups: dict[str, list[str]] = {}  # group id -> entry ids (reconcile pass)
         self.on_resolver_installed = None  # reconcile: regroups the disagreements for a new resolver
+        self.conclusion: dict | None = None  # refutation check
         self.decisions: dict[str, dict] = {}  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
@@ -619,6 +620,37 @@ class Toolbox:
         self.cards = [card]  # a later call updates the card
         return "card recorded" + (f" (unknown fact ids ignored: {unknown})" if unknown else "")
 
+    UPHOLD_STAGES = ("input_validation", "permission", "operation")
+
+    def conclude(self, verdict: str, reason: str = "", path: Any = None) -> str:
+        """Refutation check. path: the stages of the request as read in the code, each {stage, file,
+        line, quote, effect} with effect 'passes' or 'stops'. upheld needs input_validation,
+        permission and operation, each quoted and none stopping; refuted needs a quoted stage that
+        stops it; uncertain needs only the reason."""
+        if verdict not in ("upheld", "refuted", "uncertain"):
+            return "rejected: verdict must be upheld, refuted or uncertain"
+        if not str(reason or "").strip():
+            return "rejected: reason is required"
+        path = [p for p in ([path] if isinstance(path, dict) else (path or [])) if isinstance(p, dict)]
+        if verdict != "uncertain":
+            err = verify_evidence(self.root, path) if path else "path is required"
+            if err:
+                return f"rejected: path: {err}"
+            stops = [p for p in path if p.get("effect") == "stops"]
+            if verdict == "refuted" and not stops:
+                return "rejected: refuted needs the stage that stops the attack (effect: stops)"
+            if verdict == "upheld":
+                if stops:
+                    return "rejected: a stage you quoted stops the attack; conclude refuted"
+                missing = [x for x in self.UPHOLD_STAGES if x not in {p.get("stage") for p in path}]
+                if missing:
+                    return (f"rejected: upheld needs the code of each stage the request passes, quoted: missing "
+                            f"{', '.join(missing)}. Open it (framework validators, the permission hook of "
+                            "the model or service, the code that performs the operation) rather than "
+                            "assuming what it does; quote where you looked if a stage does not exist.")
+        self.conclusion = {"verdict": verdict, "reason": str(reason)[:1500], "path": path[:10]}
+        return f"concluded: {verdict}"
+
     SETTLE_VERDICTS = ("resolver_wrong", "declared_wrong", "inconsistent_code")
 
     def settle(self, decisions: Any) -> str:
@@ -699,7 +731,7 @@ class Toolbox:
 
 
 def tool_schemas(role: str) -> list[dict]:
-    """role: 'recon' (surface), 'access' (access-control model) or 'review'."""
+    """role: 'recon' (surface), 'access' (access-control model), 'review' or 'verify' (refutation)."""
     def fn(name: str, desc: str, props: dict, required: list[str]) -> dict:
         return {"type": "function", "function": {
             "name": name, "description": desc,
@@ -808,6 +840,22 @@ def tool_schemas(role: str) -> list[dict]:
                "(e.g. the request object's getter calls). Lists read sites not reachable from any "
                "entry handler found so far, grouped by directory.",
                {"request_read_pattern": s, "glob": s, "depth": i}, ["request_read_pattern"]),
+        ]
+    elif role == "verify":
+        tools += [
+            fn("who_can_call", "Who can call a request (method, path) under the project's access rules, "
+               "computed by the access agent's resolver program.", {"method": s, "path": s}, ["method", "path"]),
+            fn("conclude", "Your conclusion on the reported vulnerability, with the request's path as you read "
+               "it in the code: one item per stage (entry, input_validation, permission, handler, "
+               "operation, output) with file, line, a quote and its effect on the attack (passes or stops). "
+               "refuted: a quoted stage stops it. upheld: input_validation, permission and operation are "
+               "quoted and none stops it. uncertain: say what is left to check.",
+               {"verdict": {"type": "string", "enum": ["upheld", "refuted", "uncertain"]}, "reason": s,
+                "path": {"type": "array", "items": {"type": "object", "properties": {
+                    "stage": {"type": "string", "enum": ["entry", "input_validation", "permission", "handler",
+                                                         "operation", "output"]},
+                    "file": s, "line": i, "quote": s,
+                    "effect": {"type": "string", "enum": ["passes", "stops"]}}}}}, ["verdict", "reason"]),
         ]
     else:
         tools += [

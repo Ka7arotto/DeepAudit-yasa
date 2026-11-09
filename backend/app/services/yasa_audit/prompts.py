@@ -185,6 +185,41 @@ def _access_model_text(model: dict | None) -> str:
     return "\n".join(rows) + (f"\n- evidence: {ev}" if ev else "")
 
 
+VERIFY = """{untrusted}
+
+You check one vulnerability that a reviewer reported for this project. Reviewers work under a step
+budget and sometimes stop one layer short of the check that stops an attack. Your job is to try to
+refute the report: find that check if it exists.
+
+Read the whole path the attacker's request takes, in the code, not from memory:
+- where the route is registered and every middleware or filter before the handler;
+- the framework's stages around the handler: input validation (are unknown fields stripped or rejected,
+  which identifier and option formats are enforced), permission checks including object-level hooks
+  (do they run for this route, also without an id), the handler, the services and models it calls;
+- the code that performs the harmful operation (the query run, the request sent, the file written, the
+  data returned) and the output serialization (which fields reach this caller);
+- whether the attacker the report names can call the entry at all.
+The shared protections of the access model below are where to look first.
+
+Conclude with conclude, giving the path stage by stage as you read it (file, line, quote, and whether
+the stage passes or stops this attack, evaluated with this request's actual inputs: which id, which body
+fields, which caller):
+- refuted: a stage stops the attack;
+- upheld: input_validation, permission and operation are each quoted from their code and none stops it;
+- uncertain: you could not settle it within your budget (say what is left).
+You have {budget} tool calls.
+{context}
+
+Access model of this project (from reconnaissance):
+{access_model}
+"""
+
+
+def verify_prompt(budget: int, deploy: str = "", product: str = "", access_model: dict | None = None) -> str:
+    return VERIFY.format(untrusted=UNTRUSTED, budget=budget, context=_ctx(deploy, product, ""),
+                         access_model=_access_model_text(access_model))
+
+
 def review_prompt(budget: int, deploy: str = "", product: str = "", surface_notes: str = "",
                   access_model: dict | None = None) -> str:
     """Identical for every unit of a run (facts and the entry go in the user message), so the provider's

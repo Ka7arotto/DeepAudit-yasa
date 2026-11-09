@@ -118,6 +118,11 @@ def _describe(f: dict) -> str:
         parts.append(f"Documented as intended by the project: {di.get('file')}:{di.get('line')} \"{di.get('quote')}\"")
     if f.get("issue"):
         parts.append(f"Root cause {f['issue']}: {f.get('root_cause') or '(see linked finding)'}")
+    v = f.get("verification")
+    if v:
+        label = {"upheld": "upheld by an independent refutation check",
+                 "uncertain": "NOT verified by the refutation check"}.get(v.get("verdict"), v.get("verdict"))
+        parts.append(f"Verification: {label}. {v.get('reason', '')}".strip())
     for key, label in (("impact", "Impact"), ("entry", "Entry"), ("required_privilege", "Required privilege"),
                        ("source", "Source"), ("sanitizers", "Guards/sanitizers"), ("handler", "Handler")):
         if f.get(key):
@@ -160,7 +165,8 @@ def to_deepaudit_findings(findings: list[dict]) -> list[dict]:
             "file_path": f.get("sink_file"),
             "line_start": int(line) if str(line or "").isdigit() else None,
             "description": _describe(f),
-            "confidence": 0.85 if f.get("verdict") == "confirmed" else 0.6,
+            "confidence": (0.85 if f.get("verdict") == "confirmed" else 0.6)
+            - (0.2 if (f.get("verification") or {}).get("verdict") == "uncertain" else 0),
             "cwe_id": cwe or None,
             "verification_method": "yasa_audit entry review (static, not executed)",
         })

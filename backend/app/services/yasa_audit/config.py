@@ -55,7 +55,9 @@ class AuditConfig:
     recon_share: float = 0.25  # route reconnaissance may use this share of the budget
     recon_budget: int = 60  # tool calls of the surface agent
     access_budget: int = 40  # tool calls of the access-control agent (runs in parallel with it)
-    review_budget: int = 18  # tool calls per entry review
+    review_budget: int = 24  # tool calls per entry review
+    verify_budget: int = 24  # tool calls of the refutation check per root cause
+    verify_share: float = 0.12  # share of the wall-clock budget kept for the refutation check
     reconcile_budget: int = 20  # tool calls of the access agent to settle disagreements with the surface
     workers: int = 16  # review units in parallel (a unit spends most of its time in tools, not the LLM)
     # LLM requests in flight at most; halved automatically when the provider rate-limits

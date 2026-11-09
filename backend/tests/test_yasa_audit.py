@@ -267,6 +267,16 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                                    "open_leads": ["web/Home.php:3 echo of q: check the template escaping"],
                                    "hypotheses": []})],
     }
+    scripts["verify"] = [("finish", {"notes": "too early"}),  # refused: no conclusion yet
+                         ("conclude", {"verdict": "upheld", "reason": "nothing between $_GET and readfile",
+                                       "path": [{"stage": "operation", "file": "web/Download.php", "line": 4,
+                                                 "quote": "readfile('/srv/files/' . $_GET['name'])"}]}),
+                         ("conclude", {"verdict": "upheld", "reason": "nothing between $_GET and readfile",
+                                       "path": [{"stage": s, "file": "web/Download.php", "line": ln, "quote": q,
+                                                 "effect": "passes"} for s, ln, q in (
+                                           ("input_validation", 4, "$_GET['name']"),
+                                           ("permission", 3, "function execute()"),
+                                           ("operation", 4, "readfile('/srv/files/' . $_GET['name'])"))]})]
     users, systems = [], []
 
     class Router(ScriptedLLM):
@@ -275,8 +285,9 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                 user = messages[1]["content"]
                 users.append(user)
                 systems.append(messages[0]["content"])
-                key = next((k for k in ("/download", "/home") if f'"route": "{k}"' in user),
-                           "access" if "controls ACCESS" in messages[0]["content"] else "recon")
+                key = ("verify" if "Try to refute it" in user else
+                       next((k for k in ("/download", "/home") if f'"route": "{k}"' in user),
+                            "access" if "controls ACCESS" in messages[0]["content"] else "recon"))
                 self.script = list(scripts[key])
             return super().chat(messages, tools)
 
@@ -294,6 +305,8 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
     data = json.loads((tmp_path / "out" / "review" / "findings.json").read_text())
     (f,) = data["findings"]
     assert f["cwe"] == "CWE-22" and f["handler"] == "web/Download.php::execute" and data["not_reviewed"] == []
+    assert f["verification"]["verdict"] == "upheld" and data["refuted"] == []
+    assert m["verify"]["root_causes"] == 1 and m["verify"]["verdicts"] == {"upheld": 1}
     (lead,) = data["open_leads"]  # unverified suspicions are kept apart from findings
     assert lead["lead"] == "web/Home.php:3 echo of q: check the template escaping" and lead["entries"]
     cards = json.loads((tmp_path / "out" / "review" / "cards.json").read_text())
@@ -1179,3 +1192,70 @@ def test_access_model_requires_ladder_and_shared_protections(tmp_path):
     assert tb.record_access_model(**base) == "rejected: missing shared_protections, ladder"
     assert tb.record_access_model(**base, shared_protections="s", ladder="anon < admin") == "rejected: missing ladder"
     assert tb.record_access_model(**base, shared_protections="s", ladder=["anon", "admin"]) == "access model recorded"
+
+
+
+def test_refutation_check_moves_refuted_findings_out_and_marks_the_rest(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+    from app.services.yasa_audit.runner import to_deepaudit_findings
+    from app.services.yasa_audit.verify import verify
+
+    _write(tmp_path, {"api/posts.js": "function destroy(id) {\n  if (!isOwner(id)) throw new Forbidden();\n"
+                                      "  db.delete(id);\n}\n"})
+    review = tmp_path / "out" / "review"
+    review.mkdir(parents=True)
+    base = {"vuln_type": "IDOR", "cwe": "CWE-639", "sink_file": "api/posts.js", "sink_line": 3, "source": "id",
+            "required_privilege": "authenticated", "verdict": "likely", "impact": "deletes others' posts"}
+    findings = [dict(base, entry="DELETE /posts/:id", issue="I1", root_cause="no owner check"),
+                dict(base, entry="DELETE /posts", issue="I1", root_cause="no owner check"),
+                dict(base, entry="GET /x", issue="I2", root_cause="other", required_privilege="public"),
+                dict(base, entry="GET /y", issue="I3", root_cause="third")]
+    (review / "findings.json").write_text(json.dumps({"findings": findings, "not_reviewed": []}))
+    seen = []
+    plan = {"I1": ("conclude", {"verdict": "refuted", "reason": "destroy checks ownership first",
+                                "path": [{"stage": "permission", "file": "api/posts.js", "line": 2,
+                                          "quote": "if (!isOwner(id))", "effect": "stops"}]}),
+            "I2": ("conclude", {"verdict": "upheld", "reason": "nothing stops it"}),  # refused: no evidence
+            "I3": ("conclude", {"verdict": "uncertain", "reason": "did not reach the model"})}
+
+    class Checker(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            if not self.script and len(messages) == 2:
+                iid = messages[1]["content"].split()[2]
+                seen.append(iid)
+                self.script = [plan[iid]]
+            return super().chat(messages, tools)
+
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: Checker([]))
+    m = verify(_cfg(workers=1), tmp_path, review, deadline=time.time() + 300)
+    assert seen == ["I2", "I1", "I3"]  # public first, then the most repeated
+    assert m["verdicts"] == {"uncertain": 2, "refuted": 1} and m["findings_refuted"] == 2
+    data = json.loads((review / "findings.json").read_text())
+    assert [f["entry"] for f in data["refuted"]] == ["DELETE /posts/:id", "DELETE /posts"]
+    assert data["refuted"][0]["verification"]["path"][0]["quote"] == "if (!isOwner(id))"
+    assert {f["issue"]: f["verification"]["verdict"] for f in data["findings"]} == {"I2": "uncertain",
+                                                                                  "I3": "uncertain"}
+    out = to_deepaudit_findings(data["findings"])
+    assert "NOT verified by the refutation check" in out[0]["description"] and out[0]["confidence"] < 0.6
+
+
+
+def test_conclude_requires_the_stages_it_claims(tmp_path):
+    _write(tmp_path, {"a.js": "validate(body)\ncan(user, 'edit')\ndb.update(body)\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+
+    def st(stage, line, quote, effect="passes"):
+        return {"stage": stage, "file": "a.js", "line": line, "quote": quote, "effect": effect}
+
+    assert tb.conclude("upheld", "x", [st("operation", 3, "db.update(body)")]).startswith(
+        "rejected: upheld needs the code of each stage the request passes, quoted: missing input_validation, "
+        "permission")
+    assert tb.conclude("upheld", "x", [st("permission", 2, "can(user, 'edit')", "stops")]).startswith(
+        "rejected: a stage you quoted stops")
+    assert tb.conclude("refuted", "x", [st("permission", 2, "can(user, 'edit')")]).startswith(
+        "rejected: refuted needs the stage")
+    assert tb.conclude("upheld", "x", [st("input_validation", 1, "validate(body)"), st("permission", 2, "nope"),
+                                       st("operation", 3, "db.update(body)")]).startswith("rejected: path: quote")
+    assert tb.conclude("upheld", "x", [st("input_validation", 1, "validate(body)"),
+                                       st("permission", 2, "can(user, 'edit')"),
+                                       st("operation", 3, "db.update(body)")]) == "concluded: upheld"

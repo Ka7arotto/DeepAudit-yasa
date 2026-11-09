@@ -634,7 +634,8 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
 
 def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
         start: float | None = None, deadline: float | None = None) -> dict:
-    """recon (reused when out/recon/entries.json exists) then review, within one wall-clock budget."""
+    """recon (reused when out/recon/entries.json exists), review, then the refutation check of every
+    reported root cause, within one wall-clock budget (the check keeps verify_share of it)."""
     start = start or time.time()
     deadline = deadline or start + cfg.time_budget_s
     ef = out / "recon" / "entries.json"
@@ -646,12 +647,16 @@ def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str 
                     hard_deadline=deadline)
     entries = json.loads(ef.read_text())
     rf = out / "recon" / "resolver.py"
-    rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", deadline,
-                rec.get("access_model"), rf.read_text() if rf.exists() else None)
+    resolver = rf.read_text() if rf.exists() else None
+    review_deadline = deadline - cfg.verify_share * (deadline - start)
+    rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", review_deadline,
+                rec.get("access_model"), resolver)
+    from .verify import verify  # verify imports this module
+    vf = verify(cfg, root, out / "review", deploy, product, rec.get("access_model"), resolver, deadline)
     tok = lambda m, k: (m or {}).get(k, 0) or 0  # noqa: E731
-    m = {"recon": rec, "review": rv,
-         "total_tokens": sum(tok(x, "prompt_tokens") + tok(x, "completion_tokens") for x in (rec, rv)),
-         "total_cached_tokens": sum(tok(x, "cached_tokens") for x in (rec, rv)),
+    m = {"recon": rec, "review": rv, "verify": vf,
+         "total_tokens": sum(tok(x, "prompt_tokens") + tok(x, "completion_tokens") for x in (rec, rv, vf)),
+         "total_cached_tokens": sum(tok(x, "cached_tokens") for x in (rec, rv, vf)),
          "total_wall_s": round(time.time() - start, 1), "time_budget_s": round(deadline - start)}
     (out / "metrics.json").write_text(json.dumps(m, indent=1, ensure_ascii=False))
     return m
