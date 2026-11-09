@@ -100,6 +100,7 @@ def _is_rate_limit(e: Exception) -> bool:
 class LLM:
     cfg: AuditConfig
     usage: Usage = field(default_factory=Usage)
+    last_finish_reason: str | None = None  # 'length' when the reply was cut by the output limit
 
     def __post_init__(self) -> None:
         from openai import OpenAI  # transitive dependency of litellm
@@ -131,6 +132,7 @@ class LLM:
             try:
                 resp = self.client.chat.completions.create(**kw)
                 self.usage.add(resp.usage, time.time() - t0)
+                self.last_finish_reason = getattr(resp.choices[0], "finish_reason", None)
                 return resp.choices[0].message
             except Exception as e:  # network / rate limit: back off and retry
                 last_err = e

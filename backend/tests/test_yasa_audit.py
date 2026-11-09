@@ -1259,3 +1259,27 @@ def test_conclude_requires_the_stages_it_claims(tmp_path):
     assert tb.conclude("upheld", "x", [st("input_validation", 1, "validate(body)"),
                                        st("permission", 2, "can(user, 'edit')"),
                                        st("operation", 3, "db.update(body)")]) == "concluded: upheld"
+
+
+def test_a_reply_cut_by_the_output_limit_is_named(tmp_path):
+    from app.services.yasa_audit.agent_loop import run_agent
+    from app.services.yasa_audit.toolbox import tool_schemas
+
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    prompts = []
+
+    class Cut(ScriptedLLM):
+        cfg = AuditConfig()
+        last_finish_reason = None
+
+        def chat(self, messages, tools=None):
+            prompts.append(messages[-1].get("content") or "")
+            if self.usage.calls == 0:
+                self.usage.calls += 1
+                self.last_finish_reason = "length"
+                return SimpleNamespace(content="", tool_calls=None)
+            self.last_finish_reason = "tool_calls"
+            return super().chat(messages, tools)
+
+    run_agent(Cut([]), tb, tool_schemas("review"), "sys", "go", 5, tmp_path / "log.jsonl")
+    assert "cut off by the output limit" in prompts[1] and "parses the registration code" in prompts[1]

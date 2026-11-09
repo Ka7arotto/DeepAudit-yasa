@@ -92,7 +92,16 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                 nudges += 1
                 if nudges > 3:
                     break
-                messages.append({"role": "user", "content": "Continue with tools; call finish when done."})
+                if getattr(llm, "last_finish_reason", None) == "length":
+                    # The provider drops a tool call that was cut by the output limit: say so, or the
+                    # model writes the same oversized call again.
+                    messages.append({"role": "user", "content": "Your last reply was cut off by the output "
+                                     f"limit ({llm.cfg.llm_max_tokens} tokens) before the tool call was "
+                                     "complete, so nothing ran. Send a shorter call: e.g. a program that "
+                                     "parses the registration code instead of listing entries by hand, or "
+                                     "several smaller calls."})
+                else:
+                    messages.append({"role": "user", "content": "Continue with tools; call finish when done."})
                 continue
             for tc in msg.tool_calls:
                 steps += 1
