@@ -1283,3 +1283,46 @@ def test_a_reply_cut_by_the_output_limit_is_named(tmp_path):
 
     run_agent(Cut([]), tb, tool_schemas("review"), "sys", "go", 5, tmp_path / "log.jsonl")
     assert "cut off by the output limit" in prompts[1] and "parses the registration code" in prompts[1]
+
+
+def test_recon_follows_up_on_dispatchers_left_unenumerated(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+
+    proj = tmp_path / "p"
+    _write(proj, {"web/Home.php": "<?php\nfunction home() { echo $_GET['q']; }\n",
+                  "api/Users.php": "<?php\nfunction users() { echo $_GET['id']; }\n"})
+    web = ("import json\nprint(json.dumps([{'route': '/home', 'handler_file': 'web/Home.php', 'handler': 'home', "
+           "'exposure': 'public'}]))")
+    api = ("import json\nprint(json.dumps([{'route': '/api/users', 'handler_file': 'api/Users.php', "
+           "'handler': 'users', 'exposure': 'public'}]))")
+    users = []
+    scripts = {
+        "access": [("record_access_model", {"authentication": "none", "authorization": "none",
+                                            "permission_mapping": "none", "principals": "anyone",
+                                            "ladder": ["anyone"], "shared_protections": "none",
+                                            "evidence": [{"file": "web/Home.php", "line": 2,
+                                                          "quote": "function home()"}]}),
+                   ("finish", {"notes": "open"})],
+        "recon": [("run_extractor", {"name": "web", "code": web}),
+                  ("check_coverage", {"request_read_pattern": r"\$_GET"}),
+                  ("finish", {"notes": "web pages and a JSON API", "unenumerated": ["API: api/*.php functions"]})],
+        "follow": [("run_extractor", {"name": "api", "code": api}),
+                   ("finish", {"notes": "web pages and a JSON API, both enumerated"})],
+    }
+
+    class Router(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            if not self.script and len(messages) == 2:
+                user = messages[1]["content"]
+                users.append(user)
+                key = ("follow" if "left these dispatchers unenumerated" in user else
+                       "access" if "controls ACCESS" in messages[0]["content"] else "recon")
+                self.script = list(scripts[key])
+            return super().chat(messages, tools)
+
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
+    now = time.time()
+    m = pipeline.recon(_cfg(), proj, tmp_path / "out", deadline=now + 900, hard_deadline=now + 1800)
+    follow = next(u for u in users if "left these dispatchers unenumerated" in u)
+    assert "- API: api/*.php functions" in follow and "extractors web" in follow
+    assert m["entries"] == 2 and m["passes"] == 2 and m["notes"].endswith("both enumerated")

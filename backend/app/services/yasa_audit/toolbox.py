@@ -214,6 +214,7 @@ class Toolbox:
         self.reconcile_groups: dict[str, list[str]] = {}  # group id -> entry ids (reconcile pass)
         self.on_resolver_installed = None  # reconcile: regroups the disagreements for a new resolver
         self.conclusion: dict | None = None  # refutation check
+        self.unenumerated: list[str] = []  # recon: dispatchers found but not enumerated yet
         self.decisions: dict[str, dict] = {}  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
@@ -721,12 +722,14 @@ class Toolbox:
             evidence = [evidence]
         return self.facts.add(str(statement), evidence if isinstance(evidence, list) else [], self.unit)
 
-    def finish(self, notes: str = "", _force: bool = False) -> str:
+    def finish(self, notes: str = "", unenumerated: Any = None, _force: bool = False) -> str:
         for cond, msg, *_ in self.finish_gates:
             if not _force and cond(self):
                 return f"not finished: {msg(self) if callable(msg) else msg}"
         self.finished = True
         self.notes = notes
+        self.unenumerated = [str(x)[:400] for x in (unenumerated or []) if str(x).strip()][:12] \
+            if isinstance(unenumerated, list) else []
         return f"finished ({len(self.findings)} findings, {len(self.cards)} cards)"
 
 
@@ -921,5 +924,10 @@ def tool_schemas(role: str) -> list[dict]:
                {"statement": s, "evidence": {"type": "array", "items": {"type": "object", "properties": {
                    "file": s, "line": i, "quote": s}}}}, ["statement", "evidence"]),
         ]
-    tools.append(fn("finish", "Call once when you are done.", {"notes": s}, []))
+    if role == "recon":
+        tools.append(fn("finish", "Call once when you are done. unenumerated: every dispatcher you found but "
+                        "did not enumerate (yet), each with where its routes are declared; another pass will "
+                        "enumerate them.", {"notes": s, "unenumerated": {"type": "array", "items": s}}, []))
+    else:
+        tools.append(fn("finish", "Call once when you are done.", {"notes": s}, []))
     return tools

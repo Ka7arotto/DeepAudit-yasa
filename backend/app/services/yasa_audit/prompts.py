@@ -44,7 +44,9 @@ There is no list of frameworks to pick from. Work it out from this project's own
      the exposure right?
    - check_coverage with a pattern for how THIS project reads request data: read sites that no entry
      reaches are usually a dispatcher or an area you have not covered yet.
-5. Call finish with notes that explain each dispatcher in two or three sentences.
+5. Call finish with notes that explain each dispatcher in two or three sentences, and list in
+   unenumerated every dispatcher you found but did not enumerate, with where its routes are declared:
+   another pass will enumerate them.
 Do not hand-list hundreds of routes; write extractors. Tests, fixtures and examples are not entries.
 Use at most {budget} tool calls.
 {context}"""

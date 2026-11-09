@@ -172,7 +172,7 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
             for tc in (msg.tool_calls or []) if msg else []:
                 if tc.function.name == "finish":
                     args = parse_args(tc.function.arguments)
-                    tb.finish(**{k: v for k, v in args.items() if k == "notes"}, _force=True)
+                    tb.finish(**{k: v for k, v in args.items() if k in ("notes", "unenumerated")}, _force=True)
                     log.write(json.dumps({"t": round(time.time() - t0, 1), "role": "tool", "name": "finish",
                                           "args": args, "content": "forced finish"}, ensure_ascii=False) + "\n")
                     break

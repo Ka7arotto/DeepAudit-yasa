@@ -301,6 +301,7 @@ def _reconcile(cfg: AuditConfig, out: Path, entries: list[dict], holder: dict, a
 
 
 RECONCILE_S = 240  # wall-clock slice of the reconcile pass, outside the agents' recon share
+RECON_EXTENSION = 0.10  # share of the remaining budget follow-up recon passes may add
 
 
 def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
@@ -308,6 +309,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
     """Two agents in parallel: one maps the attack surface (entries.json), one the access-control model.
     The model is sent to the surface agent as soon as it is recorded, for the entries' exposure."""
     out.mkdir(parents=True, exist_ok=True)
+    t_recon = time.time()
     try:
         snapshot_codegraph(root, out)
     except Exception:
@@ -359,6 +361,28 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         res = {k: (res.get(k, 0) + res2.get(k, 0)) if isinstance(res2.get(k), (int, float)) and k != "finished"
                else res2.get(k) for k in res2}
         passes = 2
+    # Dispatchers the agent found but left unenumerated: follow-up passes, each in a fresh context, given
+    # only what is left. A missing dispatcher hides a whole part of the surface, so these may run past
+    # the recon share by up to RECON_EXTENSION of the remaining budget.
+    extend_to = deadline if hard_deadline is None or deadline is None else \
+        min(hard_deadline, deadline + RECON_EXTENSION * (hard_deadline - t_recon))
+    while tb.unenumerated and passes < 4 and (extend_to is None or time.time() < extend_to - 120):
+        left, n_before = tb.unenumerated, len(tb.entries())
+        budget3 = max(10, cfg.recon_budget // 2)
+        tb.finished, tb.unenumerated = False, []
+        res3 = run_agent(
+            llm, tb, tool_schemas("recon"), recon_prompt(budget3, deploy, product),
+            f"Earlier passes enumerated {n_before} entries with the extractors "
+            f"{', '.join(tb.extractors) or '(none)'} and left these dispatchers unenumerated:\n"
+            + "\n".join(f"- {x}" for x in left) + f"\n\nTheir notes:\n{tb.notes}\n\nWrite one extractor per "
+            "dispatcher above (keep the existing extractors), run each with run_extractor, fix what the checks "
+            "report, then finish with the notes updated and unenumerated listing any dispatcher still left.",
+            budget3, out / f"transcript-{passes + 1}.jsonl", deadline=extend_to)
+        passes += 1
+        res = {k: (res.get(k, 0) + res3.get(k, 0)) if isinstance(res3.get(k), (int, float)) and k != "finished"
+               else res3.get(k) for k in res3}
+        if len(tb.entries()) == n_before:  # no progress: stop rather than loop
+            break
     # the review needs the model: wait for the access agent within the deadline
     holder["done"].wait(timeout=None if deadline is None else max(0.0, deadline + 60 - time.time()))
     entries = tb.entries()
