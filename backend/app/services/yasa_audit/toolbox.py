@@ -59,7 +59,12 @@ def verify_evidence(root: Path, evidence: list[dict]) -> str | None:
         line, quote = int(ev.get("line") or 0), _norm(str(ev.get("quote") or ""))
         if not quote:
             return "each evidence item needs a quote copied from the code"
-        window = _norm(" ".join(lines[max(0, line - 4):line + 3]))
+        # A few lines around the cited line, extended so that a quote spanning several lines (a route
+        # registration with its middleware) fits.
+        end = line + 3
+        while end < len(lines) and end - line < 60 and len(_norm(" ".join(lines[max(0, line - 1):end]))) < len(quote) + 40:
+            end += 1
+        window = _norm(" ".join(lines[max(0, line - 4):end]))
         if quote not in window:
             return f"quote not found near {ev.get('file')}:{line}"
     return None
@@ -664,8 +669,9 @@ class Toolbox:
                     "and check that it really serves the path you report.")
         if not str(finding.get("root_cause") or "").strip() and not finding.get("same_as"):
             return "rejected: root_cause is required (one sentence: the underlying flaw), or same_as=<issue id>"
-        if len(_norm(str(finding.get("root_cause") or ""))) > 240:
-            return "rejected: root_cause is one sentence of at most 240 characters"
+        rc = _norm(str(finding.get("root_cause") or ""))
+        if len(rc) > 240:  # a key for grouping findings, not the explanation: keep its start
+            finding["root_cause"] = rc[:239].rsplit(" ", 1)[0] + "…"
         if finding.get("documented_intent"):
             di = finding["documented_intent"]
             err = verify_evidence(self.root, [di] if isinstance(di, dict) else di)

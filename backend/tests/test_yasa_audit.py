@@ -1113,3 +1113,24 @@ def test_access_model_carries_shared_protections_and_cards_quote_the_registratio
         {"declared_code": "r.get('/posts', auth, posts.browse);"}
     assert _declared_code(tmp_path, {"declared_at": "routes.js:9"}) == {}
     assert _declared_code(tmp_path, {"declared_at": "nofile.js:1"}) == {}
+
+
+def test_evidence_quotes_may_span_a_multi_line_registration_and_long_root_causes_are_cut(tmp_path):
+    from app.services.yasa_audit.toolbox import verify_evidence
+
+    _write(tmp_path, {"routes.js": "\n" * 19 + "  // Webmentions\n  router.post(\n    '/receive',\n"
+                                    "    bodyParser.urlencoded({ extended: true, limit: '64kb' }),\n"
+                                    "    http(api.mentions.receive),\n  );\n  return router;\n"})
+    quote = ("router.post(\n    '/receive',\n    bodyParser.urlencoded({ extended: true, limit: '64kb' }),\n"
+             "    http(api.mentions.receive),\n  );")
+    assert verify_evidence(tmp_path, [{"file": "routes.js", "line": 21, "quote": quote}]) is None
+    assert verify_evidence(tmp_path, [{"file": "routes.js", "line": 21, "quote": "router.get("}]) is not None
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out", unit="E1")
+    long_rc = "The receiver passes the attacker's URL to the client " + "and more words " * 30
+    out = tb.report_finding(vuln_type="SSRF", cwe="CWE-918", sink_file="routes.js", sink_line=22, source="url",
+                            entry="POST /receive", required_privilege="public", verdict="likely",
+                            impact="server-side request", root_cause=long_rc,
+                            route_evidence={"file": "routes.js", "line": 21, "quote": quote})
+    assert out == "recorded #1"
+    rc = tb.findings[0]["root_cause"]
+    assert len(rc) <= 240 and rc.endswith("…") and rc.startswith("The receiver passes")

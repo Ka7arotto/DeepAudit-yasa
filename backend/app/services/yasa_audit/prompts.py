@@ -67,7 +67,8 @@ Find and read, with the navigation tools:
 - what is public by default;
 - the protections every request or outgoing operation passes whatever the handler does: input
   validation in the framework, output filtering, the wrappers used for outbound HTTP, file paths,
-  queries and templates (file:line). Reviewers judge each handler with these in mind.
+  queries and templates; for each, what it guarantees and where that is enforced (file:line), read
+  from its code. Reviewers judge each handler with these in mind.
 Then call record_access_model (each statement backed by evidence quotes from the code).
 If the decision can be computed from the request, its handler and the code or configuration (route
 tables, role and permission definitions, middleware or filter order, annotations, the checks a handler
@@ -124,7 +125,8 @@ at declared_at: cite it when it is that registration).
 
 Before you report, follow the input to the code that performs the harmful operation (the query run, the
 request sent, the file written, the data returned) and check the shared protections of the access model
-and any guard on the way.
+and any guard on the way. A claim that a protection is missing needs the code that shows it: open the
+wrapper or helper the input passes through rather than assuming what it does.
 
 Who the attacker is: a remote user at the entry's exposure level. Input that only an operator controls
 (CLI arguments, deployment config files, installer steps) is trusted unless the product context says
