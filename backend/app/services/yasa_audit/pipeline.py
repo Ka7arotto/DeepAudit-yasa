@@ -78,7 +78,8 @@ def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
     """Works out the project-wide access-control model; publishes it in holder['model']."""
     tb = Toolbox(cfg, root, out, unit="access")
     tb.finish_gates = [(lambda t: t.access_model is None,
-                        "record_access_model first (how requests are authenticated and authorized)")]
+                        "record_access_model first (how requests are authenticated and authorized)",
+                        ["record_access_model"])]
     llm = LLM(cfg)
 
     def missing(t: Toolbox) -> list[str]:
@@ -95,7 +96,10 @@ def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
                                   reminders=[owed])
     except Exception as e:  # the surface agent and the review still run without a model
         holder["error"] = f"{type(e).__name__}: {e}"
-    holder["model"], holder["llm"], holder["resolver"], holder["tb"] = tb.access_model, llm, tb.resolver_code, tb
+    model = tb.access_model
+    if model is None and (tb.notes or "").strip():  # still better than nothing for the reviewers
+        model = {"unverified_notes": tb.notes[:4000]}
+    holder["model"], holder["llm"], holder["resolver"], holder["tb"] = model, llm, tb.resolver_code, tb
     holder["done"].set()
 
 
@@ -277,7 +281,8 @@ def _reconcile(cfg: AuditConfig, out: Path, entries: list[dict], holder: dict, a
     tb.on_resolver_installed = regroup
     tb.finish_gates = [(lambda t: any(g not in t.decisions for g in t.reconcile_groups),
                         lambda t: "settle every group first; undecided: "
-                                  + ", ".join(g for g in t.reconcile_groups if g not in t.decisions))]
+                                  + ", ".join(g for g in t.reconcile_groups if g not in t.decisions),
+                        ["settle"])]
     llm = holder.get("llm") or LLM(cfg)
     settle_now = (lambda steps, t: steps >= cfg.reconcile_budget // 2 and any(g not in t.decisions
                                                                                for g in t.reconcile_groups),
@@ -323,7 +328,8 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         return bool(regressions)
 
     tb.finish_gates = [(lambda t: (t.extractors or t.manual) and t.coverage is None,
-                        "run check_coverage once with a pattern for how this project reads request data"),
+                        "run check_coverage once with a pattern for how this project reads request data",
+                        ["check_coverage"]),
                        (regressed, lambda t: "; ".join(regressions) + ". Fix the regression and run the extractor "
                         "again, or finish again if the smaller result is the right one.")]
     llm = LLM(cfg)

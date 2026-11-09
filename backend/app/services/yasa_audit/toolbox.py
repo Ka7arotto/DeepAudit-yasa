@@ -691,7 +691,7 @@ class Toolbox:
         return self.facts.add(str(statement), evidence if isinstance(evidence, list) else [], self.unit)
 
     def finish(self, notes: str = "", _force: bool = False) -> str:
-        for cond, msg in self.finish_gates:
+        for cond, msg, *_ in self.finish_gates:
             if not _force and cond(self):
                 return f"not finished: {msg(self) if callable(msg) else msg}"
         self.finished = True

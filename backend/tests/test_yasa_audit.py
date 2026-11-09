@@ -1134,3 +1134,35 @@ def test_evidence_quotes_may_span_a_multi_line_registration_and_long_root_causes
     assert out == "recorded #1"
     rc = tb.findings[0]["root_cause"]
     assert len(rc) <= 240 and rc.endswith("…") and rc.startswith("The receiver passes")
+
+
+def test_budget_end_offers_the_tools_a_closed_gate_needs(tmp_path):
+    from app.services.yasa_audit.agent_loop import run_agent
+    from app.services.yasa_audit.toolbox import tool_schemas
+
+    _write(tmp_path, {"Sec.java": "class Sec {\n  boolean allowed() { return true; }\n}\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out", unit="access")
+    tb.finish_gates = [(lambda t: t.access_model is None, "record_access_model first", ["record_access_model"])]
+    seen_tools, prompts = [], []
+
+    class LLM(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            seen_tools.append(sorted(t["function"]["name"] for t in tools or []))
+            prompts.append(messages[-1].get("content") or "")
+            return super().chat(messages, tools)
+
+    model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "anon < admin",
+             "evidence": [{"file": "Sec.java", "line": 2, "quote": "allowed()"}]}
+    llm = LLM([("list_dir", {"path": "."})] * 8 + [("record_access_model", model)])
+    res = run_agent(llm, tb, tool_schemas("access"), "sys", "go", 2, tmp_path / "log.jsonl")
+    assert any("Still required before you can finish: record_access_model first" in p for p in prompts)
+    assert seen_tools[-2] == ["record_access_model"]  # the closed gate's tool only
+    assert "Tool budget used up. Before finishing" in prompts[-2]
+    assert tb.access_model is not None and res["finished"]  # then the finish-only turn
+
+
+def test_access_notes_reach_reviewers_when_no_model_was_recorded():
+    from app.services.yasa_audit.prompts import access_model_text
+
+    text = access_model_text({"unverified_notes": "ACCESS MODEL: session cookie; canThis(...) in pipeline"})
+    assert text.startswith("(the access agent ran out of budget") and "canThis(...)" in text

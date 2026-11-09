@@ -167,6 +167,9 @@ def access_model_text(model: dict | None) -> str:
 def _access_model_text(model: dict | None) -> str:
     if not model:
         return "(no access model was recorded: work out who can call this entry from its declaration and code)"
+    if set(model) == {"unverified_notes"}:
+        return ("(the access agent ran out of budget before recording a verified model; its notes follow, "
+                "unverified: check what you rely on)\n" + str(model["unverified_notes"]))
     rows = [f"- {k.replace('_', ' ')}: {model[k]}" for k in ("authentication", "authorization",
                                                             "permission_mapping", "principals",
                                                             "public_by_default", "shared_protections")
