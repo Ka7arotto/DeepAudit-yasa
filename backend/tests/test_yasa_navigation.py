@@ -1,4 +1,4 @@
-"""A slow native child must not survive navigation initialization's timeout."""
+"""Building the code index: bounded process tree, diagnostics kept, incremental when complete."""
 import os
 import subprocess
 import sys
@@ -13,7 +13,7 @@ def _cli(tmp_path, body):
     path = tmp_path / "mock-mcp"
     path.write_text(f"#!{sys.executable}\n{body}")
     path.chmod(0o755)
-    return AuditConfig(yasamcp_bin=str(path))
+    return AuditConfig(codegraph_bin=str(path))
 
 
 def test_navigation_timeout_stops_native_child(tmp_path):
@@ -56,3 +56,22 @@ def test_navigation_failure_reports_diagnostic_path(tmp_path):
     with pytest.raises(RuntimeError, match="exited with code 3; log:"):
         init_navigation(cfg, tmp_path, timeout_s=5)
     assert "parser failed" in (tmp_path / ".yasa/navigation-init.log").read_text()
+
+
+def test_navigation_picks_init_index_or_sync(tmp_path):
+    import sqlite3
+    cfg = _cli(tmp_path, "import sys\nprint('args', sys.argv[1:])\n")
+    proj = tmp_path / "p"
+    proj.mkdir()
+    init_navigation(cfg, proj, timeout_s=5)
+    assert f"args ['init', '{proj}']" in (proj / ".yasa/navigation-init.log").read_text()
+    (proj / ".codegraph").mkdir()  # an index that was never completed is rebuilt
+    init_navigation(cfg, proj, timeout_s=5)
+    assert "args ['index'" in (proj / ".yasa/navigation-init.log").read_text()
+    con = sqlite3.connect(proj / ".codegraph/codegraph.db")
+    con.execute("create table project_metadata (key text, value text)")
+    con.execute("insert into project_metadata values ('index_state', 'complete')")
+    con.commit()
+    con.close()
+    init_navigation(cfg, proj, timeout_s=5)
+    assert "args ['sync'" in (proj / ".yasa/navigation-init.log").read_text()

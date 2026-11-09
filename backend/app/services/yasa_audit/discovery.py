@@ -1,6 +1,6 @@
 """Evidence from codegraph's index for the route-reconnaissance agent.
 
-codegraph (written by `yasa-mcp init`, or `codegraph init` directly) resolves routes for many
+codegraph (`codegraph init`, run by runner.init_navigation) resolves routes for many
 frameworks and records calls / imports / references between files. Nothing here decides what the
 attack surface is: the recon agent reads this as one source of evidence among the directory layout,
 the code itself and the navigation tools, and decides.
@@ -69,7 +69,7 @@ def codegraph_db(root: Path) -> Path | None:
 
 
 def snapshot_codegraph(root: Path, dest_dir: Path) -> Path | None:
-    """Copy the live index (WAL mode, still opened by a background yasa-mcp init) into dest_dir.
+    """Copy the live index (WAL mode, possibly still open by the indexer) into dest_dir.
 
     Later reads use the copy, so they neither wait on nor race with the init process. Returns None
     (and the live index stays in use) when there is no complete index or the copy fails.
@@ -116,7 +116,7 @@ def codegraph_ready(root: Path) -> bool:
 
 
 def ensure_codegraph(codegraph_bin: str, root: Path, timeout_s: int = 300) -> Path | None:
-    """Build codegraph's index directly when yasa-mcp init did not leave one."""
+    """Build codegraph's index when there is none yet."""
     if (db := codegraph_db(root)) is not None:
         return db
     if not Path(codegraph_bin).exists():

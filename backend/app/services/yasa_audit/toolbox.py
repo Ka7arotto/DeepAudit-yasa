@@ -1,7 +1,7 @@
 """Tools exposed to the agents.
 
-- Navigation: list_dir / read_file / grep (ripgrep) and yasa-mcp queries (functions, callers, call graph,
-  route -> handler, symbol search), answered from codegraph while YASA's call graph is not built.
+- Navigation: list_dir / read_file / grep (ripgrep) and code-index queries (functions, callers, call graph,
+  symbol search), answered from codegraph's index (see graph.py).
 - Recon: codegraph's route evidence, `run_extractor` (the agent writes a small program that enumerates
   the project's entries; the tool runs it and checks the result), `check_coverage` (are the places
   that read request data reachable from the entries found so far?).
@@ -218,35 +218,21 @@ class Toolbox:
             raise ValueError("path escapes project root")
         return p
 
-    def _mcp(self, args: list[str], timeout: int = 60) -> str:
-        cmd = [self.cfg.yasamcp_bin, *args, "-p", str(self.root), "-j"]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return "error: navigation query timed out"
-        except FileNotFoundError:
-            return "error: yasa-mcp is not installed (see backend/scripts/setup_yasa.sh)"
-        out = (r.stdout or "") + ("\n" + r.stderr[-1500:] if r.returncode and r.stderr else "")
-        return clip(out.strip() or "(no result)")
+    def _graph(self):
+        """codegraph's index of the project, or None (then agents use grep / read_file)."""
+        from .discovery import codegraph_db
+        from .graph import CodeGraph
+        db = codegraph_db(self.root)
+        return CodeGraph(db, self.root) if db is not None else None
 
-    def _yasa_index_ready(self) -> bool:
-        """yasa-mcp's func/callers/callgraph need the YASA call graph written by init."""
-        d = self.root / ".yasa" / "yasamcp"
-        return (d / "yasa.db").exists() and (d / "fingerprint_cache.json").exists()
-
-    def _codegraph(self, args: list[str], timeout: int = 60) -> str:
-        """Same questions answered from codegraph's index (built in seconds even for large projects)."""
-        if not (self.root / ".codegraph" / "codegraph.db").exists():
-            return "error: no navigation index for this project (use grep / read_file)"
-        cmd = [self.cfg.codegraph_bin, *args, "-p", str(self.root)]
+    def _ask_graph(self, question: str, *args: Any, **kw: Any) -> str:
+        g = self._graph()
+        if g is None:
+            return "error: no code index for this project (use grep / read_file)"
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return "error: navigation query timed out"
-        except FileNotFoundError:
-            return "error: codegraph is not installed (see backend/scripts/setup_yasa.sh)"
-        out = (r.stdout or "") + ("\n" + r.stderr[-1500:] if r.returncode and r.stderr else "")
-        return clip("[codegraph]\n" + (out.strip() or "(no result)"))
+            return clip(getattr(g, question)(*args, **kw))
+        except Exception as e:  # a damaged or still-written index must not end the agent's turn
+            return f"error: code index query failed ({type(e).__name__}: {e}); use grep / read_file"
 
     # ---------- navigation ----------
     def list_dir(self, path: str = ".", depth: int = 2) -> str:
@@ -297,40 +283,16 @@ class Toolbox:
         return clip("\n".join(rows[: int(max_results)]) + more or "(no matches)")
 
     def find_function(self, name: str, file_path: str = "", detail: str = "summary") -> str:
-        if not self._yasa_index_ready():
-            return self._codegraph(["node", name])
-        args = ["func", "--name", name, "--detail", detail, "--max-results", "10"]
-        if file_path:
-            args += ["--file-path", file_path]
-        return self._mcp(args)
+        return self._ask_graph("find_function", str(name), str(file_path or ""), str(detail or "summary"))
 
     def find_callers(self, name: str, file_path: str = "", line: int = 0) -> str:
-        if not self._yasa_index_ready():
-            return self._codegraph(["callers", name, "-l", "30"])
-        args = ["callers", name, "--max-results", "30"]
-        if file_path:
-            args += ["--file-path", file_path]
-        if line:
-            args += ["--line", str(line)]
-        return self._mcp(args)
+        return self._ask_graph("find_callers", str(name), str(file_path or ""))
 
     def call_graph(self, name: str, depth: int = 2, file_path: str = "") -> str:
-        if not self._yasa_index_ready():
-            return self._codegraph(["callees", name, "-l", "30"])
-        args = ["callgraph", name, "--depth", str(depth), "--maxcallees", "8"]
-        if file_path:
-            args += ["--file-path", file_path]
-        return self._mcp(args)
-
-    def find_api(self, api_name: str) -> str:
-        if not self._yasa_index_ready():
-            return self._codegraph(["query", api_name, "-l", "20"])
-        return self._mcp(["api", api_name, "--max-results", "20"])
+        return self._ask_graph("call_graph", str(name), int(depth or 2), str(file_path or ""))
 
     def search_symbol(self, query: str) -> str:
-        if not self._yasa_index_ready():
-            return self._codegraph(["query", query, "-l", "20"])
-        return self._mcp(["search", query, "--max-results", "20"])
+        return self._ask_graph("search_symbol", str(query))
 
     # ---------- recon ----------
     def codegraph_routes(self, contains: str = "", limit: int = 40) -> str:
@@ -738,13 +700,16 @@ def tool_schemas(role: str) -> list[dict]:
         fn("grep", "Ripgrep regex over the project, case-sensitive ((?i) for insensitive). Returns "
                    "file:line:text. glob is relative to the project root, e.g. app/**/*.php or *.xml.",
            {"pattern": s, "glob": s, "max_results": i}, ["pattern"]),
-        fn("find_function", "Find a function definition by name. detail=full returns the body.",
+        fn("find_function", "Find a function or method definition by name (or a qualified name such as "
+           "Class::method); file_path narrows it. detail=full includes the body.",
            {"name": s, "file_path": s, "detail": {"type": "string", "enum": ["summary", "full"]}}, ["name"]),
-        fn("find_callers", "Find call sites of a function.", {"name": s, "file_path": s, "line": i}, ["name"]),
-        fn("call_graph", "Call graph (callees) of a function to a given depth.",
-           {"name": s, "depth": i, "file_path": s}, ["name"]),
-        fn("find_api", "Map an HTTP route / API name to its implementing function.", {"api_name": s},
-           ["api_name"]),
+        fn("find_callers", "Call sites of a function or method (file_path = the file that defines it), "
+           "including calls made through an interface or parent method it implements.",
+           {"name": s, "file_path": s}, ["name"]),
+        fn("call_graph", "What a function calls, as a tree with file:line; calls to interface or abstract "
+           "methods show their implementations. From a static index: calls on untyped or dynamic receivers can "
+           "be missing or attributed to a same-named function.", {"name": s, "depth": i, "file_path": s},
+           ["name"]),
         fn("search_symbol", "Search functions/classes/files by name.", {"query": s}, ["query"]),
     ]
     entry = {"type": "object", "properties": {

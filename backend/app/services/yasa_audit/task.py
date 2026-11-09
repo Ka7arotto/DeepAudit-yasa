@@ -1,7 +1,7 @@
 """Run a DeepAudit agent task in YASA mode (task.audit_scope["mode"] == "yasa").
 
 Stages, all bounded by one wall-clock budget (task.timeout_seconds, default 30 min):
-  1. yasa-mcp navigation cache (codegraph index first; YASA's call graph continues in the background)
+  1. code index (codegraph: calls, inheritance, routes; seconds to a minute)
   2. route reconnaissance: an agent works out the project's entry points
   3. one review per entry: scenario, access control, plausible risks traced to a verdict
 Findings are saved through the regular agent_tasks._save_findings path, so the existing task pages,
@@ -17,14 +17,13 @@ import fnmatch
 import logging
 import os
 import shutil
-import threading
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import AuditConfig
-from .discovery import codegraph_ready, snapshot_codegraph
+from .discovery import snapshot_codegraph
 from .runner import check_tools, init_navigation, run_entry_audit, to_deepaudit_findings
 
 logger = logging.getLogger(__name__)
@@ -137,27 +136,19 @@ async def execute_yasa_task(
 
     if dropped:
         await emitter.emit_info(f"YASA scope: {dropped} files left out by exclude patterns / target files")
-    await emitter.emit_phase_start("indexing", "🧭 YASA: building navigation cache")
+    await emitter.emit_phase_start("indexing", "🧭 YASA: building code index")
     task.current_phase = AgentTaskPhase.INDEXING
     await db.commit()
-    # yasa-mcp init writes codegraph's index first (seconds to a minute even for large projects),
-    # then YASA's call graph, which can take longer than the whole budget on large code bases.
-    # Stages start once the codegraph index is complete; navigation uses the YASA index when it
-    # appears and codegraph until then. Init keeps running in the background and is stopped at the end.
-    init_stop = threading.Event()
-    init_job = asyncio.ensure_future(asyncio.to_thread(
-        init_navigation, cfg, root, int(budget_s * 0.8), init_stop.is_set))
-    waited = 0
-    while not init_job.done() and not codegraph_ready(root) and waited < min(300, budget_s // 4):
-        await asyncio.sleep(2)
-        waited += 2
-    if init_job.done() and init_job.exception():
-        logger.warning("yasa-mcp init failed: %s", init_job.exception())
-        await emitter.emit_warning(f"yasa-mcp init failed, navigation tools limited: {init_job.exception()}")
-    elif not init_job.done():
-        await emitter.emit_info(f"🧭 codegraph index ready after {waited}s; YASA call graph continues "
-                                "in the background")
-    try:  # one consistent copy for all stages; the live index stays open by the background init
+    # codegraph indexes even large projects in seconds to a minute; without an index the agents
+    # still work with grep / read_file, so a failure is reported and the stages go on.
+    t0 = time.time()
+    try:
+        await asyncio.to_thread(init_navigation, cfg, root, min(600, budget_s // 4), is_cancelled)
+        await emitter.emit_info(f"🧭 code index ready after {time.time() - t0:.0f}s")
+    except Exception as e:
+        logger.warning("code index failed: %s", e)
+        await emitter.emit_warning(f"code index failed, navigation limited to grep/read_file: {e}")
+    try:  # one consistent copy for all stages
         await asyncio.to_thread(snapshot_codegraph, root, out)
     except Exception as e:
         logger.warning("codegraph snapshot failed: %s", e)
@@ -169,14 +160,7 @@ async def execute_yasa_task(
                                                f"budget {budget_s // 60} min")
     task.current_phase = AgentTaskPhase.ANALYSIS
     await db.commit()
-    try:
-        r = await asyncio.to_thread(run_entry_audit, cfg, root, out, deploy, product, start, deadline)
-    finally:
-        init_stop.set()
-        try:
-            await init_job
-        except Exception as e:  # already reported, or a late failure that no longer matters
-            logger.info("yasa-mcp init ended: %s", e)
+    r = await asyncio.to_thread(run_entry_audit, cfg, root, out, deploy, product, start, deadline)
     if is_cancelled():
         raise asyncio.CancelledError("任务已取消")
     rec, rv = r["recon"], r["review"]

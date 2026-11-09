@@ -12,8 +12,7 @@ do not depend on the framework.
 ## recon
 
 The agent starts from the directory layout, codegraph's route evidence and the navigation tools
-(yasa-mcp: functions, callers, call graph, symbol search; answered from codegraph until YASA's call
-graph is built). It works out where requests come in and how the dispatch chooses the code to run,
+(functions, callers, call graph, symbol search; answered from codegraph's index by `graph.py`). It works out where requests come in and how the dispatch chooses the code to run,
 for every dispatcher the project has (pages, REST, GraphQL, admin area, ...).
 
 It then writes a small **extractor program** per dispatcher and runs it with `run_extractor`. The
@@ -62,10 +61,10 @@ reasoning tokens, wall time).
 ## Usage
 
 ```bash
-bash backend/scripts/setup_yasa.sh        # yasa-mcp bundle + codegraph + ripgrep into ~/.yasamcp
+bash backend/scripts/setup_yasa.sh        # codegraph + ripgrep into ~/.yasamcp/tools
 export LLM_BASE_URL=... LLM_API_KEY=... LLM_MODEL=...   # OpenAI-compatible with tool calling
 cd backend
-uv run python -m app.services.yasa_audit init  /path/to/project            # navigation index
+uv run python -m app.services.yasa_audit init  /path/to/project            # codegraph index
 uv run python -m app.services.yasa_audit recon /path/to/project --out out/ # surface only
 uv run python -m app.services.yasa_audit run   /path/to/project --out out/ \
        --deploy "Linux, nginx, PHP 8.3" \
@@ -79,3 +78,18 @@ uv run python -m app.services.yasa_audit run   /path/to/project --out out/ \
 
 Automatic YASA taint rules (sources, sinks, sanitizers) and engine runs. The earlier rule-building,
 residual-sink and grouped-triage pipeline is in git history (before `feat/entry-first-review`).
+
+## Code index
+
+`codegraph` (tree-sitter, many languages) indexes the project in seconds to a minute: calls,
+inheritance, containment and the routes of common frameworks. `graph.py` answers the navigation tools
+from it with read-only SQL. Calls to an interface or abstract method are followed to the
+implementations, callers of an implementation include calls through its interface, and a call on
+`this` / `self` / `super` / `parent` is resolved in the caller's own class hierarchy (a parent named by
+its short name is taken from the file's imports). Calls whose receiver type is not visible statically
+may still be missing or attributed to a same-named function, so agents treat the index as navigation
+and the code as the evidence.
+
+The YASA engine's index is no longer built: on PHP it resolved 3% of the calls codegraph resolves
+(inherited methods were missing), on TypeScript it produced nothing after ten minutes, and on Java it
+was not better than codegraph plus the implementation step above, while costing 1-10 minutes per run.

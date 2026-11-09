@@ -1,10 +1,11 @@
 # DeepAudit-yasa
 
-基于 [DeepAudit](https://github.com/lintsinghua/DeepAudit) v3 的分支，新增 **YASA 混合审计**：由 Agent 为目标项目编写
-[YASA-Engine](https://github.com/antgroup/YASA-Engine) 污点规则并运行引擎，再在多个小上下文里分组复核引擎结果和残余危险调用；
-同时用确定性的路由表做权限（访问控制）审计。整个审计有时间预算，默认 30 分钟内完成；超出预算没审到的候选会列出来。
+基于 [DeepAudit](https://github.com/lintsinghua/DeepAudit) v3 的分支，审计方式是**入口优先**：
+Agent 先侦查项目的攻击面（路由入口和鉴权模型），再对每个入口在独立的上下文里审查——场景、权限、按功能推出的漏洞假设并追踪到结论。
+没有按框架写的规则、路由族或危险调用清单；项目知识来自 Agent 自己写的提取程序、入口卡片和经核实的事实。
+整个审计有时间预算，默认 30 分钟；超出预算没审到的入口会列出来。
 
-本分支只保留上游的平台部分（登录、项目管理、任务、发现、报告、Web 界面），YASA 混合审计是唯一的审计模式。
+本分支只保留上游的平台部分（登录、项目管理、任务、发现、报告、Web 界面），入口优先审计是唯一的审计模式。
 上游的 Multi-Agent 审计、RAG、Docker 沙箱、快速扫描、即时分析、提示词/规则管理已移除。
 
 ---
@@ -22,45 +23,40 @@
 
 ## 与上游的区别
 
-| | 上游 DeepAudit（Multi-Agent，已移除） | YASA 混合（本分支） |
+| | 上游 DeepAudit（Multi-Agent，已移除） | 入口优先（本分支） |
 |---|---|---|
-| 思路 | Orchestrator 调度 Recon / Analysis / Verification Agent 自主审计 | 固定流水线：建规则 → 引擎 → 分组复核；并行做权限审计 |
-| 数据流 | Agent 自己沿 source → sink 追踪 | YASA 引擎找污点路径，Agent 只负责"写规则"和"判定" |
-| 权限 | 依赖 Agent 自行发现 | 确定性路由表（Servlet/JSP、Spring、Express、Flask/FastAPI/Django、Laravel/普通 PHP 脚本）+ 同类入口对比 |
-| 验证 | Docker 沙箱执行 PoC | 不执行，结论为静态判定（证据：文件:行 路径、引擎结果编号） |
+| 思路 | Orchestrator 调度 Recon / Analysis / Verification Agent 自主审计 | 两段：侦查攻击面 → 逐入口审查（并发） |
+| 入口 | 依赖 Agent 自行发现 | Agent 读懂分派逻辑后写提取程序枚举入口；与框架无关的检查（处理代码能定位、抽样回读、读请求代码的覆盖率） |
+| 权限 | 依赖 Agent 自行发现 | 鉴权 Agent 记录鉴权模型并写"谁能调用"解析程序，与入口清单的暴露面对账；审查者逐入口判定 |
+| 验证 | Docker 沙箱执行 PoC | 不执行，结论为静态判定（证据：路由原文、文件:行） |
 | 时间 | 不固定 | 硬预算，默认 30 分钟 |
-| 语言 | 不限 | Java（含 JSP）、JavaScript / TypeScript、Python、PHP（PHP 不用引擎，见下） |
-| 依赖 | LLM、Embedding（RAG）、Docker（沙箱） | LLM（OpenAI 兼容、支持 tool calling）、YASA 工具，**不需要** RAG 和 Docker |
+| 依赖 | LLM、Embedding（RAG）、Docker（沙箱） | LLM（OpenAI 兼容、支持 tool calling）、codegraph 与 ripgrep，**不需要** RAG 和 Docker |
 
-YASA 混合审计的流程（`backend/app/services/yasa_audit/`）：
+流程（`backend/app/services/yasa_audit/`）：
 
 ```
-            ┌─ 数据流 ─────────────────────────────────────────────────────────────┐
-            │ build：Agent 读代码 + playbook → 写 ruleConfig → 运行 YASA（≤2 次）    │
- yasa-mcp   │ triage：引擎结果 + 残余危险调用（L0 清单 − 引擎已覆盖 − 常量参数）       │
- 导航缓存 ──┤         按文件分组，每组一个新的小上下文，按严重程度优先调度              │
-            ├─ 权限 ───────────────────────────────────────────────────────────────┤
-            │ 路由表 + 全局守卫 → 每 3 个文件一组复核（每组都带完整路由表做对比）      │
-            └──────────────────────────────────────────────────────────────────────┘
-                         ↓ 结果写入 DeepAudit 任务（发现、事件流、报告）
+ codegraph 代码索引（调用、继承、路由；几秒到一分钟）
+        │
+ 侦查 ──┼─ 入口 Agent：读目录与分派代码 → 写提取程序 → 入口清单（含暴露面）
+        ├─ 鉴权 Agent：鉴权模型 + "谁能调用"解析程序
+        └─ 对账：两份权限判读的分歧逐组裁决
+        │
+ 审查 ── 每个处理函数一个新上下文，按暴露面排序、并发；已核实事实与根因在单元间实时共享
+        ↓ 结果写入 DeepAudit 任务（发现、事件流、报告）
 ```
 
 ## 实测结果
 
-模型 deepseek-flash（temperature 0.1），YASA 0.2.30。基准、真值与评分脚本在 [`backend/benchmarks/yasa_audit/`](backend/benchmarks/yasa_audit/README.md)。
+模型 deepseek-flash，30 分钟预算（大项目在审查中途停止）。漏洞细节按负责任披露流程处理，这里不公开。
 
-| 目标 | 代码量 | 数据流召回 | 权限召回 | 耗时 | Token |
-|---|---|---|---|---|---|
-| Hospital-Management-System（Java Servlet + JSP） | ~1.9k LOC | 13/13，负样本 0 命中 | 8/8 | 3.8 min | 1.2 M |
-| OWASP Juice Shop 后端（TypeScript / Express） | ~10k LOC | 16/18，负样本 0 命中 | — | 11.3 min | 3.0 M |
-| PowerJob v5.1.2（Java / Spring） | ~45k LOC | 见下 | 2/2 已知 CVE | ~21 min | 8.7 M |
-| Vulnerable-Flask-App（Python / Flask） | 420 LOC | 5/5 | — | 3.6 min | 0.2 M |
-| DVWA（PHP，无引擎） | ~13k LOC | SQLi、盲注、命令注入 9/9，`impossible` 级 0 误报 | — | 6 min | 3.3 M |
+| 目标 | 语言 | 入口 | 说明 |
+|---|---|---|---|
+| Halo v2.27.2 | Java（WebFlux） | 583 | 259 个审查单元审完 251 个（约 11 个/分钟）；发现可匿名利用的问题 |
+| Actual v26.11.0 | Node / Express | 62 | recon 正确限定在服务端；14 条发现归并为 8 个根因，含多处经代码核实的权限问题 |
+| Craft CMS 5.12.0.1 | PHP | 549 | 动作、后台路由、站点、GraphQL、MCP 五类分派，没有 Craft 专用代码 |
+| Budibase v3.50.0 | TypeScript / Koa | 280 | 侦查约 7 分钟，含服务端、worker 与 Public API |
 
-- HMS 一行经 DeepAudit 任务入口实测（数据流和权限两个阶段并行）。
-- PowerJob：权限阶段复现了 CVE-2025-11580 / CVE-2025-11581；数据流阶段的报告经人工复核后有若干确认问题，
-  按负责任披露流程处理，细节暂不公开。
-- 对照组（同模型、同工具，只让单个 Agent 自己追踪 source → sink、不用引擎）：HMS 两次分别为 13/13、11/13，Juice 两次分别为 9/17、12/17。
+[`backend/benchmarks/yasa_audit/`](backend/benchmarks/yasa_audit/README.md) 里的靶场和数字来自之前的混合（污点引擎）版本，仅作历史参考。
 
 ## 从源码部署
 
@@ -75,14 +71,12 @@ YASA 混合审计的流程（`backend/app/services/yasa_audit/`）：
 | Node.js | 20+ | 前端 |
 | pnpm | 10（随 corepack 提供） | 前端依赖管理 |
 | PostgreSQL | 15+ | 数据库 |
-| curl、unzip、tar | — | 安装 YASA 工具（源码安装另需 git） |
+| curl、unzip | — | 安装 codegraph 和 ripgrep |
 | Redis | 可选 | 启动时检查，缺失不影响使用 |
 
-YASA 混合审计支持 **Linux x86_64、macOS Apple Silicon（ARM64）和 macOS Intel（x86_64）**。
-安装脚本和后端按本机平台选择官方工具包；macOS 不需要 Docker 或 Rosetta。
+支持 **Linux x86_64、macOS Apple Silicon（ARM64）和 macOS Intel（x86_64）**。
+安装脚本和后端按本机平台选择工具包；macOS 不需要 Docker 或 Rosetta。
 macOS 可用 Homebrew 安装 PostgreSQL 15+、Node.js 20+、uv 和 pnpm；数据库创建好后按下文配置和启动。
-内存建议 16 GB 以上：在 8 GB 的机器上，
-YASA 处理 2 万行以上的 Spring 项目会因内存不足被终止，这时流水线会退化为只做残余危险调用复核，仍在预算内完成。
 
 ```bash
 # Ubuntu / Debian
@@ -134,20 +128,16 @@ uv sync --frozen                 # 安装依赖到 backend/.venv
 uv run alembic upgrade head      # 建表；首次启动时会自动创建演示账户
 ```
 
-### 5. YASA 工具（YASA 混合审计需要）
+### 5. 代码索引与搜索工具
 
 ```bash
 bash scripts/setup_yasa.sh       # 仍在 backend/ 目录下执行
 ```
 
-脚本会把本机平台的 YASA 引擎安装到 `~/.yasamcp/tools/<平台>/`，把官方
-[yasa-mcp v1.0.3](https://github.com/antgroup/YASA-Engine/releases/tag/yasamcp-v1.0.3)
-完整发布包（含 `lib/`）安装到 `~/.yasamcp/mcp/<平台>/`，校验 MCP 包的 SHA256，并检查工具能否启动。
-平台目录为 `linux-x86-64`、`darwin-aarch64` 或 `darwin-x86-64`。重复执行会复用已安装的引擎和同版本 MCP。
-需要从源码安装 MCP 时可设置 `YASA_REF=<上游 tag/分支>`，仍使用独立的 `~/.yasamcp/venv`，
-并按脚本输出设置 `YASAMCP_BIN`。原有 virtualenv 安装也继续兼容。
-装在默认位置时后端会自动找到，不用设置环境变量。想换位置就用 `YASAMCP_HOME=/opt/yasamcp bash scripts/setup_yasa.sh`，
-之后启动后端时也要带上同一个 `YASAMCP_HOME`。
+脚本把本机平台的 codegraph（代码索引：调用、继承、路由）和 ripgrep 安装到 `~/.yasamcp/tools/<平台>/`，并检查能否启动。
+平台目录为 `linux-x86-64`、`darwin-aarch64` 或 `darwin-x86-64`。重复执行会复用已安装的工具。
+装在默认位置时后端会自动找到；换位置用 `YASA_HOME=/opt/yasa bash scripts/setup_yasa.sh`，启动后端时带上同一个 `YASA_HOME`
+（旧变量名 `YASAMCP_HOME` 仍然有效）。
 
 ### 6. 启动后端
 
@@ -177,11 +167,11 @@ pnpm dev                         # http://localhost:5173
 
 1. "项目管理"里新建项目：Git 仓库地址，或者上传 ZIP。
 2. 首页在终端里输入 `audit`，或者在项目页点"新建审计"。
-3. "产品上下文"里写明哪些入口按设计公开、有哪些角色
-   （例如"公开 /login、/search；角色 admin / user"），可以明显减少权限审计的误报。
+3. "产品上下文"里写明有哪些角色、哪些入口按设计公开、哪些输入可信
+   （例如"角色 guest / user / admin；公开 /login、/search；配置文件可信"），能明显减少权限误报。
 4. 任务页实时显示阶段事件；完成后发现列表、状态流转和报告导出照常使用。
    结论中的 confirmed / likely 换算为置信度（0.85 / 0.6，likely 严重度降一级），不会标成"已验证"。
-5. 规则、SARIF、每个 Agent 的对话记录和未审清单（`not_reviewed`）保存在 `YASA_AUDIT_RUNS_DIR/<任务 ID>/`。
+5. 入口清单、卡片、事实、每个 Agent 的对话记录和未审清单（`not_reviewed`）保存在 `YASA_AUDIT_RUNS_DIR/<任务 ID>/`。
 
 ### API
 
@@ -189,36 +179,36 @@ pnpm dev                         # http://localhost:5173
 curl -X POST http://127.0.0.1:8000/api/v1/agent-tasks/ \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"project_id": "<项目 ID>", "audit_mode": "yasa", "timeout_seconds": 1800,
-       "audit_scope": {"product": "公开 /login；角色 admin/user", "deploy": "Linux, JDK 17",
-                       "stages": ["dataflow", "authz"]}}'
+       "audit_scope": {"product": "角色 admin/user；公开 /login", "deploy": "Linux, JDK 17"}}'
 ```
 
 `audit_scope` 里的字段都是可选的：`product` 产品上下文；`deploy` 部署环境（例如路径检查能否用反斜杠绕过要看操作系统）；
-`stages` 默认两个阶段都跑；`workers` 并发数，默认 6。
+`workers` 审查并发数，默认 16。
 
 ### 命令行（不需要数据库和前端）
 
 ```bash
 cd backend
 export LLM_BASE_URL=... LLM_API_KEY=... LLM_MODEL=...
-uv run python -m app.services.yasa_audit init  /path/to/project
-uv run python -m app.services.yasa_audit run   /path/to/project --out out/ --deploy "Linux container"
-uv run python -m app.services.yasa_audit authz /path/to/project --out out-authz/ \
-       --product "Roles: user, admin. Public by design: /login, /search"
+uv run python -m app.services.yasa_audit init  /path/to/project                 # 代码索引
+uv run python -m app.services.yasa_audit recon /path/to/project --out out/      # 只做侦查
+uv run python -m app.services.yasa_audit run   /path/to/project --out out/ \
+       --deploy "Linux container" --product "Roles: user, admin. Public by design: /login, /search"
 ```
 
-另有 `build` / `triage` / `trace` 子命令，以及 `--time-budget`（分钟）、`--workers`，详见
+另有 `--time-budget`（分钟）、`--workers`，详见
 [`backend/app/services/yasa_audit/README.md`](backend/app/services/yasa_audit/README.md)。
 
 ## 配置
 
-`backend/.env` 的完整说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。YASA 模式相关的配置：
+`backend/.env` 的完整说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。审计相关的配置：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LLM_*` | — | 和 DeepAudit 共用；网页里的用户配置优先。必须是 OpenAI 兼容并支持 tool calling 的接口 |
-| `YASAMCP_HOME` | `~/.yasamcp` | `setup_yasa.sh` 的安装位置 |
-| `YASA_BIN` / `YASAMCP_BIN` / `YASA_RG_BIN` / `YASAMCP_TOOLS_DIR` | 由 `YASAMCP_HOME` 推出 | 需要单独指定某个工具时才设置 |
+| `YASA_HOME`（旧名 `YASAMCP_HOME`） | `~/.yasamcp` | `setup_yasa.sh` 的安装位置 |
+| `YASA_CODEGRAPH_BIN` / `YASA_RG_BIN` | 由 `YASA_HOME` 推出 | 需要单独指定某个工具时才设置 |
+| `LLM_CONCURRENCY` | `16` | 同时在途的模型请求上限，遇到限流自动减半 |
 | `YASA_AUDIT_RUNS_DIR` | `/tmp/deepaudit-yasa-runs` | 运行产物目录，建议换成持久目录 |
 
 注意：上面这几个 `YASA*` 变量是在后端进程的环境变量里读取的，**不会**从 `.env` 读取。需要时在启动命令前设置，例如
@@ -226,52 +216,30 @@ uv run python -m app.services.yasa_audit authz /path/to/project --out out-authz/
 
 ## 已知限制
 
-- 各语言的支持程度不同：
-
-  | 语言 | 数据流 | 权限路由表 |
-  |---|---|---|
-  | Java（含 JSP） | 引擎 + 复核 | Servlet、JSP、Spring（注解 + 拦截器 + Security 规则） |
-  | JS / TS | 引擎 + 复核 | Express（全局、前缀、内联中间件） |
-  | Python | 引擎 + 复核 | Flask / FastAPI 装饰器（含 Blueprint/APIRouter 前缀、`Depends`）、Django `urls.py`（视图装饰器、Mixin、`MIDDLEWARE`） |
-  | PHP | 引擎（入口脚本包装为 `*Service`）+ 复核 | Laravel `routes/*.php`（`->middleware`）；没有 Laravel 时每个脚本都是入口，开头的 include/session 检查作为守卫 |
-
-  PHP 的引擎入口：YASA 的 PHP 分析器会忽略 ruleConfig 里的自定义入口（检查器收集了，分析器从不执行），只自动识别 `*Service`
-  类的公开方法等几种约定。流水线因此在引擎副本里把入口脚本的顶层代码包装成 `YasaEntry*Service::run()`（行号不变），
-  并把项目自己的 `*Service` 类改名，避免它们也被当成入口。
-- Go：YASA 引擎支持，但流水线还没有为 Go 写危险调用清单、路由提取和规则手册。
-- 结论是静态判定，没有执行验证；报告里附带了路径和证据，需要的话请人工复现。
-- 大型 Spring 项目上引擎受内存限制（见上文），而且自定义入口方案还没跑通，这时数据流阶段主要靠残余危险调用复核。
-- 时间预算优先：预算用完时剩下的候选不再复核，任务页会提示数量，清单在运行目录里。
-- 入口发现优先用 yasa-mcp 自带的 codegraph 路由表（覆盖 Spring、Laravel、Django/Flask/FastAPI、Express、NestJS、Go 等框架）；
-  没有框架路由的脚本式项目（普通 PHP、JSP、SuiteCRM 这类前端控制器）用"直接访问保护常量"等通用规则找真正可访问的文件，
-  并读取项目自带或安装器生成的 Web 服务器拒绝规则（`.htaccess` 等）。前端控制器的分发规则由 Agent 追踪一次后按类审查。
-- 引擎输入按入口切片：PHP 项目和源文件超过 1,500 个的项目，引擎只分析能连到入口的文件（保持行号的副本）。PHP 入口脚本会被包装成
-  YASA 能自动识别的 `*Service::run()`。SuiteCRM（76 万行）因此能在 2.5 分钟内跑完污点分析，之前整库调用图 15 分钟都建不完。
-  前端控制器通过动态分发（如 `index.php?module=&action=`）到达的代码不在静态切片里，需要建规则的 Agent 补充，数据流复核也只能覆盖一部分，
-  其余列在未审清单里。
+- 结论是静态判定，没有执行验证；报告附带路由原文和代码位置，需要的话请人工复现。
+- 时间预算优先：预算用完时剩下的入口不再审查，任务页会提示数量，清单在运行目录里。大项目建议在侦查和前一部分审查完成后评估结果。
+- 代码索引来自静态分析：类型看不出来的调用（动态分派、服务定位器、无类型接收者）可能缺失或连到同名函数；
+  Agent 以读代码和 grep 为准，索引只用来导航。
 - 遵守项目的排除规则（默认 `node_modules/**`、`.git/**`、`dist/**`、`build/**`、`*.log`）和"指定文件"。
-  只选部分文件时，跨到未选文件的数据流和路由注册（例如 Express 的 `server.ts`）会看不到，召回会下降。
+  只选部分文件时，跨到未选文件的分派和路由注册会看不到，入口会变少。
 
 ## 开发与测试
 
 ```bash
 cd backend
-uv run --with pytest pytest tests/test_yasa_audit.py      # YASA 模式单元测试（不需要 LLM 和 YASA）
+uv run --with pytest pytest tests/test_yasa_*.py         # 审计单元测试（不需要 LLM）
 uv run --with ruff ruff check app/services/yasa_audit
 cd ../frontend
 npx tsc --noEmit -p . && pnpm test
 ```
 
-基准复现：`bash backend/benchmarks/yasa_audit/prepare_targets.sh /tmp/targets` 下载靶场，然后用
-`backend/benchmarks/yasa_audit/eval.py` 评分。
-
 代码位置：
 
 ```
-backend/app/services/yasa_audit/     YASA 混合审计（pipeline / entrypoints / toolbox / prompts / kb）
+backend/app/services/yasa_audit/     入口优先审计（pipeline / toolbox / graph / prompts / agent_loop）
   task.py                            DeepAudit 任务入口（agent_tasks.py 中 audit_mode=yasa 时调用）
-backend/scripts/setup_yasa.sh        YASA 工具安装
-backend/benchmarks/yasa_audit/       靶场、真值、评分、实验记录
+backend/scripts/setup_yasa.sh        codegraph 与 ripgrep 安装
+backend/benchmarks/yasa_audit/       之前混合版本的靶场与评分（历史参考）
 frontend/src/components/agent/CreateAgentTaskDialog.tsx   新建审计对话框
 ```
 
@@ -279,6 +247,6 @@ frontend/src/components/agent/CreateAgentTaskDialog.tsx   新建审计对话框
 
 - 本项目沿用上游 DeepAudit 的 [AGPL-3.0](LICENSE) 许可证。
 - [DeepAudit](https://github.com/lintsinghua/DeepAudit)（lintsinghua）提供了平台本身；
-  [YASA-Engine](https://github.com/antgroup/YASA-Engine)（蚂蚁集团）提供了污点引擎和 yasa-mcp。
+  [YASA-Engine](https://github.com/antgroup/YASA-Engine)（蚂蚁集团）提供了工具包（codegraph、ripgrep）和本项目最初的污点分析流水线。
 - 仅限对你有权测试的代码使用。安全与合规要求见 [SECURITY.md](SECURITY.md)、[DISCLAIMER.md](DISCLAIMER.md)。
   审计中发现的第三方漏洞，请通过项目方的安全渠道私下报告。
