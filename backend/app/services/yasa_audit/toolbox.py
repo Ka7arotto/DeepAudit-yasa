@@ -816,6 +816,9 @@ def tool_schemas(role: str) -> list[dict]:
                "then again with every hypothesis's final status (a later call replaces the card).",
                {"function": {"type": "string", "description": "what the entry does, in business terms"},
                 "callers": {"type": "string", "description": "who can call it, with the evidence"},
+                "open_leads": {"type": "array", "items": s, "description": "suspicions you could not verify "
+                               "to the harmful operation: file:line and what is left to check (kept for "
+                               "follow-up, not reported as findings)"},
                 "least_privileged_caller": {"type": "string", "description": "who can actually call it, as you "
                                             "established from the code (put a wrong recon exposure right "
                                             "here, not in report_finding)",

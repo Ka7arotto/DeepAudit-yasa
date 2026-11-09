@@ -264,6 +264,7 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
                                           "route_evidence": {"file": "web/Download.php", "line": 2,
                                                              "quote": "class Download"}})],
         "/home": [("record_card", {"function": "home page", "callers": "anyone", "authz_verdict": "ok",
+                                   "open_leads": ["web/Home.php:3 echo of q: check the template escaping"],
                                    "hypotheses": []})],
     }
     users, systems = [], []
@@ -293,6 +294,8 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
     data = json.loads((tmp_path / "out" / "review" / "findings.json").read_text())
     (f,) = data["findings"]
     assert f["cwe"] == "CWE-22" and f["handler"] == "web/Download.php::execute" and data["not_reviewed"] == []
+    (lead,) = data["open_leads"]  # unverified suspicions are kept apart from findings
+    assert lead["lead"] == "web/Home.php:3 echo of q: check the template escaping" and lead["entries"]
     cards = json.loads((tmp_path / "out" / "review" / "cards.json").read_text())
     assert {c["function"] for c in cards} == {"file download", "home page"}  # one card per unit
     assert next(c for c in cards if c["function"] == "file download")["hypotheses"][0]["anchor"] == \

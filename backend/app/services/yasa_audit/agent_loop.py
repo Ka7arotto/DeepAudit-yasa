@@ -76,7 +76,8 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                 messages.append({"role": "user", "content": "Budget nearly used. "
                                  + (f"Still required before you can finish: {'; '.join(m for m, _ in owed)}. "
                                     if owed else "")
-                                 + "Report what you have concluded, then call finish."})
+                                 + "Record only what you verified; what you could not verify goes into your "
+                                 "notes or open leads, not into conclusions. Then call finish."})
                 warned = True
             msg = llm.chat(messages, tools=tools)
             entry: dict = {"role": "assistant", "content": msg.content or ""}

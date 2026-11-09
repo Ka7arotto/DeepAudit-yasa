@@ -607,8 +607,11 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
     findings = [f for r in results for f in r["findings"]]
     cards = [c for r in results for c in r["cards"]]
     not_reviewed = [e["id"] for u in skipped for e in u["entries"]]
-    (out / "findings.json").write_text(json.dumps({"findings": findings, "not_reviewed": not_reviewed},
-                                                  indent=1, ensure_ascii=False))
+    # Suspicions a reviewer could not verify within its budget: kept apart from findings, for follow-up.
+    open_leads = [{"entries": c.get("entries"), "lead": str(lead)[:500]}
+                  for c in cards for lead in (c.get("open_leads") or []) if str(lead).strip()]
+    (out / "findings.json").write_text(json.dumps({"findings": findings, "open_leads": open_leads,
+                                                   "not_reviewed": not_reviewed}, indent=1, ensure_ascii=False))
     (out / "cards.json").write_text(json.dumps(cards, indent=1, ensure_ascii=False))
     (out / "facts.json").write_text(json.dumps(facts.facts, indent=1, ensure_ascii=False))
     (out / "issues.json").write_text(json.dumps(issues.issues, indent=1, ensure_ascii=False))

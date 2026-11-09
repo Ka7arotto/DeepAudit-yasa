@@ -68,7 +68,10 @@ Find and read, with the navigation tools:
 - the protections every request or outgoing operation passes whatever the handler does: input
   validation in the framework, output filtering, the wrappers used for outbound HTTP, file paths,
   queries and templates; for each, what it guarantees and where that is enforced (file:line), read
-  from its code. Reviewers judge each handler with these in mind.
+  from its code. Concretely: are unknown body fields stripped, rejected or kept; which identifier
+  and option formats are enforced; do object-level checks (ownership, model permission hooks) also
+  run for collection routes without an id; which output fields are removed for which caller.
+  Reviewers judge each handler with these in mind.
 Then call record_access_model (each statement backed by evidence quotes from the code).
 If the decision can be computed from the request, its handler and the code or configuration (route
 tables, role and permission definitions, middleware or filter order, annotations, the checks a handler
@@ -116,7 +119,9 @@ Method:
 5. Trace each hypothesis to a confirmed path (file:line hops, and why the checks do not stop it) or a
    rejection with evidence. Then record_card again with every hypothesis's final status and the fact ids
    you relied on, report_finding for each confirmed or likely vulnerability, add_fact for short reusable
-   facts you verified, and finish.
+   facts you verified, and finish. report_finding is only for a vulnerability you traced to the harmful
+   operation: when you found none, the card says so; a suspicion you could not verify goes into the
+   card's open_leads.
 
 The entry list was produced by automated reconnaissance and can be wrong (a route that is not actually
 served, a wrong exposure). Before you report, find where the code registers or generates the route and
