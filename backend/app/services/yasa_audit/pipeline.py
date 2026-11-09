@@ -80,9 +80,19 @@ def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
     tb.finish_gates = [(lambda t: t.access_model is None,
                         "record_access_model first (how requests are authenticated and authorized)")]
     llm = LLM(cfg)
+
+    def missing(t: Toolbox) -> list[str]:
+        return [x for x, done in (("record_access_model", t.access_model is not None),
+                                  ("write_access_resolver", t.resolver_code is not None)) if not done]
+
+    # Reading the security chain can take the whole budget; at two thirds, say what is still owed.
+    owed = (lambda steps, t: steps >= cfg.access_budget * 2 // 3 and bool(missing(t)),
+            lambda t: "Two thirds of your budget is used. Still to do: " + ", ".join(missing(t))
+                      + " (a resolver may answer unknown for what you could not work out).")
     try:
         holder["res"] = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.access_budget, deploy, product),
-                                  user, cfg.access_budget, out / "transcript-access.jsonl", deadline=deadline)
+                                  user, cfg.access_budget, out / "transcript-access.jsonl", deadline=deadline,
+                                  reminders=[owed])
     except Exception as e:  # the surface agent and the review still run without a model
         holder["error"] = f"{type(e).__name__}: {e}"
     holder["model"], holder["llm"], holder["resolver"], holder["tb"] = tb.access_model, llm, tb.resolver_code, tb
@@ -121,6 +131,42 @@ def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Pat
             "unknown": sum(len(v) for v in unknown.values()), "_groups": groups, "_unknown": unknown}
 
 
+def _declared_code(root: Path, e: dict) -> dict:
+    """The code at the entry's declared_at (the registration), quoted for the reviewer."""
+    where = str(e.get("declared_at") or "")
+    file, _, line = where.rpartition(":")
+    if not file or not line.isdigit() or int(line) < 1:
+        return {}
+    try:
+        with (root / file).open(errors="ignore") as fh:
+            for i, text in enumerate(fh, 1):
+                if i == int(line):
+                    return {"declared_code": text.strip()[:200]} if text.strip() else {}
+    except OSError:
+        pass
+    return {}
+
+
+def _rank_principals(entries: list[dict], ladder: list[str] | None) -> None:
+    """Place each entry on the project's principal ladder: the least privileged principal the resolver
+    names for it (a ladder name matches a principal equal to it or containing it; the longest wins)."""
+    if not ladder:
+        return
+    names = [(i, n.lower()) for i, n in enumerate(ladder)]
+    for e in entries:
+        ranks = []
+        for p in (e.get("who_can_call") or {}).get("principals") or []:
+            hits = [(len(n), i) for i, n in names if n == p.lower() or n in p.lower()]
+            if hits:
+                ranks.append(max(hits)[1])
+        if ranks:
+            e["principal_rank"] = min(ranks)
+            e["least_principal"] = ladder[min(ranks)]
+        else:
+            e.pop("principal_rank", None)
+            e.pop("least_principal", None)
+
+
 def _apply_decisions(entries: list[dict], groups: dict[str, list[str]], decisions: dict[str, dict]) -> dict:
     """Apply the access agent's per-group verdicts to the entries that still disagree."""
     verdict_of = {eid: decisions[g] for g, ids in groups.items() if g in decisions for eid in ids}
@@ -154,19 +200,46 @@ def _sample(e: dict) -> str:
     return f"{e.get('method', '')} {e.get('route', '')} -> {where} {e.get('handler', '')}".strip()
 
 
-def _reconcile_message(entries: list[dict], applied: dict, code: str, model: dict | None
-                       ) -> tuple[str, dict[str, list[str]]]:
-    rows, ids = [], {}
-    for n, ((declared, lp, rule), es) in enumerate(
-            sorted(applied["_groups"].items(), key=lambda kv: -len(kv[1]))[:12], 1):
-        ids[f"G{n}"] = [e["id"] for e in es if e.get("id")]
-        rows.append(f"- G{n}: {len(es)} entries, declared {declared}, resolver {lp} (rule: {rule})")
+def _group_rows(groups: list[tuple[str, tuple, list[dict]]]) -> list[str]:
+    rows = []
+    for gid, (declared, lp, rule), es in groups:
+        rows.append(f"- {gid}: {len(es)} entries, declared {declared}, resolver {lp} (rule: {rule})")
         rows += [f"    {_sample(e)}" for e in es[:3]]
+    return rows
+
+
+def _unknown_rows(applied: dict) -> list[str]:
+    rows = []
     for kind, es in sorted(applied["_unknown"].items(), key=lambda kv: -len(kv[1]))[:6]:
         rows.append(f"- {len(es)} entries of kind/prefix {kind!r}: resolver unknown")
         rows += [f"    {_sample(e)}  request fields: "
                  + json.dumps({k: e.get(k) for k in ("method", "route", *Toolbox.RESOLVER_FIELDS) if e.get(k)},
                               ensure_ascii=False) for e in es[:2]]
+    return rows
+
+
+def _new_groups(applied: dict, groups: dict[str, list[str]], decided: set[str], limit: int = 12
+                ) -> list[tuple[str, tuple, list[dict]]]:
+    """Number the disagreements no decided group covers as new groups (ids continue), replacing the
+    undecided ones: after the resolver changed, those describe answers it no longer gives."""
+    covered = {eid for g, ids in groups.items() if g in decided for eid in ids}
+    for g in [g for g in groups if g not in decided]:
+        del groups[g]
+    n = max((int(g[1:]) for g in groups if g[1:].isdigit()), default=0)
+    out = []
+    for key, es in sorted(applied["_groups"].items(), key=lambda kv: -len(kv[1])):
+        es = [e for e in es if e.get("id") not in covered]
+        if es and len(out) < limit:
+            n += 1
+            groups[f"G{n}"] = [e["id"] for e in es if e.get("id")]
+            out.append((f"G{n}", key, es))
+    return out
+
+
+def _reconcile_message(entries: list[dict], applied: dict, code: str, model: dict | None
+                       ) -> tuple[str, dict[str, list[str]]]:
+    ids: dict[str, list[str]] = {}
+    rows = _group_rows(_new_groups(applied, ids, set())) + _unknown_rows(applied)
     msg = (f"The surface agent enumerated {len(entries)} entries and declared each one's exposure, "
            f"independently of you. Your resolver disagrees on {applied['disagreements']} of them and answers "
            f"unknown for {applied['unknown']}. The groups:\n" + "\n".join(rows) +
@@ -176,7 +249,8 @@ def _reconcile_message(entries: list[dict], applied: dict, code: str, model: dic
            "- declared_wrong: the resolver is right;\n"
            "- inconsistent_code: both follow real code that disagrees (a likely access-control bug).\n"
            "Then, with the rest of your budget, fix the resolver where it is wrong or answers unknown and install "
-           "it with write_access_resolver (samples from these groups). Then finish.\n\n"
+           "it with write_access_resolver (samples from these groups); it is run on every entry again and the "
+           "disagreements left are shown to you as new groups to settle. Then finish.\n\n"
            + (access_model_text(model) + "\n\n" if model else "") + "Your current resolver:\n" + code)
     return msg, ids
 
@@ -188,6 +262,19 @@ def _reconcile(cfg: AuditConfig, out: Path, entries: list[dict], holder: dict, a
     msg, tb.reconcile_groups = _reconcile_message(entries, applied, tb.resolver_code or "", holder.get("model"))
     tb.decisions = {}
     tb.finished = False
+
+    def regroup() -> str:
+        applied2 = _apply_resolver(tb, entries, tb.resolver_code, out)
+        if "_groups" not in applied2:
+            return f"(could not run it on the entries: {applied2.get('error', '')})"
+        new = _new_groups(applied2, tb.reconcile_groups, set(tb.decisions))
+        head = (f"On all {len(entries)} entries: {applied2['disagreements']} disagreements with the declared "
+                f"exposure, {applied2['unknown']} unknown.")
+        if not new:
+            return head + " No new group to settle."
+        return head + " Settle these too (in one settle call):\n" + "\n".join(_group_rows(new))
+
+    tb.on_resolver_installed = regroup
     tb.finish_gates = [(lambda t: any(g not in t.decisions for g in t.reconcile_groups),
                         lambda t: "settle every group first; undecided: "
                                   + ", ".join(g for g in t.reconcile_groups if g not in t.decisions))]
@@ -199,6 +286,7 @@ def _reconcile(cfg: AuditConfig, out: Path, entries: list[dict], holder: dict, a
     res = run_agent(llm, tb, tool_schemas("access"), access_prompt(cfg.reconcile_budget, deploy, product), msg,
                     cfg.reconcile_budget, out / "transcript-reconcile.jsonl", deadline=deadline,
                     reminders=[settle_now])
+    tb.on_resolver_installed = None
     changed = tb.resolver_code != holder.get("resolver")
     holder["resolver"] = tb.resolver_code
     return {"steps": res.get("steps"), "finished": res.get("finished"), "resolver_changed": changed,
@@ -292,6 +380,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         except Exception as e:  # keep the unreconciled answers (declared exposure stands)
             reconcile = {"error": f"{type(e).__name__}: {e}"}
         reconcile["before"] = before
+    _rank_principals(entries, (holder.get("model") or {}).get("ladder"))
     resolver = {k: v for k, v in resolver.items() if not k.startswith("_")}
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
     by_exp = collections.Counter(e["exposure"] for e in entries)
@@ -389,7 +478,10 @@ def _units(entries: list[dict]) -> list[dict]:
                       "handlers": sorted({f"{e.get('handler_file')}::{e.get('handler')}" for e in es}),
                       "resolved": all(e.get("resolved", True) for e in es)})
     # within a level: entries where the two readings of the access rules disagree first
+    # within a level: lower on the project's principal ladder first, then entries where the two readings
+    # of the access rules disagree
     units.sort(key=lambda u: (EXPOSURE_RANK.get(u["exposure"], 1), not u["resolved"],
+                              min((e.get("principal_rank", 99) for e in u["entries"]), default=99),
                               not any(e.get("exposure_declared") for e in u["entries"]),
                               u["entries"][0].get("route", "")))
     return units
@@ -438,9 +530,10 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
     tb.resolver_code = resolver
     tb.known_entries = {(str(e.get("method") or "GET").upper(), str(e.get("route"))): e for e in entries}
     llm = LLM(cfg)
-    entry_view = {"routes": [{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
-                                                     "exposure_declared", "who_can_call", "declared_at")
-                              if e.get(k)} for e in unit["entries"][:20]],
+    entry_view = {"routes": [{**{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
+                                                        "least_principal", "exposure_declared", "who_can_call",
+                                                        "declared_at") if e.get(k)},
+                              **_declared_code(root, e)} for e in unit["entries"][:20]],
                   "more_routes": max(0, len(unit["entries"]) - 20),
                   "handler_file": unit["handler_file"], "handler": unit["handler"]}
     if unit.get("generic"):

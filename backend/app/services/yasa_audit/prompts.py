@@ -63,8 +63,11 @@ Find and read, with the navigation tools:
 - how a request (method, path, resource, operation) is turned into the permission that is checked;
 - the principals from least to most privileged (anonymous, any registered user, roles, admin), how a
   principal gets them, and how to tell from an entry's declaration the least privileged one that can
-  call it;
-- what is public by default.
+  call it; record their names in that order as the ladder;
+- what is public by default;
+- the protections every request or outgoing operation passes whatever the handler does: input
+  validation in the framework, output filtering, the wrappers used for outbound HTTP, file paths,
+  queries and templates (file:line). Reviewers judge each handler with these in mind.
 Then call record_access_model (each statement backed by evidence quotes from the code).
 If the decision can be computed from the request, its handler and the code or configuration (route
 tables, role and permission definitions, middleware or filter order, annotations, the checks a handler
@@ -116,7 +119,12 @@ Method:
 
 The entry list was produced by automated reconnaissance and can be wrong (a route that is not actually
 served, a wrong exposure). Before you report, find where the code registers or generates the route and
-check that it really serves the path you report; cite it as route_evidence.
+check that it really serves the path you report; cite it as route_evidence (declared_code shows the code
+at declared_at: cite it when it is that registration).
+
+Before you report, follow the input to the code that performs the harmful operation (the query run, the
+request sent, the file written, the data returned) and check the shared protections of the access model
+and any guard on the way.
 
 Who the attacker is: a remote user at the entry's exposure level. Input that only an operator controls
 (CLI arguments, deployment config files, installer steps) is trusted unless the product context says
@@ -159,7 +167,10 @@ def _access_model_text(model: dict | None) -> str:
         return "(no access model was recorded: work out who can call this entry from its declaration and code)"
     rows = [f"- {k.replace('_', ' ')}: {model[k]}" for k in ("authentication", "authorization",
                                                             "permission_mapping", "principals",
-                                                            "public_by_default") if model.get(k)]
+                                                            "public_by_default", "shared_protections")
+            if model.get(k)]
+    if model.get("ladder"):
+        rows.append("- ladder (least to most privileged): " + " < ".join(model["ladder"]))
     ev = ", ".join(f"{e.get('file')}:{e.get('line')}" for e in (model.get("evidence") or [])[:8])
     return "\n".join(rows) + (f"\n- evidence: {ev}" if ev else "")
 

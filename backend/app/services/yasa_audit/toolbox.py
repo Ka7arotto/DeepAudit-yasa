@@ -207,6 +207,7 @@ class Toolbox:
         self.extractor_best: dict[str, int] = {}  # most entries any version of each extractor produced
         self.regressions_shown: set[tuple] = set()
         self.reconcile_groups: dict[str, list[str]] = {}  # group id -> entry ids (reconcile pass)
+        self.on_resolver_installed = None  # reconcile: regroups the disagreements for a new resolver
         self.decisions: dict[str, dict] = {}  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
@@ -452,8 +453,11 @@ class Toolbox:
         rows = [f"{s.get('method', 'GET')} {s['route']} -> {r['least_privileged']} {r['principals']} ({r['rule']})"
                 for s, r in zip(samples, res, strict=True)]
         unknown = sum(r["least_privileged"] == "unknown" for r in res)
-        return clip("resolver installed. Check each result against the code you read; fix and resend if any is "
-                    f"wrong{' (unknown results: ' + str(unknown) + ')' if unknown else ''}:\n" + "\n".join(rows))
+        text = ("resolver installed. Check each result against the code you read; fix and resend if any is "
+                f"wrong{' (unknown results: ' + str(unknown) + ')' if unknown else ''}:\n" + "\n".join(rows))
+        if self.on_resolver_installed is not None:
+            text += "\n\n" + self.on_resolver_installed()
+        return clip(text, 12000)
 
     def who_can_call(self, method: str, path: str) -> str:
         req = {**self.known_entries.get((str(method or "GET").upper(), str(path)), {}),
@@ -639,7 +643,11 @@ class Toolbox:
         err = verify_evidence(self.root, model.get("evidence") or [])
         if err:
             return f"rejected: {err}"
-        self.access_model = {k: model.get(k) for k in (*need, "public_by_default", "evidence")}
+        self.access_model = {k: model.get(k) for k in (*need, "public_by_default", "shared_protections",
+                                                       "evidence")}
+        ladder = [str(x).strip() for x in (model.get("ladder") or []) if str(x).strip()]
+        if ladder:
+            self.access_model["ladder"] = ladder[:12]
         return "access model recorded"
 
     def report_finding(self, **finding: Any) -> str:
@@ -727,7 +735,8 @@ def tool_schemas(role: str) -> list[dict]:
                "result per request, same order. A request is an entry of the attack surface: method, route "
                "(in whatever shape the surface agent wrote it), and when known kind, handler_file, handler, "
                "handler_line. A result is {least_privileged: public|authenticated|privileged|denied|unknown, "
-               "principals: [roles or principal kinds allowed], rule: where the decision comes from (file:line "
+               "principals: [roles or principal kinds allowed, named as in your ladder], rule: where the "
+               "decision comes from (file:line "
                "or config key)}. least_privileged is the least privileged principal whose request gets the "
                "handler's operation done: count the shared gates AND the checks the handler itself makes (the "
                "program can read the handler's code). Answer unknown for requests whose shape you do not "
@@ -757,6 +766,13 @@ def tool_schemas(role: str) -> list[dict]:
                                "privileged, who gets each (any visitor, any registered user, ...), and how "
                                "to tell from an entry's declaration which is the least one that can call it"},
                 "public_by_default": s,
+                "shared_protections": {"type": "string", "description": "protections every request or outgoing "
+                                       "operation passes whatever the handler does, with file:line: input "
+                                       "validation in the framework, output filtering, wrappers for outbound "
+                                       "HTTP, file paths, queries, templates"},
+                "ladder": {"type": "array", "items": s, "description": "the principals' names from least to "
+                           "most privileged, as this project calls them (e.g. visitor, member, editor, admin); "
+                           "the resolver's principals use these names"},
                 "evidence": {"type": "array", "items": {"type": "object", "properties": {
                     "file": s, "line": i, "quote": s}}}},
                ["authentication", "authorization", "permission_mapping", "principals", "evidence"]),

@@ -1021,3 +1021,95 @@ def test_units_merge_entries_that_share_a_request():
            "exposure": "public"}]
     units = _units(es)
     assert sorted(sorted(e["id"] for e in u["entries"]) for u in units) == [["E1", "E2", "E3"], ["E4"]]
+
+
+def test_ladder_orders_units_within_a_level_and_is_shown(tmp_path):
+    from app.services.yasa_audit.pipeline import _rank_principals, _units
+    from app.services.yasa_audit.prompts import access_model_text
+
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path)
+    _write(tmp_path, {"a.js": "x\n"})
+    assert tb.record_access_model(authentication="session", authorization="grants", permission_mapping="doc.method",
+                                  principals="visitor < contributor < editor < owner",
+                                  ladder=["Visitor", "Contributor", "Editor", "Super Editor", "Owner"],
+                                  evidence=[{"file": "a.js", "line": 1, "quote": "x"}]) == "access model recorded"
+    assert "ladder (least to most privileged): Visitor < Contributor < Editor < Super Editor < Owner" in \
+        access_model_text(tb.access_model)
+
+    def e(i, route, principals):
+        return {"id": i, "method": "GET", "route": route, "handler_file": f"{i}.js", "handler": "h",
+                "exposure": "privileged", "resolved": True,
+                "who_can_call": {"least_privileged": "privileged", "principals": principals, "rule": "r"}}
+
+    es = [e("E1", "/a/settings", ["Owner"]), e("E2", "/a/tags", ["Super Editor", "Owner"]),
+          e("E3", "/a/posts", ["any staff user (Contributor and above)", "Owner"]), e("E4", "/a/x", ["robot"])]
+    _rank_principals(es, tb.access_model["ladder"])
+    assert [x.get("least_principal") for x in es] == ["Owner", "Super Editor", "Contributor", None]
+    assert [u["entries"][0]["id"] for u in _units(es)] == ["E3", "E2", "E1", "E4"]
+
+
+def test_reconcile_shows_new_groups_after_the_resolver_changes(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+
+    proj = tmp_path / "p"
+    _write(proj, {"web/Admin.php": "<?php\nfunction execute() { require_admin(); }\n",
+                  "web/Home.php": "<?php\nfunction execute() { echo 1; }\n"})
+    extractor = ("import json\nprint(json.dumps([{'route': '/admin', 'handler_file': 'web/Admin.php', "
+                 "'handler': 'execute', 'exposure': 'privileged'}, {'route': '/home', 'handler_file': "
+                 "'web/Home.php', 'handler': 'execute', 'exposure': 'public'}]))")
+    public_all = ("import json,sys; r=json.load(sys.stdin); print(json.dumps([{'least_privileged': 'public', "
+                  "'rule': 'no gate'} for _ in r]))")
+    admin_all = ("import json,sys; r=json.load(sys.stdin); print(json.dumps([{'least_privileged': 'privileged', "
+                 "'rule': 'everything admin'} for _ in r]))")
+    seen = []
+    scripts = {
+        "access": [("record_access_model", {"authentication": "s", "authorization": "a", "permission_mapping": "p",
+                                            "principals": "anyone, admin", "evidence": [
+                                                {"file": "web/Admin.php", "line": 2, "quote": "require_admin()"}]}),
+                   ("write_access_resolver", {"code": public_all, "samples": [{"route": "/a"}, {"route": "/b"},
+                                                                              {"route": "/c"}]}),
+                   ("finish", {"notes": "x"})],
+        "recon": [("run_extractor", {"name": "web", "code": extractor}),
+                  ("check_coverage", {"request_read_pattern": "echo"}), ("finish", {"notes": "web"})],
+        "reconcile": [("settle", {"decisions": [{"group": "G1", "verdict": "resolver_wrong", "reason": "Admin:2"}]}),
+                      ("write_access_resolver", {"code": admin_all, "samples": [{"route": "/admin"},
+                                                                               {"route": "/home"}, {"route": "/x"}]}),
+                      ("finish", {"notes": "too early"}),  # refused: the new group G2 is undecided
+                      ("settle", {"decisions": [{"group": "G2", "verdict": "resolver_wrong", "reason": "Home:2"}]}),
+                      ("finish", {"notes": "done"})],
+    }
+
+    class Router(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            if not self.script and len(messages) == 2:
+                user = messages[1]["content"]
+                key = ("reconcile" if "independently of you" in user else
+                       "access" if "controls ACCESS" in messages[0]["content"] else "recon")
+                self.script = list(scripts[key])
+            seen.extend(m.get("content") or "" for m in messages if m.get("role") == "tool")
+            return super().chat(messages, tools)
+
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
+    m = pipeline.recon(_cfg(), proj, tmp_path / "out", deadline=time.time() + 900)
+    assert any("Settle these too" in t and "- G2: 1 entries, declared public, resolver privileged" in t for t in seen)
+    rc = m["reconcile"]
+    assert {g: v.get("verdict") for g, v in rc["groups"].items()} == {"G1": "resolver_wrong", "G2": "resolver_wrong"}
+    es = {e["route"]: e for e in json.loads((tmp_path / "out" / "entries.json").read_text())}
+    assert es["/home"]["exposure"] == "public" and es["/admin"]["exposure"] == "privileged"
+    assert rc["applied"] == {"resolver_wrong": 1}  # /home; /admin now agrees with the new resolver
+
+
+def test_access_model_carries_shared_protections_and_cards_quote_the_registration(tmp_path):
+    from app.services.yasa_audit.pipeline import _declared_code
+    from app.services.yasa_audit.prompts import access_model_text
+
+    _write(tmp_path, {"routes.js": "const r = express.Router();\nr.get('/posts', auth, posts.browse);\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    tb.record_access_model(authentication="a", authorization="b", permission_mapping="c", principals="d",
+                           shared_protections="ids validated globally (validators/all.ts:27)",
+                           evidence=[{"file": "routes.js", "line": 2, "quote": "r.get('/posts'"}])
+    assert "- shared protections: ids validated globally (validators/all.ts:27)" in access_model_text(tb.access_model)
+    assert _declared_code(tmp_path, {"declared_at": "routes.js:2"}) == \
+        {"declared_code": "r.get('/posts', auth, posts.browse);"}
+    assert _declared_code(tmp_path, {"declared_at": "routes.js:9"}) == {}
+    assert _declared_code(tmp_path, {"declared_at": "nofile.js:1"}) == {}
