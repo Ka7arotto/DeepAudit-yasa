@@ -199,6 +199,10 @@ def _apply_decisions(entries: list[dict], groups: dict[str, list[str]], decision
     return dict(c)
 
 
+def _req_key(e: dict) -> tuple:
+    return (e.get("method", "ANY"), e.get("route"), str(e.get("handler_file")))
+
+
 def _sample(e: dict) -> str:
     where = f"{e.get('handler_file')}:{e.get('handler_line') or ''}".rstrip(":")
     return f"{e.get('method', '')} {e.get('route', '')} -> {where} {e.get('handler', '')}".strip()
@@ -424,6 +428,31 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         res = {k: (res.get(k, 0) + res2.get(k, 0)) if isinstance(res2.get(k), (int, float)) and k != "finished"
                else res2.get(k) for k in res2}
         passes = 2
+    hard = hard_deadline or deadline
+    # The reconcile pass runs on the entries enumerated so far, while the follow-up passes run: both take
+    # minutes, and every minute before the review starts is a minute less of review.
+    early: dict = {}
+    snap = [dict(e) for e in tb.entries()]  # taken here: the follow-up passes add to tb meanwhile
+
+    def reconcile_early() -> None:
+        holder["done"].wait(timeout=None if deadline is None else max(0.0, deadline + 60 - time.time()))
+        for i, e in enumerate(snap):
+            e["id"] = f"E{i + 1}"
+        applied = _apply_resolver(tb, snap, holder.get("resolver"), out)
+        if not (applied.get("disagreements") or applied.get("unknown")) or holder.get("tb") is None \
+                or (hard is not None and time.time() >= hard - 3 * RECONCILE_S):
+            return
+        early["before"] = {k: applied.get(k) for k in ("disagreements", "unknown")}
+        try:
+            rec = _reconcile(cfg, out, snap, holder, applied, time.time() + RECONCILE_S, deploy, product)
+            by_id = {e["id"]: _req_key(e) for e in snap}
+            rec["_keys"] = {g: [by_id[i] for i in ids if i in by_id] for g, ids in rec.pop("_ids").items()}
+            early["rec"] = rec
+        except Exception as e:  # keep the unreconciled answers (declared exposure stands)
+            early["rec"] = {"error": f"{type(e).__name__}: {e}"}
+
+    rec_thread = threading.Thread(target=reconcile_early, daemon=True)
+    rec_thread.start()
     # Dispatchers the agent found but left unenumerated: follow-up passes, one fresh agent per dispatcher,
     # all in parallel (dispatchers are independent, and one context reading all of them runs out of time
     # before it writes anything). A missing dispatcher hides a whole part of the surface, so these may run
@@ -440,8 +469,8 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         tb.unenumerated = [x for x in found if x not in left]  # a dispatcher it still could not do is not retried
         if len(tb.entries()) == n_before:  # no progress: stop rather than loop
             break
-    # the review needs the model: wait for the access agent within the deadline
-    holder["done"].wait(timeout=None if deadline is None else max(0.0, deadline + 60 - time.time()))
+    rec_thread.join(timeout=None if hard is None else max(0.0, min(hard, time.time() + RECONCILE_S + 90)
+                                                           - time.time()))
     entries = tb.entries()
     source = "agent"
     if not entries:  # the agent produced nothing usable: keep codegraph's routes so review can start
@@ -454,19 +483,13 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         e["id"] = f"E{i + 1}"
         e["resolved"] = tb._check_entry(e) is None
     resolver = _apply_resolver(tb, entries, holder.get("resolver"), out)
-    reconcile = None
-    hard = hard_deadline or deadline
-    if (resolver.get("disagreements") or resolver.get("unknown")) and holder.get("tb") is not None \
-            and (hard is None or time.time() < hard - 3 * RECONCILE_S):
-        before = {k: resolver.get(k) for k in ("disagreements", "unknown")}
-        try:
-            reconcile = _reconcile(cfg, out, entries, holder, resolver, time.time() + RECONCILE_S, deploy,
-                                   product)
-            resolver = _apply_resolver(tb, entries, holder.get("resolver"), out)
-            reconcile["applied"] = _apply_decisions(entries, reconcile.pop("_ids"), reconcile.pop("_decisions"))
-        except Exception as e:  # keep the unreconciled answers (declared exposure stands)
-            reconcile = {"error": f"{type(e).__name__}: {e}"}
-        reconcile["before"] = before
+    reconcile = early.get("rec")
+    if reconcile is not None and "_keys" in reconcile:
+        id_of = {_req_key(e): e["id"] for e in entries}
+        groups = {g: [id_of[k] for k in keys if k in id_of] for g, keys in reconcile.pop("_keys").items()}
+        reconcile["applied"] = _apply_decisions(entries, groups, reconcile.pop("_decisions"))
+    if reconcile is not None:
+        reconcile["before"] = early.get("before")
     _rank_principals(entries, (holder.get("model") or {}).get("ladder"))
     resolver = {k: v for k, v in resolver.items() if not k.startswith("_")}
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))

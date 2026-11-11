@@ -1346,3 +1346,18 @@ def test_extractor_nudge_fires_on_time_as_well_as_steps(tmp_path):
     assert pipeline._past_half(now, now + 600, 60)(30, tb)  # half of the steps
     tb.extractors["x"] = {"entries": [], "run": 1}
     assert not pipeline._past_half(now - 400, now + 200, 60)(30, tb)  # an extractor ran: no nudge
+
+
+def test_limiter_cuts_once_per_burst_and_recovers():
+    from app.services.yasa_audit.llm import AdaptiveLimiter
+
+    lim = AdaptiveLimiter(16)
+    for _ in range(5):  # five requests rejected together: one cut, not four
+        lim.acquire()
+    for _ in range(5):
+        lim.release(rate_limited=True)
+    assert lim.limit == 8
+    for _ in range(8):  # a low cap grows after as many successes as the cap
+        lim.acquire()
+        lim.release()
+    assert lim.limit == 9

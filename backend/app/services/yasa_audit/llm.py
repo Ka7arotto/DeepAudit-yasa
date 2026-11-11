@@ -33,14 +33,16 @@ class Usage:
 
 
 class AdaptiveLimiter:
-    """Caps concurrent requests to one endpoint. Halves the cap when the provider rate-limits,
-    raises it by one after `grow_after` successes in a row, between 1 and `ceiling`.
+    """Caps concurrent requests to one endpoint. Halves the cap when the provider rate-limits (once per
+    burst: the requests in flight when the provider pushes back all fail together, and counting each one
+    took the cap from 16 to 4 for the rest of a run), raises it by one after as many successes in a row as
+    the cap (at most `grow_after`, at least 4), between 1 and `ceiling`.
 
     Many review units can run at once (most of a unit's time is spent outside LLM calls, in tools);
     the limiter keeps the number of requests in flight at what the provider accepts.
     """
 
-    def __init__(self, ceiling: int, start: int | None = None, grow_after: int = 20):
+    def __init__(self, ceiling: int, start: int | None = None, grow_after: int = 20, burst_s: float = 10.0):
         self.ceiling = max(1, ceiling)
         self.limit = max(1, min(self.ceiling, start or self.ceiling))
         self.grow_after = grow_after
@@ -48,6 +50,8 @@ class AdaptiveLimiter:
         self.ok_streak = 0
         self.throttled = 0
         self.peak = 0
+        self.burst_s = burst_s
+        self.last_cut = 0.0
         self._cv = threading.Condition()
 
     def acquire(self) -> None:
@@ -63,10 +67,13 @@ class AdaptiveLimiter:
             if rate_limited:
                 self.throttled += 1
                 self.ok_streak = 0
-                self.limit = max(1, self.limit // 2)
+                now = time.monotonic()
+                if now - self.last_cut >= self.burst_s:  # one cut per burst of rejections
+                    self.limit = max(1, self.limit // 2)
+                    self.last_cut = now
             else:
                 self.ok_streak += 1
-                if self.ok_streak >= self.grow_after and self.limit < self.ceiling:
+                if self.ok_streak >= min(self.grow_after, max(4, self.limit)) and self.limit < self.ceiling:
                     self.limit += 1
                     self.ok_streak = 0
             self._cv.notify_all()
