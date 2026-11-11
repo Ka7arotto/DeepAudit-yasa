@@ -52,6 +52,7 @@ class AdaptiveLimiter:
         self.peak = 0
         self.burst_s = burst_s
         self.last_cut = 0.0
+        self.last_error = ""  # the provider's last rate-limit message (RPM, TPM or concurrency: they differ)
         self._cv = threading.Condition()
 
     def acquire(self) -> None:
@@ -61,8 +62,10 @@ class AdaptiveLimiter:
             self.in_flight += 1
             self.peak = max(self.peak, self.in_flight)
 
-    def release(self, rate_limited: bool = False) -> None:
+    def release(self, rate_limited: bool = False, error: str = "") -> None:
         with self._cv:
+            if error:
+                self.last_error = error[:300]
             self.in_flight -= 1
             if rate_limited:
                 self.throttled += 1
@@ -81,7 +84,7 @@ class AdaptiveLimiter:
     def stats(self) -> dict:
         with self._cv:
             return {"limit": self.limit, "ceiling": self.ceiling, "peak_in_flight": self.peak,
-                    "rate_limited": self.throttled}
+                    "rate_limited": self.throttled, "last_rate_limit_error": self.last_error}
 
 
 _LIMITERS: dict[tuple, AdaptiveLimiter] = {}
@@ -123,6 +126,7 @@ class LLM:
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> Any:
         last_err: Exception | None = None
+        err = ""
         for attempt in range(6):
             t0 = time.time()
             kw: dict[str, Any] = {
@@ -144,8 +148,9 @@ class LLM:
             except Exception as e:  # network / rate limit: back off and retry
                 last_err = e
                 limited = _is_rate_limit(e)
+                err = str(e) if limited else ""
             finally:
-                self.limiter.release(rate_limited=limited)
+                self.limiter.release(rate_limited=limited, error=err)
             time.sleep(min(30, (5 if limited else 2) * (attempt + 1)))
         raise RuntimeError(f"LLM call failed after retries: {last_err}")
 
