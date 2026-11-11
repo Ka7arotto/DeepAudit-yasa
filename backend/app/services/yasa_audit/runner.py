@@ -59,24 +59,25 @@ LOWER = {"critical": "high", "high": "medium", "medium": "low", "low": "low"}
 def check_tools(cfg: AuditConfig) -> list[str]:
     """Names of missing executables (empty when the pipeline can run)."""
     missing = []
-    for name, path in (("YASAMCP_BIN", cfg.yasamcp_bin), ("YASA_RG_BIN", cfg.rg_bin)):
+    for name, path in (("YASA_CODEGRAPH_BIN", cfg.codegraph_bin), ("YASA_RG_BIN", cfg.rg_bin)):
         if not (Path(path).is_file() or shutil.which(path)):
             missing.append(f"{name}={path}")
     return missing
 
 
 def init_navigation(cfg: AuditConfig, root: Path, timeout_s: int = 600, stop=None) -> None:
-    """Bound the whole navigation process tree, including native engine children.
+    """Build (or bring up to date) codegraph's index of the project, bounding the whole process tree.
 
-    `stop` (a callable) ends init early without error: the task starts its stages as soon as
-    codegraph's index is written and stops the slower YASA call-graph step when the stages finish.
+    `stop` (a callable) ends it early without error. A complete index is synced incrementally.
     """
-    command = [cfg.yasamcp_bin, "init", str(root), "--no-progress", "-b", cfg.yasamcp_tools_dir]
+    from .discovery import codegraph_ready
+    sub = "sync" if codegraph_ready(root) else ("index" if (root / ".codegraph").exists() else "init")
+    command = [cfg.codegraph_bin, sub, str(root)]
     log_path = root / ".yasa" / "navigation-init.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     t_end = time.time() + timeout_s
     with log_path.open("w") as log:
-        with subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+        with subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                               start_new_session=True) as process:
             code = None
             while code is None:
@@ -86,7 +87,7 @@ def init_navigation(cfg: AuditConfig, root: Path, timeout_s: int = 600, stop=Non
                     stopped = bool(stop and stop())
                     if not stopped and time.time() < t_end:
                         continue
-                    # Killing only the CLI leaves its YASA/codegraph children running indefinitely.
+                    # Killing only the CLI would leave its workers running.
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -94,10 +95,10 @@ def init_navigation(cfg: AuditConfig, root: Path, timeout_s: int = 600, stop=Non
                     process.wait()
                     if stopped:
                         return
-                    raise RuntimeError(f"yasa-mcp init timed out after {timeout_s}s; navigation process "
+                    raise RuntimeError(f"code index timed out after {timeout_s}s; navigation process "
                                        f"group stopped; log: {log_path}") from None
     if code:
-        raise RuntimeError(f"yasa-mcp init exited with code {code}; log: {log_path}")
+        raise RuntimeError(f"code index ({sub}) exited with code {code}; log: {log_path}")
 
 
 def run_entry_audit(cfg: AuditConfig, root: Path, out: Path, deploy: str, product: str, start: float,

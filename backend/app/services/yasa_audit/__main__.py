@@ -1,6 +1,6 @@
 """Command line entry point.
 
-    python -m app.services.yasa_audit init   <project>             # build the yasa-mcp navigation cache
+    python -m app.services.yasa_audit init   <project>             # build codegraph's index of the project
     python -m app.services.yasa_audit recon  <project> --out DIR   # route reconnaissance only
     python -m app.services.yasa_audit run    <project> --out DIR   # recon (reused if DIR/recon exists) + review
 
@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 from .config import AuditConfig
 from .pipeline import recon, run
+from .runner import init_navigation
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,8 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     root = args.project.resolve()
 
     if args.cmd == "init":
-        return subprocess.run([cfg.yasamcp_bin, "init", str(root), "--no-progress",
-                               "-b", cfg.yasamcp_tools_dir]).returncode
+        init_navigation(cfg, root, timeout_s=3600)
+        return 0
 
     cfg.workers = args.workers
     cfg.time_budget_s = int(args.time_budget * 60)

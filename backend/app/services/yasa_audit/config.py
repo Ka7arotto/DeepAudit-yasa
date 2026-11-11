@@ -2,7 +2,7 @@
 
 LLM settings reuse DeepAudit's environment variables (LLM_API_KEY, LLM_MODEL, LLM_BASE_URL,
 LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_TIMEOUT). Tool locations default to the layout created by
-backend/scripts/setup_yasa.sh and can be overridden with YASA_* variables.
+backend/scripts/setup_yasa.sh and can be overridden with YASA_RG_BIN / YASA_CODEGRAPH_BIN.
 """
 
 from __future__ import annotations
@@ -13,11 +13,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_HOME = Path(os.environ.get("YASAMCP_HOME", Path.home() / ".yasamcp"))
+# Where setup_yasa.sh installs the native tools (codegraph, ripgrep). YASAMCP_HOME is the older name.
+DEFAULT_HOME = Path(os.environ.get("YASA_HOME") or os.environ.get("YASAMCP_HOME") or Path.home() / ".yasamcp")
 
 
 def platform_directory() -> str:
-    """Use the same native-tool directory names as upstream yasa-mcp."""
+    """Directory names of the native tool bundle."""
     system, machine = platform.system(), platform.machine()
     return {
         ("Darwin", "arm64"): "darwin-aarch64",
@@ -28,15 +29,6 @@ def platform_directory() -> str:
 
 
 DEFAULT_TOOLS = DEFAULT_HOME / "tools" / platform_directory()
-
-
-def _default_yasamcp() -> str:
-    """Official release bundle, legacy source virtualenv, then PATH."""
-    native_bin = DEFAULT_HOME / "mcp" / platform_directory() / "yasamcp"
-    if native_bin.is_file() and os.access(native_bin, os.X_OK):
-        return str(native_bin)
-    venv_bin = DEFAULT_HOME / "venv" / "bin" / "yasa-mcp"
-    return str(venv_bin) if venv_bin.exists() else "yasa-mcp"
 
 
 @dataclass
@@ -51,14 +43,7 @@ class AuditConfig:
     llm_max_tokens: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS", "8192")))
     llm_timeout_s: float = field(default_factory=lambda: float(os.environ.get("LLM_TIMEOUT", "150")))
 
-    # Tools (yasa-mcp init uses the YASA engine to build its call graph for the navigation tools)
-    yasa_bin: str = field(
-        default_factory=lambda: os.environ.get("YASA_BIN", str(DEFAULT_TOOLS / "yasa" / "yasa"))
-    )
-    yasamcp_bin: str = field(default_factory=lambda: os.environ.get("YASAMCP_BIN", _default_yasamcp()))
-    yasamcp_tools_dir: str = field(
-        default_factory=lambda: os.environ.get("YASAMCP_TOOLS_DIR", str(DEFAULT_HOME / "tools"))
-    )
+    # Tools: codegraph indexes the code (calls, inheritance, routes), ripgrep searches it
     rg_bin: str = field(
         default_factory=lambda: os.environ.get("YASA_RG_BIN", str(DEFAULT_TOOLS / "ripgrep" / "rg"))
     )
