@@ -304,6 +304,64 @@ RECONCILE_S = 240  # wall-clock slice of the reconcile pass, outside the agents'
 RECON_EXTENSION = 0.10  # share of the remaining budget follow-up recon passes may add
 
 
+def _past_half(t0: float, until: float | None, budget: int):
+    """Reminder condition: half of the step budget or of the wall-clock window is used and no extractor
+    has run. Agents read file after file and are cut by the deadline before writing anything."""
+    def cond(steps: int, t: Toolbox) -> bool:
+        late = until is not None and time.time() >= t0 + (until - t0) / 2
+        return (steps >= budget // 2 or late) and not t.extractors and not t.manual
+    return cond
+
+
+def _followup(cfg: AuditConfig, root: Path, out: Path, tb: Toolbox, left: list[str], deploy: str,
+              product: str, until: float | None, holder: dict, llm: LLM, rnd: int) -> list[str]:
+    """Enumerate each unenumerated dispatcher in its own fresh context, in parallel; merge the extractors
+    into tb. Returns the dispatchers the agents report as still left (new ones they came across)."""
+    budget = max(12, cfg.recon_budget // 3)
+    model = holder.get("model")
+    taken = sorted(tb.extractors)
+
+    def one(i: int, disp: str):
+        sub, sub_llm, t0 = Toolbox(cfg, root, out, unit="recon"), LLM(cfg), time.time()
+        msg = (f"Earlier passes enumerated {len(tb.entries())} entries with the extractors "
+               f"{', '.join(taken) or '(none)'}. Enumerate ONE dispatcher they left out:\n- {disp}\n\n"
+               f"Notes of the earlier passes:\n{tb.notes}\n\n"
+               "Read only what this dispatcher needs, write one extractor for it (a new name, not one of the "
+               "above), run it with run_extractor, fix what the checks report, then finish; list in "
+               "unenumerated any other dispatcher you came across that none of these covers.")
+        if model is not None:
+            msg += "\n\nAccess-control model (set each entry's exposure from it):\n" + access_model_text(model)
+        try:
+            run_agent(sub_llm, sub, tool_schemas("recon"), recon_prompt(budget, deploy, product), msg, budget,
+                      out / f"transcript-f{rnd}-{i + 1}.jsonl", deadline=until,
+                      reminders=[(_past_half(t0, until, budget),
+                                  "Half of your time or tool budget is used and no extractor has run. Stop "
+                                  "reading: write the extractor for this dispatcher now and run it, then refine.")])
+        except Exception:  # one dispatcher failing must not lose the others
+            pass
+        return sub, sub_llm
+
+    with ThreadPoolExecutor(max_workers=max(1, min(len(left), 6))) as ex:
+        subs = list(ex.map(lambda a: one(*a), enumerate(left[:6])))
+    still: list[str] = []
+    notes = []
+    for sub, sub_llm in subs:
+        for k in ("prompt", "completion", "cached", "reasoning", "calls"):
+            setattr(llm.usage, k, getattr(llm.usage, k) + getattr(sub_llm.usage, k))
+        for name, ex in sorted(sub.extractors.items(), key=lambda kv: kv[1].get("run", 0)):
+            final = name if name not in tb.extractors else f"{name}-f{rnd}"
+            tb._runs = getattr(tb, "_runs", 0) + 1
+            tb.extractors[final] = {**ex, "run": tb._runs}
+            tb.extractor_best[final] = max(tb.extractor_best.get(final, 0), len(ex["entries"]))
+        tb.manual += sub.manual
+        still += sub.unenumerated
+        if sub.notes:
+            notes.append(sub.notes)
+    if notes:
+        tb.notes = (tb.notes + "\n\n" + "\n\n".join(notes)).strip()
+    return still
+
+
 def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
           deadline: float | None = None, hard_deadline: float | None = None) -> dict:
     """Two agents in parallel: one maps the attack surface (entries.json), one the access-control model.
@@ -329,14 +387,19 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         regressions[:] = t.extractor_regressions()
         return bool(regressions)
 
-    tb.finish_gates = [(lambda t: (t.extractors or t.manual) and t.coverage is None,
+    tb.finish_gates = [(lambda t: not t.extractors and not t.manual,
+                        "no extractor has run. Your context already holds what the dispatchers need (a fresh "
+                        "pass would have to read it all again): write an extractor for the dispatcher you "
+                        "understand best, run it with run_extractor, and list the others in unenumerated",
+                        ["run_extractor"]),
+                       (lambda t: (t.extractors or t.manual) and t.coverage is None,
                         "run check_coverage once with a pattern for how this project reads request data",
                         ["check_coverage"]),
                        (regressed, lambda t: "; ".join(regressions) + ". Fix the regression and run the extractor "
                         "again, or finish again if the smaller result is the right one.")]
     llm = LLM(cfg)
-    no_extractor_yet = (lambda steps, t: steps >= cfg.recon_budget // 2 and not t.extractors and not t.manual,
-                        "Half of your tool budget is used and no extractor has run. Stop reading: write an "
+    no_extractor_yet = (_past_half(t_recon, deadline, cfg.recon_budget),
+                        "Half of your time or tool budget is used and no extractor has run. Stop reading: write an "
                         "extractor for the dispatcher you understand best and run it now, then refine.")
     model_ready = (lambda steps, t: holder["done"].is_set() and holder["model"] is not None,
                    lambda t: "The access-control model is ready. Use it to set each entry's exposure (the "
@@ -361,26 +424,20 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         res = {k: (res.get(k, 0) + res2.get(k, 0)) if isinstance(res2.get(k), (int, float)) and k != "finished"
                else res2.get(k) for k in res2}
         passes = 2
-    # Dispatchers the agent found but left unenumerated: follow-up passes, each in a fresh context, given
-    # only what is left. A missing dispatcher hides a whole part of the surface, so these may run past
-    # the recon share by up to RECON_EXTENSION of the remaining budget.
+    # Dispatchers the agent found but left unenumerated: follow-up passes, one fresh agent per dispatcher,
+    # all in parallel (dispatchers are independent, and one context reading all of them runs out of time
+    # before it writes anything). A missing dispatcher hides a whole part of the surface, so these may run
+    # past the recon share by up to RECON_EXTENSION of the remaining budget.
     extend_to = deadline if hard_deadline is None or deadline is None else \
         min(hard_deadline, deadline + RECON_EXTENSION * (hard_deadline - t_recon))
-    while tb.unenumerated and passes < 4 and (extend_to is None or time.time() < extend_to - 120):
+    rounds = 0
+    while tb.unenumerated and rounds < 2 and (extend_to is None or time.time() < extend_to - 120):
         left, n_before = tb.unenumerated, len(tb.entries())
-        budget3 = max(10, cfg.recon_budget // 2)
-        tb.finished, tb.unenumerated = False, []
-        res3 = run_agent(
-            llm, tb, tool_schemas("recon"), recon_prompt(budget3, deploy, product),
-            f"Earlier passes enumerated {n_before} entries with the extractors "
-            f"{', '.join(tb.extractors) or '(none)'} and left these dispatchers unenumerated:\n"
-            + "\n".join(f"- {x}" for x in left) + f"\n\nTheir notes:\n{tb.notes}\n\nWrite one extractor per "
-            "dispatcher above (keep the existing extractors), run each with run_extractor, fix what the checks "
-            "report, then finish with the notes updated and unenumerated listing any dispatcher still left.",
-            budget3, out / f"transcript-{passes + 1}.jsonl", deadline=extend_to)
+        tb.unenumerated = []
+        rounds += 1
+        found = _followup(cfg, root, out, tb, left, deploy, product, extend_to, holder, llm, rounds)
         passes += 1
-        res = {k: (res.get(k, 0) + res3.get(k, 0)) if isinstance(res3.get(k), (int, float)) and k != "finished"
-               else res3.get(k) for k in res3}
+        tb.unenumerated = [x for x in found if x not in left]  # a dispatcher it still could not do is not retried
         if len(tb.entries()) == n_before:  # no progress: stop rather than loop
             break
     # the review needs the model: wait for the access agent within the deadline

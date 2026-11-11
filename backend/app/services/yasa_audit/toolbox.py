@@ -408,7 +408,10 @@ class Toolbox:
             r = subprocess.run([sys.executable, "-I", str(script), str(self.root)], capture_output=True,
                                text=True, timeout=timeout, cwd=work, env=env, input=stdin)
         except subprocess.TimeoutExpired:
-            return False, f"error: program ran longer than {timeout} s"
+            return False, (f"error: program ran longer than {timeout} s. Reading and parsing source files takes "
+                           "seconds; a run this long is almost always a loop that does not advance (a while "
+                           "loop whose index is not moved on every branch) or a regex that backtracks on long "
+                           "input. Fix that rather than narrowing the input.")
         if r.returncode:
             return False, clip(f"error: program exited {r.returncode}\n{r.stderr[-3000:]}", 4000)
         return True, r.stdout
@@ -491,7 +494,7 @@ class Toolbox:
         print a JSON list of entries. The result replaces any earlier extractor of the same name."""
         if not re.fullmatch(r"[\w-]{1,40}", str(name)):
             return "error: name must be 1-40 letters, digits, '-' or '_'"
-        ok, out = self._run_python(code, "extractor")
+        ok, out = self._run_python(code, "extractor", timeout=60)
         if not ok:
             return out
         try:

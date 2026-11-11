@@ -563,7 +563,7 @@ def test_agent_loop_explains_unparsable_arguments_and_forces_finish(tmp_path):
 
 
 @needs_rg
-def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
+def test_recon_pass_that_read_the_code_writes_the_extractor(tmp_path, monkeypatch):
     from app.services.yasa_audit import pipeline
 
     _write(tmp_path, {"api/Posts.java": "class Posts {\n  Mono<ServerResponse> list(ServerRequest r) {\n"
@@ -573,12 +573,10 @@ def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
     model = {"authentication": "session", "authorization": "RBAC filter", "permission_mapping": "verb+path",
              "ladder": ["anonymous", "admin"], "shared_protections": "none", "principals": "anonymous < user", "evidence": [{"file": "api/Posts.java", "line": 2,
                                                              "quote": "list(ServerRequest r)"}]}
-    script = [("list_dir", {})] * 8 + [                       # pass 1 only reads (budget 2, +6 grace) ...
-              ("finish", {"notes": "RouterFunction beans: /apis/posts -> Posts::list"}),  # ... forced finish
-              ("run_extractor", {"name": "router", "code": extractor}),                  # pass 2
+    script = [("list_dir", {})] * 8 + [                       # the pass only reads (budget 2, +6 grace) ...
+              ("run_extractor", {"name": "router", "code": extractor}),  # ... then is offered only the gate's tools
               ("record_access_model", model),
-              ("check_coverage", {"request_read_pattern": r"queryParam\("}),
-              ("finish", {"notes": "RouterFunction beans, 1 extractor"})]
+              ("check_coverage", {"request_read_pattern": r"queryParam\("})]
     surface = ScriptedLLM([x for x in script if x[0] != "record_access_model"])
     access = ScriptedLLM([("record_access_model", model), ("finish", {})])
     seen = []
@@ -592,8 +590,9 @@ def test_recon_second_pass_turns_notes_into_extractors(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "LLM", ByRole(access=access, surface=surface))
     cfg = _cfg(recon_budget=2)
     m = pipeline.recon(cfg, tmp_path, tmp_path / "recon")
-    assert m["passes"] == 2 and m["source"] == "agent" and m["entries"] == 1 and m["resolved"] == 1
-    assert any("/apis/posts -> Posts::list" in x for x in seen) and m["notes"] == "RouterFunction beans, 1 extractor"
+    # finish is refused until an extractor ran, so the pass that read the code writes it (no second pass)
+    assert m["passes"] == 1 and m["source"] == "agent" and m["entries"] == 1 and m["resolved"] == 1
+    assert any("no extractor has run" in x for x in seen) and m["coverage"] is not None
     assert m["access_model"]["principals"] == "anonymous < user"
 
 
@@ -1290,11 +1289,14 @@ def test_recon_follows_up_on_dispatchers_left_unenumerated(tmp_path, monkeypatch
 
     proj = tmp_path / "p"
     _write(proj, {"web/Home.php": "<?php\nfunction home() { echo $_GET['q']; }\n",
-                  "api/Users.php": "<?php\nfunction users() { echo $_GET['id']; }\n"})
+                  "api/Users.php": "<?php\nfunction users() { echo $_GET['id']; }\n",
+                  "hook/Push.php": "<?php\nfunction push() { echo $_POST['ref']; }\n"})
     web = ("import json\nprint(json.dumps([{'route': '/home', 'handler_file': 'web/Home.php', 'handler': 'home', "
            "'exposure': 'public'}]))")
     api = ("import json\nprint(json.dumps([{'route': '/api/users', 'handler_file': 'api/Users.php', "
            "'handler': 'users', 'exposure': 'public'}]))")
+    hook = ("import json\nprint(json.dumps([{'route': '/hook/push', 'handler_file': 'hook/Push.php', "
+            "'handler': 'push', 'exposure': 'public'}]))")
     users = []
     scripts = {
         "access": [("record_access_model", {"authentication": "none", "authorization": "none",
@@ -1305,9 +1307,11 @@ def test_recon_follows_up_on_dispatchers_left_unenumerated(tmp_path, monkeypatch
                    ("finish", {"notes": "open"})],
         "recon": [("run_extractor", {"name": "web", "code": web}),
                   ("check_coverage", {"request_read_pattern": r"\$_GET"}),
-                  ("finish", {"notes": "web pages and a JSON API", "unenumerated": ["API: api/*.php functions"]})],
-        "follow": [("run_extractor", {"name": "api", "code": api}),
-                   ("finish", {"notes": "web pages and a JSON API, both enumerated"})],
+                  ("finish", {"notes": "web pages and a JSON API", "unenumerated": ["API: api/*.php functions", "hooks: hook/*.php"]})],
+        "API": [("run_extractor", {"name": "api", "code": api}),
+                ("finish", {"notes": "the JSON API is enumerated"})],
+        "hooks": [("run_extractor", {"name": "web", "code": hook}),  # a taken name: kept apart on merge
+                  ("finish", {"notes": "hooks enumerated"})],
     }
 
     class Router(ScriptedLLM):
@@ -1315,7 +1319,7 @@ def test_recon_follows_up_on_dispatchers_left_unenumerated(tmp_path, monkeypatch
             if not self.script and len(messages) == 2:
                 user = messages[1]["content"]
                 users.append(user)
-                key = ("follow" if "left these dispatchers unenumerated" in user else
+                key = (("API" if "- API:" in user else "hooks") if "ONE dispatcher they left out" in user else
                        "access" if "controls ACCESS" in messages[0]["content"] else "recon")
                 self.script = list(scripts[key])
             return super().chat(messages, tools)
@@ -1323,6 +1327,22 @@ def test_recon_follows_up_on_dispatchers_left_unenumerated(tmp_path, monkeypatch
     monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
     now = time.time()
     m = pipeline.recon(_cfg(), proj, tmp_path / "out", deadline=now + 900, hard_deadline=now + 1800)
-    follow = next(u for u in users if "left these dispatchers unenumerated" in u)
-    assert "- API: api/*.php functions" in follow and "extractors web" in follow
-    assert m["entries"] == 2 and m["passes"] == 2 and m["notes"].endswith("both enumerated")
+    follow = [u for u in users if "ONE dispatcher they left out" in u]
+    assert len(follow) == 2 and all("extractors web" in u for u in follow)  # one fresh agent per dispatcher
+    assert any("- API: api/*.php functions" in u for u in follow)
+    assert m["entries"] == 3 and m["passes"] == 2
+    assert "JSON API is enumerated" in m["notes"] and "hooks enumerated" in m["notes"]
+    assert set(m["extractors"]) == {"web", "api", "web-f1"}
+
+
+def test_extractor_nudge_fires_on_time_as_well_as_steps(tmp_path):
+    from app.services.yasa_audit import pipeline
+    from app.services.yasa_audit.toolbox import Toolbox
+
+    tb = Toolbox(_cfg(), tmp_path, tmp_path)
+    now = time.time()
+    assert not pipeline._past_half(now, now + 600, 60)(3, tb)  # early, few steps
+    assert pipeline._past_half(now - 400, now + 200, 60)(3, tb)  # past half of the time window
+    assert pipeline._past_half(now, now + 600, 60)(30, tb)  # half of the steps
+    tb.extractors["x"] = {"entries": [], "run": 1}
+    assert not pipeline._past_half(now - 400, now + 200, 60)(30, tb)  # an extractor ran: no nudge
