@@ -107,11 +107,11 @@ def run_entry_audit(cfg: AuditConfig, root: Path, out: Path, deploy: str, produc
     m = run(cfg, root, out, deploy, product, start, deadline)
     data = json.loads((out / "review" / "findings.json").read_text())
     return {**m, "findings": data["findings"], "not_reviewed": data.get("not_reviewed", []),
-            "tokens": m["total_tokens"]}
+            "design_worksheet": data.get("design_worksheet", []), "tokens": m["total_tokens"]}
 
 
 def _describe(f: dict) -> str:
-    parts = [f"[yasa_audit/entry review] verdict: {f.get('verdict')}"]
+    parts = [f"[yasa_audit/{f.get('unit_kind') or 'entry'} review] verdict: {f.get('verdict')}"]
     if f.get("documented_intent"):
         di = f["documented_intent"]
         di = di if isinstance(di, dict) else (di or [{}])[0]
@@ -168,6 +168,6 @@ def to_deepaudit_findings(findings: list[dict]) -> list[dict]:
             "confidence": (0.85 if f.get("verdict") == "confirmed" else 0.6)
             - (0.2 if (f.get("verification") or {}).get("verdict") == "uncertain" else 0),
             "cwe_id": cwe or None,
-            "verification_method": "yasa_audit entry review (static, not executed)",
+            "verification_method": f"yasa_audit {f.get('unit_kind') or 'entry'} review (static, not executed)",
         })
     return out

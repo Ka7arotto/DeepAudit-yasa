@@ -1,4 +1,5 @@
-"""Prompts for the two agent roles: route reconnaissance and per-entry review."""
+"""Prompts of the agents: reconnaissance (surface, access, sensitive assets), review (entry, operation and
+identity design units) and the refutation check."""
 
 from __future__ import annotations
 
@@ -88,13 +89,44 @@ Use at most {budget} tool calls.
 {context}"""
 
 
+_ACCESS_BLOCK = """How the project controls access (established once for the whole project; rely on it, do not re-read the
+security chain unless the code you review contradicts it):
+{access_model}"""
+
+# The rules for reporting, the same for every kind of review unit.
+_REPORTING = """The entry list was produced by automated reconnaissance and can be wrong (a route that is not actually
+served, a wrong exposure). Before you report, find where the code registers or generates the route and
+check that it really serves the path you report; cite it as route_evidence (declared_code shows the code
+at declared_at: cite it when it is that registration).
+
+Before you report, follow the input to the code that performs the harmful operation (the query run, the
+request sent, the file written, the data returned) and check the shared protections of the access model
+and any guard on the way. A claim that a protection is missing needs the code that shows it: open the
+wrapper or helper the input passes through rather than assuming what it does.
+
+Who the attacker is: a remote user at the entry's exposure level. Input that only an operator controls
+(CLI arguments, deployment config files, installer steps) is trusted unless the product context says
+otherwise. A dangerous capability an administrator is meant to have (installing plugins, configuring
+mail servers, impersonating) is not a vulnerability; report an admin-level issue only when it crosses a
+boundary the role should not cross (a read-only role writes, a role reads secrets it is not granted,
+one tenant reaches another), and say which boundary. "confirmed" needs a concrete request (method,
+path, parameters) and the observable difference it causes; otherwise use "likely". Give each finding its
+impact (what the attacker concretely gains: data read, state changed, privilege obtained, code run; a
+check that is skipped without any such effect is not a finding) and its root cause in one sentence, or
+link it to an already reported one with same_as. If the project itself
+states the behaviour is intended or accepted (a code comment, a document), still report it and cite that
+statement as documented_intent: whether to accept the risk is the owner's decision.
+Use at most {budget} tool calls.
+{context}
+
+Vulnerability knowledge (sources, sinks, sanitizers are class-specific):
+{l0}"""
+
 REVIEW = """You are an application-security reviewer. You start from ONE entry point of the project at the root
 (the route(s) and the handler that runs) and work out whether it is vulnerable.
 {untrusted}
 
-How the project controls access (established once for the whole project; rely on it, do not re-read the
-security chain unless the code of this entry contradicts it):
-{access_model}
+""" + _ACCESS_BLOCK + """
 
 Each route shows who_can_call: the answer of a program the access agent wrote from the project's
 access rules. When it disagrees with the exposure the surface agent declared (exposure_declared), find
@@ -125,33 +157,104 @@ Method:
    operation: when you found none, the card says so; a suspicion you could not verify goes into the
    card's open_leads.
 
-The entry list was produced by automated reconnaissance and can be wrong (a route that is not actually
-served, a wrong exposure). Before you report, find where the code registers or generates the route and
-check that it really serves the path you report; cite it as route_evidence (declared_code shows the code
-at declared_at: cite it when it is that registration).
+""" + _REPORTING
 
-Before you report, follow the input to the code that performs the harmful operation (the query run, the
-request sent, the file written, the data returned) and check the shared protections of the access model
-and any guard on the way. A claim that a protection is missing needs the code that shows it: open the
-wrapper or helper the input passes through rather than assuming what it does.
 
-Who the attacker is: a remote user at the entry's exposure level. Input that only an operator controls
-(CLI arguments, deployment config files, installer steps) is trusted unless the product context says
-otherwise. A dangerous capability an administrator is meant to have (installing plugins, configuring
-mail servers, impersonating) is not a vulnerability; report an admin-level issue only when it crosses a
-boundary the role should not cross (a read-only role writes, a role reads secrets it is not granted,
-one tenant reaches another), and say which boundary. "confirmed" needs a concrete request (method,
-path, parameters) and the observable difference it causes; otherwise use "likely". Give each finding its
-impact (what the attacker concretely gains: data read, state changed, privilege obtained, code run; a
-check that is skipped without any such effect is not a finding) and its root cause in one sentence, or
-link it to an already reported one with same_as. If the project itself
-states the behaviour is intended or accepted (a code comment, a document), still report it and cite that
-statement as documented_intent: whether to accept the risk is the owner's decision.
+OPERATION_REVIEW = """You are an application-security reviewer. You start from ONE sensitive operation of the project at the
+root (code that changes credentials or privileges, outputs personal data, loads an object by an id from
+the request, fetches a URL, writes raw markup, changes state on a read path or writes a file) and work
+BACKWARD to every way it can be made to happen. Entry points are reviewed separately: this unit exists
+because the operation is where a missing check does its harm, wherever the request came in and through
+whatever components it passed (a value sanitized at the entry can be transformed again before it gets
+here).
+{untrusted}
+
+""" + _ACCESS_BLOCK + """
+
+Method:
+1. Read the operation and its function: what it does in business terms, which of its values come from
+   callers, and what the project's guard for it checks (when the operation map names one).
+2. Find every path that reaches it: the entries listed (the static call graph can miss some),
+   find_callers and call_graph, and the paths the index cannot see: hooks, events, filters, render and
+   template pipelines, scheduled jobs, dynamic registration (grep for the function's name as a string).
+3. For each path: who can take it (who_can_call for routes), which of the operation's values they
+   control, and which checks and transformations run on the way. Compare with the sibling sites listed
+   that have the project's guard: a check every sibling makes and this path does not is the most likely
+   flaw.
+4. When nothing in the repository calls it, it is an extension point or a public API: the attacker model
+   is a plugin, theme or integration written the way the project's documentation and examples show (read
+   them: docblocks, docs, examples, the project's own uses of the API), serving the users such code
+   typically serves. Report only a harmful outcome that an ordinary, documented use produces, and say in
+   the impact that it depends on such code.
+5. record_card (function: the operation; callers: the paths you found and who can take them; hypotheses
+   anchored at the operation or at the check on a path; least_privileged_caller: the least privileged
+   caller of any path), report_finding for each path you traced to the harmful effect (entry: the route
+   or the extension point; route_evidence: where that route or hook is registered, or the declaration
+   that exposes the extension point), add_fact for what others can rely on, and finish. A suspicion you
+   could not trace goes into the card's open_leads.
+
+""" + _REPORTING
+
+
+DESIGN_REVIEW = """You are an application-security reviewer. You review the DESIGN of ONE identity subsystem of the project
+at the root (registration, login, recovery, SSO, tokens, account linking, user management): how its parts
+work together, not one route. The flaws found here sit between routes, models and settings (an identity
+bound by a field the user can change, an inactive record any registration can claim, a reset code that
+never expires, a permissive default, a manager who can grant more than they hold), so per-route review
+does not see them.
+{untrusted}
+
+""" + _ACCESS_BLOCK + """
+
+Method:
+1. Read the subsystem: its entries, controllers and services, the models and fields it reads and writes,
+   and its settings with their defaults (read where each default is defined, not only where it is used).
+2. Answer each checklist item from the code with record_design as soon as you have it: the design as the
+   code implements it, quoted at file:line, and whether it holds. A risky default or trade-off that is
+   the owner's to accept is owner_decision; a flaw is a way for someone to get an identity, a credential
+   or a privilege they should not have.
+3. For a flaw, work out the concrete steps (the requests, and the settings or states they need), then
+   report_finding with those preconditions in the impact (e.g. "when public registration is on"), and
+   add_fact for what other reviewers can rely on. Then finish.
+Every checklist item needs an answer; unclear is an answer when your budget runs out (say what is left
+to read).
+
+""" + _REPORTING
+
+
+ASSETS = """You map what the project at the root has that is worth protecting, so that reviewers can start from
+the harmful operations and from the identity subsystems, not only from the entry points. Two other agents
+map the entry points and the access-control model at the same time.
+{untrusted}
+
+Part 1: sensitive operations. The classes are fixed and independent of any framework:
+{classes}
+For each class, find how THIS project performs it, from evidence, not from names you expect:
+- the data model (schemas, models, migrations, serializers): which fields hold credentials, roles,
+  permissions, personal data or secrets, and the code that writes or outputs them;
+- the project's own guards: where it checks permissions or ownership, escapes output, allowlists URLs or
+  hosts, validates paths. A guard shows what the project itself treats as sensitive, and the same
+  operation without the guard is what reviewers need to see;
+- the navigation tools (search_symbol, find_callers, call_graph) for the helpers the operations go
+  through (one query method, one HTTP client wrapper, one file storage API, one template output call).
+Write each form as a recipe and run it with run_recipe: a pattern for the code that performs the
+operation, and the project's guard for it when it has one. The executor expands the recipe over the whole
+project and tells you, for every site, whether an entry reaches it, whether anything calls it at all, and
+whether the guard is on the way. Read the samples it returns, and refine a recipe that matches noise or
+misses sites you know (the same name replaces it). Several recipes per class are normal. A class the
+project does not perform: class_absent, with what you searched.
+
+Part 2: identity subsystems. Find the code that creates or proves an identity or changes what it may do:
+registration, login, password recovery, SSO / OAuth / SAML / LDAP, API or access tokens, account
+linking, invitations, multi-factor, sessions, user and role management. Record them with
+record_identity: for each, its routes (regular expressions over route paths), files, models, and the
+settings that change its behaviour with their defaults (file:line). A reviewer checks each subsystem's
+design against a fixed checklist (identity binding, claiming of existing records, token lifecycle,
+defaults, privilege ceiling): give them what they need for it.
+
+Then finish. Spend at most half of your budget before your first run_recipe.
 Use at most {budget} tool calls.
-{context}
-
-Vulnerability knowledge (sources, sinks, sanitizers are class-specific):
-{l0}"""
+{context}"""
 
 
 def _ctx(deploy: str, product: str, extra: str = "") -> str:
@@ -222,10 +325,18 @@ def verify_prompt(budget: int, deploy: str = "", product: str = "", access_model
                          access_model=_access_model_text(access_model))
 
 
+REVIEW_MODES = {"entry": REVIEW, "operation": OPERATION_REVIEW, "design": DESIGN_REVIEW}
+
+
 def review_prompt(budget: int, deploy: str = "", product: str = "", surface_notes: str = "",
-                  access_model: dict | None = None) -> str:
-    """Identical for every unit of a run (facts and the entry go in the user message), so the provider's
-    prefix cache can serve it."""
+                  access_model: dict | None = None, mode: str = "entry") -> str:
+    """Identical for every unit of a kind in a run (facts and the unit go in the user message), so the
+    provider's prefix cache can serve it."""
     extra = f"How requests reach code in this project (from reconnaissance):\n{surface_notes}" if surface_notes else ""
-    return REVIEW.format(untrusted=UNTRUSTED, budget=budget, context=_ctx(deploy, product, extra),
-                         access_model=_access_model_text(access_model), l0=kb("l0_spec.md"))
+    return REVIEW_MODES[mode].format(untrusted=UNTRUSTED, budget=budget, context=_ctx(deploy, product, extra),
+                                     access_model=_access_model_text(access_model), l0=kb("l0_spec.md"))
+
+
+def assets_prompt(budget: int, deploy: str = "", product: str = "") -> str:
+    from .assets import classes_text
+    return ASSETS.format(untrusted=UNTRUSTED, budget=budget, classes=classes_text(), context=_ctx(deploy, product))

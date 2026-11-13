@@ -218,6 +218,14 @@ class Toolbox:
         self.decisions: dict[str, dict] = {}  # the access agent's who-can-call program
         # (condition, message): finish is refused while a condition holds (e.g. no access model yet)
         self.finish_gates: list[tuple[Any, str]] = []
+        # the sensitive-asset map (assets agent): operation recipes, absent classes, identity subsystems
+        self.recipes: dict[str, dict] = {}
+        self.absent: dict[str, str] = {}
+        self.identity: list[dict] | None = None
+        self.entries_source: Any = None  # callable: the entries the surface agent has enumerated so far
+        self._calls: Any = None
+        self.design: dict[str, dict] = {}  # identity design review: checklist item -> answer
+        self.anchors: Any = None  # assets.Anchors shared by the review units
 
     # ---------- helpers ----------
     def _safe(self, rel: str) -> Path:
@@ -320,9 +328,11 @@ class Toolbox:
         """Union of all extractor outputs and manual entries. One entry per (method, route, handler file):
         the most recently run extractor wins, and an entry whose handler does not resolve is dropped when
         another one for the same request does (two services may serve the same path from different files)."""
+        # sorted() copies the values before calling the key: another agent's thread reads the entries
+        # while this one adds extractors
         runs = sorted(self.extractors.values(), key=lambda ex: ex.get("run", 0))
         by_req: dict[tuple, dict[str, dict]] = {}
-        for e in [x for ex in runs for x in ex["entries"]] + self.manual:  # later ones replace earlier ones
+        for e in [x for ex in runs for x in ex["entries"]] + list(self.manual):  # later ones replace earlier ones
             by_req.setdefault((e.get("method", "ANY"), e.get("route")), {})[str(e.get("handler_file"))] = e
         out = []
         for cands in by_req.values():
@@ -599,6 +609,107 @@ class Toolbox:
                              for f, rows in sorted(by_file.items(), key=lambda kv: -len(kv[1]))[:25]]}
         return clip(json.dumps(res, ensure_ascii=False, indent=1))
 
+    # ---------- sensitive-asset map ----------
+    def call_index(self):
+        from .assets import CallIndex
+        if self._calls is None:
+            self._calls = CallIndex(self.root)
+        return self._calls
+
+    def _entries_now(self) -> list[dict]:
+        return list(self.entries_source()) if self.entries_source is not None else []
+
+    def run_recipe(self, name: str, op_class: str, pattern: str, glob: str = "", exclude: str = "",
+                   guard: str = "", why: str = "") -> str:
+        """Expand a recipe for one form of a sensitive operation over the whole project and place every
+        site in the call graph. The same name replaces the earlier version."""
+        from .assets import MAX_SITES, OP_CLASSES, check_recipe, counters, expand
+        r = {"name": str(name), "op_class": str(op_class), "pattern": str(pattern or ""), "glob": str(glob or ""),
+             "exclude": str(exclude or ""), "guard": str(guard or ""), "why": str(why or "")[:400]}
+        err = check_recipe(r)
+        if err:
+            return f"rejected: {err}"
+        try:
+            rows = self.grep_rows(r["pattern"], r["glob"])
+        except subprocess.TimeoutExpired:
+            return "error: search timed out; narrow the pattern or the glob"
+        if len(rows) > MAX_SITES:
+            return (f"rejected: {len(rows)} matches. A recipe matches the operation itself (the call or "
+                    "assignment that performs it), not every mention of a word: narrow it")
+        entries = self._entries_now()
+        sites = expand(r, rows, self.call_index(), entries)
+        self.recipes[r["name"]] = r
+        self.absent.pop(r["op_class"], None)
+        res = counters(r, sites, len(entries))
+        if not self.call_index().indexed:
+            res["note_index"] = "no code index: every site counts as file-level code, reach is by handler file"
+        if self.entries_source is not None:
+            res["entries_note"] = "the surface agent is still enumerating entries; reach is against those so far"
+        left = [c for c in OP_CLASSES if c not in {x["op_class"] for x in self.recipes.values()}
+                and c not in self.absent]
+        res["classes_left"] = left
+        return clip(json.dumps(res, ensure_ascii=False, indent=1))
+
+    def drop_recipe(self, name: str) -> str:
+        if self.recipes.pop(str(name), None) is None:
+            return f"error: no recipe {name!r}; recipes: {', '.join(self.recipes) or 'none'}"
+        return f"dropped {name}; recipes: {', '.join(self.recipes) or 'none'}"
+
+    def class_absent(self, op_class: str, reason: str) -> str:
+        """Say that the project does not perform a class of operation at all."""
+        from .assets import OP_CLASSES
+        if op_class not in OP_CLASSES:
+            return f"rejected: op_class must be one of {', '.join(OP_CLASSES)}"
+        if not str(reason or "").strip():
+            return "rejected: give the reason (what you searched and found)"
+        if any(r["op_class"] == op_class for r in self.recipes.values()):
+            return f"rejected: a recipe for {op_class} exists; drop_recipe it first if it was wrong"
+        self.absent[op_class] = str(reason)[:400]
+        return f"recorded: {op_class} absent"
+
+    def record_identity(self, subsystems: Any) -> str:
+        """The identity subsystems of the project (replaces an earlier call)."""
+        from .assets import check_identity, group_identity
+        clean, problems = check_identity(subsystems, self.root)
+        if problems and not clean:
+            return "rejected: " + "; ".join(problems[:6])
+        self.identity = clean
+        entries = self._entries_now()
+        rows = [f"- {g['name']} ({g['kind']}): {len(group_identity(g, entries, [])['entry_ids'])} entries so far, "
+                f"{len(g['files'])} files, {len(g['settings'])} settings" for g in clean]
+        return ("recorded " + str(len(clean)) + " subsystem(s)" + (":\n" + "\n".join(rows) if rows else "")
+                + ("\nnot recorded: " + "; ".join(problems[:6]) if problems else ""))
+
+    def record_design(self, items: Any) -> str:
+        """Answers to the identity checklist; each item replaces an earlier answer to it."""
+        from .assets import DESIGN_STATUSES, IDENTITY_CHECKLIST
+        items = [items] if isinstance(items, dict) else items if isinstance(items, list) else []
+        errors = []
+        for it in items:
+            it = it if isinstance(it, dict) else {}
+            key, status = str(it.get("item") or ""), it.get("status")
+            if key not in IDENTITY_CHECKLIST:
+                errors.append(f"unknown item {key!r}")
+                continue
+            if status not in DESIGN_STATUSES:
+                errors.append(f"{key}: status must be one of {', '.join(DESIGN_STATUSES)}")
+                continue
+            if not str(it.get("answer") or "").strip():
+                errors.append(f"{key}: answer is required")
+                continue
+            ev = it.get("evidence") or []
+            ev = [ev] if isinstance(ev, dict) else ev if isinstance(ev, list) else []
+            if status in ("sound", "flaw", "owner_decision"):
+                err = verify_evidence(self.root, ev) if ev else "evidence is required for this status"
+                if err:
+                    errors.append(f"{key}: {err}")
+                    continue
+            self.design[key] = {"item": key, "status": status, "answer": str(it["answer"])[:1500],
+                                "evidence": ev[:6]}
+        left = [k for k in IDENTITY_CHECKLIST if k not in self.design]
+        return "; ".join(errors + [f"answered: {len(self.design)}",
+                                   f"left: {', '.join(left)}" if left else "all items answered"])
+
     # ---------- review / output ----------
     def _anchor_ok(self, anchor: Any) -> bool:
         m = re.match(r"^\s*([^:\s]+):(\d+)", str(anchor or ""))
@@ -622,6 +733,10 @@ class Toolbox:
         unknown = self.facts.cite(card.get("facts_used")) if self.facts is not None else []
         card["_unit"] = self.unit
         self.cards = [card]  # a later call updates the card
+        if self.anchors is not None:
+            for h in hyps:
+                if isinstance(h, dict):
+                    self.anchors.add(h.get("anchor"))
         return "card recorded" + (f" (unknown fact ids ignored: {unknown})" if unknown else "")
 
     UPHOLD_STAGES = ("input_validation", "permission", "operation")
@@ -737,7 +852,9 @@ class Toolbox:
 
 
 def tool_schemas(role: str) -> list[dict]:
-    """role: 'recon' (surface), 'access' (access-control model), 'review' or 'verify' (refutation)."""
+    """role: 'recon' (surface), 'access' (access-control model), 'assets' (sensitive-asset map),
+    'review' (entry and operation units), 'design' (identity design units) or 'verify' (refutation)."""
+    from .assets import DESIGN_STATUSES, IDENTITY_CHECKLIST, IDENTITY_KINDS, OP_CLASSES
     def fn(name: str, desc: str, props: dict, required: list[str]) -> dict:
         return {"type": "function", "function": {
             "name": name, "description": desc,
@@ -847,6 +964,42 @@ def tool_schemas(role: str) -> list[dict]:
                "entry handler found so far, grouped by directory.",
                {"request_read_pattern": s, "glob": s, "depth": i}, ["request_read_pattern"]),
         ]
+    elif role == "assets":
+        tools += [
+            fn("run_probe", "Run a throwaway Python 3 program (standard library; project root in sys.argv[1]) "
+               "to explore the code, e.g. list the fields of every model; prints its output.", {"code": s},
+               ["code"]),
+            fn("run_recipe",
+               "Expand a recipe for one form of a sensitive operation over the whole project. pattern: a "
+               "ripgrep regex (case-sensitive, (?i) for insensitive) matching the code that PERFORMS the "
+               "operation in this project (the call, assignment or output), not every mention of a word. "
+               "glob narrows the files (relative to the root). exclude: a Python regex; matching lines are "
+               "dropped. guard: a Python regex for the check this project applies to this operation (a "
+               "permission or ownership check, an escaping or allowlist call); each site says whether it "
+               "is in the operation's function before it or in a close caller. Returns, for the sites, "
+               "whether an entry reaches them, whether anything calls them, the guard counts and samples to "
+               "read. The same name replaces the earlier version.",
+               {"name": s, "op_class": {"type": "string", "enum": list(OP_CLASSES)}, "pattern": s, "glob": s,
+                "exclude": s, "guard": s,
+                "why": {"type": "string", "description": "how this project performs the operation and the "
+                        "evidence (file:line); reviewers read it"}}, ["name", "op_class", "pattern", "why"]),
+            fn("drop_recipe", "Remove a recipe and its sites.", {"name": s}, ["name"]),
+            fn("class_absent", "Say that the project does not perform a class of operation at all, with what "
+               "you searched.", {"op_class": {"type": "string", "enum": list(OP_CLASSES)}, "reason": s},
+               ["op_class", "reason"]),
+            fn("record_identity",
+               "Record the identity subsystems (an empty list if the project creates no identities). A later "
+               "call replaces the earlier one.",
+               {"subsystems": {"type": "array", "items": {"type": "object", "properties": {
+                   "name": s, "kind": {"type": "string", "enum": list(IDENTITY_KINDS)},
+                   "routes": {"type": "array", "items": s, "description": "regular expressions over route "
+                              "paths as the surface agent writes them (e.g. ^/users/(register|signup))"},
+                   "files": {"type": "array", "items": s, "description": "controllers, services, directories"},
+                   "models": {"type": "array", "items": s, "description": "model, schema or migration files"},
+                   "settings": {"type": "array", "items": s, "description": "configuration keys that change "
+                                "its behaviour, with their defaults and file:line"},
+                   "notes": s}, "required": ["name", "kind"]}}}, ["subsystems"]),
+        ]
     elif role == "verify":
         tools += [
             fn("who_can_call", "Who can call a request (method, path) under the project's access rules, "
@@ -927,6 +1080,22 @@ def tool_schemas(role: str) -> list[dict]:
                {"statement": s, "evidence": {"type": "array", "items": {"type": "object", "properties": {
                    "file": s, "line": i, "quote": s}}}}, ["statement", "evidence"]),
         ]
+    if role == "design":
+        tools.append(fn(
+            "record_design",
+            "Answer checklist items of the identity design review (a later answer to an item replaces the "
+            "earlier one). status: sound (the design holds, evidence quoted), flaw (it does not; also "
+            "report_finding when you traced the harm), owner_decision (a risky default or trade-off the "
+            "owner must accept or change, evidence quoted), unclear (say what is left to read), "
+            "not_applicable.",
+            {"items": {"type": "array", "items": {"type": "object", "properties": {
+                "item": {"type": "string", "enum": list(IDENTITY_CHECKLIST)},
+                "status": {"type": "string", "enum": list(DESIGN_STATUSES)},
+                "answer": {"type": "string", "description": "the design as the code implements it, and why "
+                           "it holds or not"},
+                "evidence": {"type": "array", "items": {"type": "object", "properties": {
+                    "file": s, "line": i, "quote": s}}}}, "required": ["item", "status", "answer"]}}},
+            ["items"]))
     if role == "recon":
         tools.append(fn("finish", "Call once when you are done. unenumerated: every dispatcher you found but "
                         "did not enumerate (yet), each with where its routes are declared; another pass will "

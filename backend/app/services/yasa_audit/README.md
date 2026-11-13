@@ -1,9 +1,12 @@
-# yasa_audit: entry-first audit
+# yasa_audit: entry-first audit, with sensitive operations and identity design
 
-Two stages under one wall-clock budget (default 30 minutes):
+Three stages under one wall-clock budget (default 30 minutes):
 
-1. **recon** — an agent maps the attack surface of the project.
-2. **review** — every entry point is reviewed in its own fresh context.
+1. **recon** — agents map the attack surface, the access-control model and what is worth protecting
+   (sensitive operations, identity subsystems).
+2. **review** — every entry point, every sensitive operation outside a handler and every identity
+   subsystem is reviewed in its own fresh context.
+3. **verify** — every reported root cause gets a sceptical agent that tries to refute it.
 
 There is no per-framework code, no routing DSL and no sink list. Project knowledge lives in what the
 agents write (extractor programs, entry cards, verified facts), and correctness comes from checks that
@@ -37,6 +40,63 @@ If the agent produces nothing usable, codegraph's own routes are used so the rev
 Output: `recon/entries.json`, `recon/recon.json` (counts, coverage, the agent's notes on each
 dispatcher), `recon/extractors/*.py`.
 
+## Sensitive operations and identity subsystems (`assets.py`)
+
+Starting only from entries misses three kinds of flaw. The first is code that no route reaches
+directly: render pipelines, hooks, and extension points with no caller in the repository. The second is
+a value that is sanitized at the entry and transformed again by another component. The third is the
+design of a module, such as how a login binds an external identity, which no single route shows. A
+third recon agent, running in parallel with the other two, maps the other end of the flow.
+
+**Operations.** The classes are fixed, describe effects rather than frameworks, and never change per
+project:
+
+| Class | The operation |
+| --- | --- |
+| `credential_or_privilege_write` | sets a password, credential, token, role, group or permission |
+| `personal_data_output` | puts email, IP, password hash, token, ... into something others read |
+| `object_by_request_id` | loads, changes or deletes an object chosen by a request id |
+| `outbound_request` | the server fetches a URL or connects to a host |
+| `raw_markup_output` | data written into HTML or an attribute without the project's escaping |
+| `state_change_in_read_path` | persistent state changed by a GET, a permission callback, a renderer |
+| `file_write` | writes, moves, extracts or deletes a file |
+
+How *this* project performs each class is found from evidence, not from a rule list:
+
+- the sensitive fields of its data model;
+- the guards the project applies itself (a permission or ownership check, an escaping call, an
+  allowlist), which show what it treats as sensitive;
+- the helpers that codegraph navigation leads to.
+
+The agent writes each form as a declarative **recipe**:
+
+```json
+{"name": "role-write", "op_class": "credential_or_privilege_write", "pattern": "->role\\s*=",
+ "guard": "requireAdmin\\(|->can\\(", "why": "users.role, set by Users::actionSave (app/Users.php:5)"}
+```
+
+`run_recipe` expands a recipe over the whole project (tests and vendored code left out). It places
+every site in codegraph's call graph, following calls through interfaces and parent methods, and returns
+counters the agent refines the recipe on, just as it refines an extractor on coverage:
+
+| Counter | Meaning |
+| --- | --- |
+| `handler` | the site is in an entry's handler |
+| `entry` | an enumerated entry reaches the site through calls |
+| `no_callers` | nothing in the repository calls the site: a framework hook, an extension point, a public API, or dead code |
+| `internal` | something calls the site, but no enumerated entry reaches it |
+| `guarded` / `unguarded` | whether the guard pattern appears in the operation's function before it, or in a caller within three calls |
+
+The agent can finish only when each class has a recipe or has been declared absent (`class_absent`,
+with what it searched).
+
+**Identity subsystems.** The same agent records registration, login, recovery, SSO, tokens, account
+linking, invitations, MFA, sessions and user management with `record_identity`. Each subsystem carries
+its route patterns, files, models and settings (defaults with `file:line`).
+
+Once the entries are final, the recipes are expanded again against them, and the subsystems are joined
+to their entries and sites. Output: `recon/assets.json`.
+
 ## review
 
 Entries that run the same handler form one unit; units are ordered public → unknown → authenticated →
@@ -54,9 +114,53 @@ Facts are accepted only when each quote is found at the cited file:line, so late
 them instead of re-deriving the same framework behaviour. The system prompt is identical for every unit
 (facts and the entry go in the user message), which keeps the provider's prefix cache effective.
 
-There is no re-review stage. Output: `review/findings.json` (with `not_reviewed` entry ids when the
-budget runs out), `review/cards.json`, `review/facts.json`, `metrics.json` (tokens, cached tokens,
-reasoning tokens, wall time).
+There is no re-review stage.
+
+### Three kinds of unit
+
+| Kind | Unit | Starts from | Question |
+| --- | --- | --- | --- |
+| entry | entries sharing one handler | the route, forward | is this entry vulnerable? |
+| operation | a function performing sensitive operations outside every handler | the operation, backward | can anyone make it happen with values they control? |
+| design | one identity subsystem (at most `design_units_max`) | routes, models and settings together | does the design hold? |
+
+- **Operation units.** A site inside a handler is not a unit of its own: it is listed in that entry's
+  unit ("sensitive operations in this handler"), so the code is reviewed once. Every other site is
+  grouped by function. The reviewer works backward through the entries listed and through paths the
+  index cannot see (hooks, events, render pipelines, jobs). It is shown sibling sites of the same recipe
+  where the project's guard is on the way: a check the siblings make and this path does not is the
+  most likely flaw. When nothing calls the code, the threat model is a plugin or integration written
+  the way the project's documentation shows. Units are ordered by the exposure of the entries that
+  reach them, with unguarded and caller-less sites first. If an entry reviewer has already anchored a
+  hypothesis at the same `file:line`, the operation unit is skipped and the result is shared.
+- **Design units.** The reviewer answers a fixed checklist with `record_design` and cannot finish until
+  every item is answered:
+  - identity binding;
+  - claiming of existing records (inactive, guest, pending);
+  - token lifecycle (expiry, single use, hashing, constant-time comparison, revocation);
+  - defaults;
+  - privilege ceiling (granting or reaching more than one holds).
+
+  Each answer has a status:
+  - `sound`, `flaw` and `owner_decision` need quoted evidence;
+  - `unclear` and `not_applicable` do not.
+
+  A flaw that has been traced to its harm is also reported as a finding, with its preconditions in the
+  impact.
+
+The schedule puts design units first, because they are few and nothing else covers them. Entry units
+follow, and operation units take every `operation_every`-th slot, so neither kind waits for the other to
+be used up. All units share facts, root causes and anchors. Each finding carries `unit_kind`.
+
+Output:
+- `review/findings.json`:
+  - `findings`;
+  - `open_leads`;
+  - `design_worksheet`: per subsystem, every checklist item with its status, answer and evidence. This is
+    what a human reviews for defaults and design trade-offs.
+  - `not_reviewed`, `not_reviewed_operations` and `not_reviewed_design`, when the budget runs out.
+- `review/cards.json`, `review/facts.json`.
+- `metrics.json`: units of each kind, tokens, cached tokens, reasoning tokens, wall time.
 
 ## Usage
 

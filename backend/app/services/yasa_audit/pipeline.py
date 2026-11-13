@@ -4,9 +4,16 @@ recon  : an agent works out how requests reach code in THIS project (directory l
          evidence, navigation tools), writes extractor programs that enumerate every entry, and checks
          them (handlers resolve to code, sampled entries read correctly, request-reading code is reachable
          from some entry). Output: entries.json.
-review : each entry (entries sharing one handler are one unit) is reviewed in a fresh context: what it
-         does, who can call it, its access-control verdict, risks plausible for that function, each traced
-         to a confirmed path or rejected. Reviewers share verified project facts. No later re-review.
+         In parallel, an agent maps what is worth protecting (assets.py): recipes for seven fixed classes of
+         sensitive operation, expanded over the project and placed in the call graph, and the identity
+         subsystems. Output: assets.json.
+review : three kinds of unit, each in a fresh context, sharing verified facts and root causes:
+         - entry: entries sharing one handler; what it does, who can call it, its access-control verdict,
+           risks plausible for that function, each traced to a confirmed path or rejected;
+         - operation: a function performing sensitive operations outside any handler, reviewed backward
+           to every path that reaches it (entries, hooks, render pipelines) or, with no caller in the
+           repository, as an extension point used the way the project documents it;
+         - design: one identity subsystem against a fixed checklist; answers form a design worksheet.
 """
 
 from __future__ import annotations
@@ -20,11 +27,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from . import assets as assets_map
 from .agent_loop import run_agent
 from .config import AuditConfig
 from .discovery import codegraph_db, codegraph_routes, snapshot_codegraph
 from .llm import LLM, limiter_for
-from .prompts import access_model_text, access_prompt, recon_prompt, review_prompt
+from .prompts import access_model_text, access_prompt, assets_prompt, recon_prompt, review_prompt
 from .toolbox import EXPOSURES, FactBook, IssueBoard, Toolbox, tool_schemas
 
 MIN_UNIT_S = 60  # do not start a unit with less time left than this
@@ -50,7 +58,8 @@ def _schedule(units: list, work, workers: int, deadline: float | None,
             return work(i, unit)
         except Exception as e:  # keep the batch going
             return {"findings": [], "cards": [], "prompt_tokens": 0, "completion_tokens": 0,
-                    "cached_tokens": 0, "steps": 0, "error": f"{type(e).__name__}: {e}"}
+                    "cached_tokens": 0, "steps": 0, "error": f"{type(e).__name__}: {e}",
+                    **({"kind": unit.get("kind", "entry")} if isinstance(unit, dict) else {})}
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         results = [r for r in ex.map(guarded, enumerate(units)) if r is not None]
@@ -101,6 +110,52 @@ def _access_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
         model = {"unverified_notes": tb.notes[:4000]}
     holder["model"], holder["llm"], holder["resolver"], holder["tb"] = model, llm, tb.resolver_code, tb
     holder["done"].set()
+
+
+def _classes_left(t: Toolbox) -> list[str]:
+    done = {r["op_class"] for r in t.recipes.values()} | set(t.absent)
+    return [c for c in assets_map.OP_CLASSES if c not in done]
+
+
+def _assets_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product: str, deadline: float | None,
+                  user: str, entries_now, holder: dict) -> None:
+    """Maps the sensitive operations (recipes) and the identity subsystems; the map is built from them
+    once the entries are final."""
+    tb = Toolbox(cfg, root, out, unit="assets")
+    tb.entries_source = entries_now
+    tb.finish_gates = [(lambda t: bool(_classes_left(t)),
+                        lambda t: "run a recipe, or class_absent, for: " + ", ".join(_classes_left(t)),
+                        ["run_recipe", "class_absent"]),
+                       (lambda t: t.identity is None,
+                        "record_identity (an empty list if the project creates no identities)", ["record_identity"])]
+    llm, t0 = LLM(cfg), time.time()
+    no_recipe = (lambda steps, t: not t.recipes and (steps >= cfg.assets_budget // 2 or (
+                     deadline is not None and time.time() >= t0 + (deadline - t0) / 2)),
+                 "Half of your time or tool budget is used and no recipe has run. Write recipes now for the "
+                 "operations you have seen, run them, then refine.")
+    try:
+        holder["res"] = run_agent(llm, tb, tool_schemas("assets"), assets_prompt(cfg.assets_budget, deploy, product),
+                                  user, cfg.assets_budget, out / "transcript-assets.jsonl", deadline=deadline,
+                                  reminders=[no_recipe])
+    except Exception as e:  # the review still runs, from the entries only
+        holder["error"] = f"{type(e).__name__}: {e}"
+    holder["tb"], holder["llm"] = tb, llm
+
+
+def _build_assets(holder: dict, entries: list[dict], out: Path) -> dict:
+    """recon/assets.json from the agent's recipes, expanded against the final entries."""
+    tb: Toolbox | None = holder.get("tb")
+    if tb is None:
+        return {"error": holder.get("error") or "the assets agent did not finish in time"}
+    tb.entries_source = None
+    try:
+        data = assets_map.build(tb, dict(tb.recipes), tb.identity, dict(tb.absent), entries)
+    except Exception as e:  # a map that cannot be built must not cost the recon
+        return {"error": f"{type(e).__name__}: {e}"}
+    assets_map.dump(data, out / "assets.json")
+    res = holder.get("res") or {}
+    return {**data["summary"], "steps": res.get("steps"), "finished": res.get("finished"),
+            **({"error": holder["error"]} if holder.get("error") else {})}
 
 
 def _apply_resolver(tb: Toolbox, entries: list[dict], code: str | None, out: Path) -> dict:
@@ -384,6 +439,11 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
     access = threading.Thread(target=_access_agent, daemon=True,
                               args=(cfg, root, out, deploy, product, deadline, user, holder))
     access.start()
+    assets_holder: dict = {}
+    assets_thread = threading.Thread(target=_assets_agent, daemon=True,
+                                     args=(cfg, root, out, deploy, product, deadline, user, tb.entries,
+                                           assets_holder))
+    assets_thread.start()
 
     regressions: list[str] = []
 
@@ -493,20 +553,23 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
     _rank_principals(entries, (holder.get("model") or {}).get("ladder"))
     resolver = {k: v for k, v in resolver.items() if not k.startswith("_")}
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
+    assets_thread.join(timeout=None if hard is None else max(0.0, min(hard, (deadline or hard) + 90) - time.time()))
+    assets_m = _build_assets(assets_holder, entries, out)
     by_exp = collections.Counter(e["exposure"] for e in entries)
     m = _metrics(llm, {"stage": "recon", "source": source, "entries": len(entries),
                        "resolved": sum(e["resolved"] for e in entries), "by_exposure": dict(by_exp),
                        "extractors": {k: len(v["entries"]) for k, v in tb.extractors.items()},
                        "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
                        "access_model": holder["model"], "access_error": holder.get("error"),
-                       "resolver": resolver, "reconcile": reconcile,
+                       "resolver": resolver, "reconcile": reconcile, "assets": assets_m,
                        "passes": passes, **res})
-    if holder.get("llm") is not None:  # both agents' tokens count
-        a = _metrics(holder["llm"], holder.get("res") or {})
+    for h, name in ((holder, "access_agent"), (assets_holder, "assets_agent")):  # every agent's tokens count
+        if h.get("llm") is None:
+            continue
+        a = _metrics(h["llm"], h.get("res") or {})
         for k in ("prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens", "llm_calls"):
             m[k] = m.get(k, 0) + a.get(k, 0)
-        m["access_agent"] = {k: a.get(k) for k in ("steps", "wall_s", "tool_counts", "finished",
-                                                   "prompt_tokens", "llm_calls")}
+        m[name] = {k: a.get(k) for k in ("steps", "wall_s", "tool_counts", "finished", "prompt_tokens", "llm_calls")}
     (out / "recon.json").write_text(json.dumps(m, indent=1, ensure_ascii=False))
     return m
 
@@ -631,15 +694,26 @@ def _handler_snippet(root: Path, unit: dict, lines: int = 70) -> str:
     return f"{unit['handler_file']} lines {start + 1}-{min(len(text), start + lines)} of {len(text)}:\n{body}"
 
 
-def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: list[dict], facts: FactBook,
-                 system: str, deadline: float | None, issues: IssueBoard | None = None,
-                 resolver: str | None = None) -> dict:
-    out.mkdir(parents=True, exist_ok=True)
-    uid = ",".join(e["id"] for e in unit["entries"][:5])
-    tb = Toolbox(cfg, root, out, facts=facts, unit=uid, issues=issues)
-    tb.resolver_code = resolver
-    tb.known_entries = {(str(e.get("method") or "GET").upper(), str(e.get("route"))): e for e in entries}
-    llm = LLM(cfg)
+class _Shared:
+    """What every review unit of a run shares: boards other units write to, prompts, and lookups."""
+
+    def __init__(self, cfg: AuditConfig, root: Path, entries: list[dict], deploy: str, product: str,
+                 surface_notes: str, access_model: dict | None, resolver: str | None, assets: dict,
+                 deadline: float | None):
+        self.entries, self.resolver, self.deadline = entries, resolver, deadline
+        self.facts, self.issues, self.anchors = FactBook(root), IssueBoard(), assets_map.Anchors()
+        self.systems = {k: review_prompt(cfg.review_budget if k != "design" else cfg.design_budget, deploy,
+                                         product, surface_notes, access_model, k)
+                        for k in ("entry", "operation", "design")}
+        self.known = {(str(e.get("method") or "GET").upper(), str(e.get("route"))): e for e in entries}
+        self.recipes = {r["name"]: r for r in assets.get("recipes") or []}
+        self.guarded: dict[str, list[dict]] = collections.defaultdict(list)  # recipe -> sites with its guard
+        for site in assets.get("sites") or []:
+            if site.get("guard_at"):
+                self.guarded[site["recipe"]].append(site)
+
+
+def _entry_brief(root: Path, unit: dict, entries: list[dict]) -> str:
     entry_view = {"routes": [{**{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
                                                         "least_principal", "exposure_declared", "who_can_call",
                                                         "declared_at") if e.get(k)},
@@ -651,30 +725,69 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, entries: l
         entry_view["note"] = ("these handlers are shared by many resources; review them for the resource of "
                               "these routes only (its access rules, ownership and stored data)")
     peers = _peers(unit, entries)
-    user = "\n\n".join(x for x in (
+    return "\n\n".join(x for x in (
         "Entry to review:\n" + json.dumps(entry_view, ensure_ascii=False),
         ("Similar entries (peers):\n" + "\n".join(peers)) if peers else "",
-        facts.prompt_block(),
-        issues.prompt_block() if issues is not None else "",
-        _handler_snippet(root, unit)) if x)
-    seen_facts = {f["id"] for f in facts.facts}
-    seen_issues = {i["id"] for i in issues.issues} if issues is not None else set()
+        assets_map.handler_operations(unit)) if x)
+
+
+def _unit_view(root: Path, unit: dict, sh: _Shared) -> tuple[str, str, str]:
+    """(id for facts and issues, the unit's description, the code to start reading)."""
+    kind = unit.get("kind", "entry")
+    if kind == "operation":
+        first = unit["sites"][0]
+        siblings = [x for site in unit["sites"] for x in sh.guarded.get(site["recipe"], [])
+                    if x["file"] != unit["handler_file"]]
+        start = max(unit["span"][0], first["line"] - 30)
+        code = _handler_snippet(root, {"handler_file": unit["handler_file"], "handler": "", "handler_line": start})
+        return (f"op:{assets_map.site_key(first)}", assets_map.operation_brief(unit, siblings, sh.recipes), code)
+    if kind == "design":
+        return f"design:{unit['handler']}", assets_map.design_brief(unit), ""
+    return (",".join(e["id"] for e in unit["entries"][:5]), _entry_brief(root, unit, sh.entries),
+            _handler_snippet(root, unit))
+
+
+def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, sh: _Shared) -> dict:
+    kind = unit.get("kind", "entry")
+    if kind == "operation" and all(sh.anchors.covers(x["file"], x["line"]) for x in unit["sites"]):
+        # an entry's reviewer already traced this operation: its card and findings are shared
+        return {"kind": kind, "covered": True, "findings": [], "cards": [], "prompt_tokens": 0,
+                "completion_tokens": 0, "cached_tokens": 0, "steps": 0}
+    out.mkdir(parents=True, exist_ok=True)
+    uid, brief, code = _unit_view(root, unit, sh)
+    tb = Toolbox(cfg, root, out, facts=sh.facts, unit=uid, issues=sh.issues)
+    tb.resolver_code, tb.known_entries, tb.anchors = sh.resolver, sh.known, sh.anchors
+    budget = cfg.review_budget
+    if kind == "design":
+        budget = cfg.design_budget
+        left = lambda t: [k for k in assets_map.IDENTITY_CHECKLIST if k not in t.design]  # noqa: E731
+        tb.finish_gates = [(lambda t: bool(left(t)), lambda t: "answer with record_design: " + ", ".join(left(t)),
+                            ["record_design"])]
+    llm = LLM(cfg)
+    user = "\n\n".join(x for x in (brief, sh.facts.prompt_block(), sh.issues.prompt_block(), code) if x)
+    seen_facts = {f["id"] for f in sh.facts.facts}
+    seen_issues = {i["id"] for i in sh.issues.issues}
 
     def updates() -> str | None:
         """What other units verified or reported since this one started (units run in parallel)."""
-        nf = facts.since(seen_facts, uid)
-        ni = issues.since(seen_issues, uid) if issues is not None else []
-        rows = [f"- {f['id']}: {f['statement']}" for f in nf]
+        rows = [f"- {f['id']}: {f['statement']}" for f in sh.facts.since(seen_facts, uid)]
         rows += [f"- {i['id']} ({i['cwe']}, {i['where']}): {i['root_cause']} -> use same_as={i['id']} if this "
-                 "entry has the same root cause" for i in ni]
+                 "unit has the same root cause" for i in sh.issues.since(seen_issues, uid)]
         return ("New from reviewers working in parallel:\n" + "\n".join(rows)) if rows else None
 
-    res = run_agent(llm, tb, tool_schemas("review"), system, user, cfg.review_budget, out / "transcript.jsonl",
-                    deadline=deadline, updates=updates)
+    res = run_agent(llm, tb, tool_schemas("design" if kind == "design" else "review"), sh.systems[kind], user,
+                    budget, out / "transcript.jsonl", deadline=sh.deadline, updates=updates)
+    ids = [e["id"] for e in unit["entries"]]
+    where = f"identity:{unit['handler']}" if kind == "design" else f"{unit['handler_file']}::{unit['handler']}"
     for x in tb.findings + tb.cards:
-        x["entries"] = [e["id"] for e in unit["entries"]]
-        x["handler"] = f"{unit['handler_file']}::{unit['handler']}"
-    return {"findings": tb.findings, "cards": tb.cards, **_metrics(llm, res)}
+        x["entries"], x["handler"], x["unit_kind"] = ids, where, kind
+    design = []
+    if kind == "design":
+        g = unit["subsystem"]
+        design = [{"subsystem": g["name"], "kind": g["kind"], "entries": ids, "files": g["files"],
+                   "settings": g["settings"], "complete": not left(tb),
+                   "items": [tb.design[k] for k in assets_map.IDENTITY_CHECKLIST if k in tb.design]}]
+    return {"kind": kind, "findings": tb.findings, "cards": tb.cards, "design": design, **_metrics(llm, res)}
 
 
 def _exposure_check(cards: list[dict], entries: list[dict]) -> dict:
@@ -682,6 +795,8 @@ def _exposure_check(cards: list[dict], entries: list[dict]) -> dict:
     by_id = {e["id"]: e for e in entries}
     c: collections.Counter = collections.Counter()
     for card in cards:
+        if card.get("unit_kind", "entry") != "entry":  # an operation's callers are other paths
+            continue
         seen = card.get("least_privileged_caller")
         es = [by_id[i] for i in card.get("entries", []) if i in by_id]
         if seen not in (*EXPOSURES, "denied") or not es:
@@ -697,35 +812,51 @@ def _exposure_check(cards: list[dict], entries: list[dict]) -> dict:
 
 def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy: str = "", product: str = "",
            surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None,
-           resolver: str | None = None) -> dict:
+           resolver: str | None = None, assets: dict | None = None) -> dict:
+    """Review every unit: identity design units first (few, and nothing else covers them), then entry
+    units with operation units interleaved."""
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    units = _units(entries)
-    facts = FactBook(root)
-    issues = IssueBoard()
-    system = review_prompt(cfg.review_budget, deploy, product, surface_notes, access_model)
-    results, skipped = _schedule(
-        units, lambda i, u: _review_unit(cfg, root, out / f"unit-{i:04d}", u, entries, facts, system, deadline,
-                                  issues, resolver),
-        cfg.workers, deadline, cfg.stopped)
+    assets = assets or {}
+    units = [{**u, "kind": "entry"} for u in _units(entries)]
+    sites = assets.get("sites") or []
+    ops = assets_map.operation_units(sites, entries, units, EXPOSURE_RANK)
+    designs = assets_map.design_units(assets.get("identity") or [], entries, sites, cfg.design_units_max)
+    order = designs + assets_map.interleave(units, ops, cfg.operation_every)
+    sh = _Shared(cfg, root, entries, deploy, product, surface_notes, access_model, resolver, assets, deadline)
+    results, skipped = _schedule(order, lambda i, u: _review_unit(cfg, root, out / f"unit-{i:04d}", u, sh),
+                                 cfg.workers, deadline, cfg.stopped)
     findings = [f for r in results for f in r["findings"]]
     cards = [c for r in results for c in r["cards"]]
-    not_reviewed = [e["id"] for u in skipped for e in u["entries"]]
+    worksheet = [d for r in results for d in r.get("design") or []]
+    left = collections.defaultdict(list)
+    for u in skipped:
+        left[u.get("kind", "entry")].append(u)
+    not_reviewed = [e["id"] for u in left["entry"] for e in u["entries"]]
     # Suspicions a reviewer could not verify within its budget: kept apart from findings, for follow-up.
-    open_leads = [{"entries": c.get("entries"), "lead": str(lead)[:500]}
+    open_leads = [{"entries": c.get("entries"), "handler": c.get("handler"), "lead": str(lead)[:500]}
                   for c in cards for lead in (c.get("open_leads") or []) if str(lead).strip()]
-    (out / "findings.json").write_text(json.dumps({"findings": findings, "open_leads": open_leads,
-                                                   "not_reviewed": not_reviewed}, indent=1, ensure_ascii=False))
+    (out / "findings.json").write_text(json.dumps({
+        "findings": findings, "open_leads": open_leads, "design_worksheet": worksheet,
+        "not_reviewed": not_reviewed,
+        "not_reviewed_operations": [assets_map.site_key(x) for u in left["operation"] for x in u["sites"]],
+        "not_reviewed_design": [u["handler"] for u in left["design"]]}, indent=1, ensure_ascii=False))
     (out / "cards.json").write_text(json.dumps(cards, indent=1, ensure_ascii=False))
-    (out / "facts.json").write_text(json.dumps(facts.facts, indent=1, ensure_ascii=False))
-    (out / "issues.json").write_text(json.dumps(issues.issues, indent=1, ensure_ascii=False))
+    (out / "facts.json").write_text(json.dumps(sh.facts.facts, indent=1, ensure_ascii=False))
+    (out / "issues.json").write_text(json.dumps(sh.issues.issues, indent=1, ensure_ascii=False))
     s = lambda k: sum(r.get(k, 0) for r in results)  # noqa: E731
-    m = {"stage": "review", "entries": len(entries), "units": len(units), "reviewed_units": len(results),
-         "skipped_units": len(skipped), "not_reviewed_entries": len(not_reviewed),
+    kinds = collections.Counter(r.get("kind", "entry") for r in results if not r.get("covered"))
+    m = {"stage": "review", "entries": len(entries), "units": len(units), "reviewed_units": kinds["entry"],
+         "skipped_units": len(left["entry"]), "not_reviewed_entries": len(not_reviewed),
+         "operation_units": len(ops), "reviewed_operation_units": kinds["operation"],
+         "operation_units_covered_by_entry_review": sum(1 for r in results if r.get("covered")),
+         "design_units": len(designs), "reviewed_design_units": kinds["design"],
+         "design_items": dict(collections.Counter(i["status"] for d in worksheet for i in d["items"])),
          "prompt_tokens": s("prompt_tokens"), "completion_tokens": s("completion_tokens"),
          "cached_tokens": s("cached_tokens"), "reasoning_tokens": s("reasoning_tokens"), "steps": s("steps"),
-         "errors": sum(1 for r in results if r.get("error")), "facts": len(facts.facts),
-         "cards": len(cards), "n_findings": len(findings), "root_causes": len(issues.issues),
+         "errors": sum(1 for r in results if r.get("error")), "facts": len(sh.facts.facts),
+         "cards": len(cards), "n_findings": len(findings), "root_causes": len(sh.issues.issues),
+         "findings_by_unit_kind": dict(collections.Counter(f.get("unit_kind") for f in findings)),
          "authz_verdicts": dict(collections.Counter(c.get("authz_verdict") for c in cards)),
          "exposure_check": _exposure_check(cards, entries),
          "workers": cfg.workers, "llm_limiter": limiter_for(cfg).stats(),
@@ -738,8 +869,9 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
 
 def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str = "",
         start: float | None = None, deadline: float | None = None) -> dict:
-    """recon (reused when out/recon/entries.json exists), review, then the refutation check of every
-    reported root cause, within one wall-clock budget (the check keeps verify_share of it)."""
+    """recon (reused when out/recon/entries.json exists, with its assets.json when there is one), review,
+    then the refutation check of every reported root cause, within one wall-clock budget (the check keeps
+    verify_share of it)."""
     start = start or time.time()
     deadline = deadline or start + cfg.time_budget_s
     ef = out / "recon" / "entries.json"
@@ -752,9 +884,11 @@ def run(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: str 
     entries = json.loads(ef.read_text())
     rf = out / "recon" / "resolver.py"
     resolver = rf.read_text() if rf.exists() else None
+    af = out / "recon" / "assets.json"
+    assets = json.loads(af.read_text()) if af.exists() else None
     review_deadline = deadline - cfg.verify_share * (deadline - start)
     rv = review(cfg, root, out / "review", entries, deploy, product, rec.get("notes") or "", review_deadline,
-                rec.get("access_model"), resolver)
+                rec.get("access_model"), resolver, assets)
     from .verify import verify  # verify imports this module
     vf = verify(cfg, root, out / "review", deploy, product, rec.get("access_model"), resolver, deadline)
     tok = lambda m, k: (m or {}).get(k, 0) or 0  # noqa: E731

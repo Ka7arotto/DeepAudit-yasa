@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.services.yasa_audit.assets import OP_CLASSES
 from app.services.yasa_audit.config import AuditConfig
 from app.services.yasa_audit.toolbox import FactBook, Toolbox, tool_schemas
 
@@ -47,6 +48,20 @@ class ScriptedLLM:
         return SimpleNamespace(content="", tool_calls=[_call(name, args, f"c{self.usage.calls}")])
 
 
+def _role(system):
+    """Which recon agent a system prompt belongs to."""
+    return "assets" if "worth protecting" in system else "access" if "controls ACCESS" in system else "recon"
+
+
+# The asset agent of a test project that has none of the operations: every class absent, no identity.
+ASSETS_NONE = [("class_absent", {"op_class": c, "reason": "not in this test project"}) for c in OP_CLASSES] + [
+    ("record_identity", {"subsystems": []}), ("finish", {})]
+
+
+def _script(scripts, key):
+    return list(scripts.get("assets", ASSETS_NONE) if key == "assets" else scripts[key])
+
+
 class ByRole:
     """LLM factory for recon tests: each agent gets the scripted model for its role, picked from its
     system prompt at the first call (the two agents start in parallel, in no fixed order)."""
@@ -61,7 +76,9 @@ class ByRole:
             usage = SimpleNamespace(prompt=0, completion=0, cached=0, reasoning=0, calls=0)
 
             def chat(self, messages, tools=None):
-                role = "access" if "controls ACCESS" in messages[0]["content"] else "surface"
+                role = {"recon": "surface"}.get(_role(messages[0]["content"]), _role(messages[0]["content"]))
+                if role not in roles:
+                    roles[role] = ScriptedLLM(ASSETS_NONE)
                 return roles[role].chat(messages, tools)
 
         return Proxy()
@@ -281,14 +298,14 @@ def test_run_recon_then_review_end_to_end(tmp_path, monkeypatch):
 
     class Router(ScriptedLLM):
         def chat(self, messages, tools=None):
-            if not self.script and len(messages) == 2:
+            if not self.script and not self.usage.calls:  # a reminder may follow the first user message
                 user = messages[1]["content"]
                 users.append(user)
                 systems.append(messages[0]["content"])
                 key = ("verify" if "Try to refute it" in user else
                        next((k for k in ("/download", "/home") if f'"route": "{k}"' in user),
-                            "access" if "controls ACCESS" in messages[0]["content"] else "recon"))
-                self.script = list(scripts[key])
+                            _role(messages[0]["content"])))
+                self.script = _script(scripts, key)
             return super().chat(messages, tools)
 
     monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
@@ -927,8 +944,8 @@ def test_reconcile_lets_the_access_agent_fix_its_resolver(tmp_path, monkeypatch)
                 user = messages[1]["content"]
                 users.append(user)
                 key = ("reconcile" if "independently of you" in user else
-                       "access" if "controls ACCESS" in messages[0]["content"] else "recon")
-                self.script = list(scripts[key])
+                       _role(messages[0]["content"]))
+                self.script = _script(scripts, key)
             return super().chat(messages, tools)
 
     monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
@@ -1099,8 +1116,8 @@ def test_reconcile_shows_new_groups_after_the_resolver_changes(tmp_path, monkeyp
             if not self.script and len(messages) == 2:
                 user = messages[1]["content"]
                 key = ("reconcile" if "independently of you" in user else
-                       "access" if "controls ACCESS" in messages[0]["content"] else "recon")
-                self.script = list(scripts[key])
+                       _role(messages[0]["content"]))
+                self.script = _script(scripts, key)
             seen.extend(m.get("content") or "" for m in messages if m.get("role") == "tool")
             return super().chat(messages, tools)
 
@@ -1316,12 +1333,13 @@ def test_recon_follows_up_on_dispatchers_left_unenumerated(tmp_path, monkeypatch
 
     class Router(ScriptedLLM):
         def chat(self, messages, tools=None):
-            if not self.script and len(messages) == 2:
+            # first call: a reminder (the access model is ready) may already follow the user message
+            if not self.script and not self.usage.calls:
                 user = messages[1]["content"]
                 users.append(user)
                 key = (("API" if "- API:" in user else "hooks") if "ONE dispatcher they left out" in user else
-                       "access" if "controls ACCESS" in messages[0]["content"] else "recon")
-                self.script = list(scripts[key])
+                       _role(messages[0]["content"]))
+                self.script = _script(scripts, key)
             return super().chat(messages, tools)
 
     monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
