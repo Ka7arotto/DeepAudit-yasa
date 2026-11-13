@@ -297,3 +297,24 @@ def test_run_maps_assets_and_reviews_operations_and_identity_design(tmp_path, mo
     assert data["not_reviewed_operations"] == [] and data["not_reviewed_design"] == []
     saved = json.loads((tmp_path / "out" / "recon" / "assets.json").read_text())
     assert {r["name"] for r in saved["recipes"]} == {"role-write", "cache-write"}
+
+
+@needs_rg
+def test_new_classes_have_recipes_and_appear_in_the_prompt(tmp_path):
+    from app.services.yasa_audit.prompts import assets_prompt
+
+    _write(tmp_path, {"app/Report.php": "<?php\nfunction byName($db, $n) {\n  $db->bind(':n', $n);\n"
+                                        "  return $db->query('select * from t where n = :n');\n}\n"
+                                        "function sorted($db, $col) {\n  return $db->query(\"select * from t order by $col\");\n}\n"})
+    _index(tmp_path, [("f1", "function", "byName", "byName", "app/Report.php", 2, 5),
+                      ("f2", "function", "sorted", "sorted", "app/Report.php", 6, 8)], [])
+    tb = Toolbox(_cfg(), tmp_path, tmp_path / "out")
+    res = json.loads(tb.run_recipe("raw-query", "query_construction", r"->query\(", guard=r"->bind\(",
+                                   why="Db::query runs SQL text as given"))
+    assert res["sites"] == 2 and res["guard"]["guarded"] == 1 and len(res["unguarded_samples"]) == 1
+    assert "order by $col" in res["unguarded_samples"][0]
+    text = assets_prompt(40)
+    for c in ("bulk_field_assignment", "query_construction", "code_or_command_execution",
+              "secret_generation_or_check"):
+        assert c in assets.OP_CLASSES and f"- {c}: " in text
+    assert len(assets.OP_CLASSES) == 11 and AuditConfig().assets_budget == 40

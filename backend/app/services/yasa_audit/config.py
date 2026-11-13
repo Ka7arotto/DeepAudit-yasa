@@ -59,7 +59,7 @@ class AuditConfig:
     verify_budget: int = 24  # tool calls of the refutation check per root cause
     verify_share: float = 0.12  # share of the wall-clock budget kept for the refutation check
     reconcile_budget: int = 20  # tool calls of the access agent to settle disagreements with the surface
-    assets_budget: int = 30  # tool calls of the sensitive-asset agent (runs in parallel with the surface agent)
+    assets_budget: int = 40  # tool calls of the sensitive-asset agent (runs in parallel with the surface agent)
     design_budget: int = 36  # tool calls per identity design-review unit
     design_units_max: int = 6  # identity subsystems reviewed for their design, at most
     operation_every: int = 3  # every n-th review slot goes to an operation unit while both kinds are left

@@ -161,9 +161,8 @@ Method:
 
 
 OPERATION_REVIEW = """You are an application-security reviewer. You start from ONE sensitive operation of the project at the
-root (code that changes credentials or privileges, outputs personal data, loads an object by an id from
-the request, fetches a URL, writes raw markup, changes state on a read path or writes a file) and work
-BACKWARD to every way it can be made to happen. Entry points are reviewed separately: this unit exists
+root (its class, and what the class means, come with the unit) and work BACKWARD to every way it can be
+made to happen. Entry points are reviewed separately: this unit exists
 because the operation is where a missing check does its harm, wherever the request came in and through
 whatever components it passed (a value sanitized at the entry can be transformed again before it gets
 here).
@@ -178,7 +177,8 @@ Method:
    find_callers and call_graph, and the paths the index cannot see: hooks, events, filters, render and
    template pipelines, scheduled jobs, dynamic registration (grep for the function's name as a string).
 3. For each path: who can take it (who_can_call for routes), which of the operation's values they
-   control, and which checks and transformations run on the way. Compare with the sibling sites listed
+   control, and which checks and transformations run on the way. A value read from storage is controlled
+   by whoever could write it earlier: find that write and who can make it. Compare with the sibling sites listed
    that have the project's guard: a check every sibling makes and this path does not is the most likely
    flaw.
 4. When nothing in the repository calls it, it is an extension point or a public API: the attacker model
@@ -232,8 +232,9 @@ Part 1: sensitive operations. The classes are fixed and independent of any frame
 For each class, find how THIS project performs it, from evidence, not from names you expect:
 - the data model (schemas, models, migrations, serializers): which fields hold credentials, roles,
   permissions, personal data or secrets, and the code that writes or outputs them;
-- the project's own guards: where it checks permissions or ownership, escapes output, allowlists URLs or
-  hosts, validates paths. A guard shows what the project itself treats as sensitive, and the same
+- the project's own guards: where it checks permissions or ownership, escapes output, binds query
+  parameters, allowlists fields, columns, URLs or hosts, validates paths, compares secrets in constant
+  time. A guard shows what the project itself treats as sensitive, and the same
   operation without the guard is what reviewers need to see;
 - the navigation tools (search_symbol, find_callers, call_graph) for the helpers the operations go
   through (one query method, one HTTP client wrapper, one file storage API, one template output call).

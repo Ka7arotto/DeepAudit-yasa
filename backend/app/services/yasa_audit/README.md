@@ -51,15 +51,25 @@ third recon agent, running in parallel with the other two, maps the other end of
 **Operations.** The classes are fixed, describe effects rather than frameworks, and never change per
 project:
 
-| Class | The operation |
+| Class | What the operation does |
 | --- | --- |
-| `credential_or_privilege_write` | sets a password, credential, token, role, group or permission |
-| `personal_data_output` | puts email, IP, password hash, token, ... into something others read |
-| `object_by_request_id` | loads, changes or deletes an object chosen by a request id |
-| `outbound_request` | the server fetches a URL or connects to a host |
-| `raw_markup_output` | data written into HTML or an attribute without the project's escaping |
-| `state_change_in_read_path` | persistent state changed by a GET, a permission callback, a renderer |
+| `credential_or_privilege_write` | sets or changes an account's credentials, tokens, role, groups or permissions |
+| `bulk_field_assignment` | copies request fields onto a stored object without naming each one (mass assignment) |
+| `object_by_request_id` | loads, changes or deletes an object chosen by an id, key or path from the request |
+| `personal_data_output` | puts email, IP, phone, password hash, token, ... where someone other than the owner reads it |
+| `query_construction` | builds a database or search query from text or structures containing request or stored data |
+| `code_or_command_execution` | runs code or commands not fixed in the program text (shell, eval, dynamic include, template compile, deserialization, XXE) |
+| `outbound_request` | makes the server fetch a URL or connect to a host |
+| `raw_markup_output` | writes data into HTML or an attribute without the project's escaping |
 | `file_write` | writes, moves, extracts or deletes a file |
+| `state_change_in_read_path` | changes persistent state on a path meant only to read (GET, permission callback, renderer) |
+| `secret_generation_or_check` | creates or checks a secret value: tokens, codes, signed links, webhook signatures, keys |
+
+The classes do not limit what is found. Entry units still trace every class of vulnerability forward
+from the request. The operation classes choose where review also starts backward: these are the
+operations whose flaws entry review misses most often. That happens when the data was stored earlier by
+another request, when the code is reached through hooks or extension points, or when the check is
+missing in one sibling of many.
 
 How *this* project performs each class is found from evidence, not from a rule list:
 

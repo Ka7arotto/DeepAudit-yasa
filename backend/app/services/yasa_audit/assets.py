@@ -5,7 +5,7 @@ does not see code that no route reaches directly (render pipelines, hooks, exten
 one route at a time, never the design of a module. This stage maps the other end, so the review can
 also start there:
 
-operations  Seven fixed classes of harmful operation (OP_CLASSES). They describe effects, not
+operations  A fixed set of classes of harmful operation (OP_CLASSES). They describe effects, not
             frameworks. An agent finds how THIS project performs each class: the sensitive fields of
             its data model, the guards the project applies itself (permission and ownership checks,
             escaping, allowlists), the helpers the operations go through. It writes each form as a
@@ -37,23 +37,40 @@ from typing import Any
 
 from .discovery import _connect, codegraph_db
 
-# The classes are fixed and framework-independent; their concrete forms come from the project.
+# The classes are fixed and framework-independent; their concrete forms come from the project. Each
+# description says what the operation does, then (in brackets) the forms it usually takes.
 OP_CLASSES: dict[str, str] = {
-    "credential_or_privilege_write": "sets or changes an account's password, credentials, tokens, role, group "
-                                     "membership or permissions (creating an account with them included)",
-    "personal_data_output": "puts personal or secret fields (email, IP address, password hash, token, phone, "
-                            "address) into a response, export, feed or log that someone else can read",
-    "object_by_request_id": "loads, changes or deletes a stored object chosen by an id, key or path that "
-                            "comes from the request",
-    "outbound_request": "makes the server fetch a URL or connect to a host (HTTP clients, URL openers, "
-                        "mail or webhook senders, embed/preview fetchers)",
-    "raw_markup_output": "writes stored or request data into HTML, markup or an attribute without the "
-                         "project's escaping (raw template output, innerHTML, unescaped attributes, "
-                         "directive, shortcode or Markdown processing that runs after sanitizing)",
-    "state_change_in_read_path": "changes persistent state on a path meant to only read (GET handlers, "
-                                 "permission or visibility callbacks, renderers, getters, feeds)",
-    "file_write": "writes, moves, extracts or deletes a file (uploads, exports, caches, archives, "
+    "credential_or_privilege_write": "sets or changes what an account is or may do: its password or other "
+                                     "credentials, tokens, role, group memberships or permissions (account "
+                                     "creation, profile and user-management updates, invitations, role grants)",
+    "bulk_field_assignment": "copies request fields onto a stored object without naming each field (mass "
+                             "assignment: fill, update or merge with the request body, model binding, spreading "
+                             "request data into a create or update call)",
+    "object_by_request_id": "loads, changes or deletes a stored object chosen by an id, key, slug or path taken "
+                            "from the request (find by id, delete by key, lookups of files, records or settings)",
+    "personal_data_output": "puts personal or secret fields of a record into something a person other than its "
+                            "owner can read (email, IP address, phone, address, password hash or token in a "
+                            "response, export, feed, notification or log)",
+    "query_construction": "builds a database or search query from text or structures that contain request or "
+                          "stored data (raw SQL and SQL fragments, column or sort names, NoSQL filter objects "
+                          "and operators, search-engine query strings)",
+    "code_or_command_execution": "runs code or commands that are not fixed in the program text (shell commands "
+                                 "and process spawning, eval and dynamic code, includes or imports chosen at run "
+                                 "time, templates compiled from data, object deserialization, XML parsing with "
+                                 "external entities)",
+    "outbound_request": "makes the server fetch a URL or connect to a host (HTTP clients, URL openers, mail and "
+                        "webhook senders, embed, preview and import fetchers)",
+    "raw_markup_output": "writes stored or request data into HTML, markup or an attribute without the project's "
+                         "escaping (raw template output, innerHTML, unescaped attributes, and directive, "
+                         "shortcode or Markdown processing that runs after sanitizing)",
+    "file_write": "writes, moves, extracts or deletes a file (uploads, exports, caches, archive extraction, "
                   "generated code or configuration)",
+    "state_change_in_read_path": "changes persistent state on a path that is meant only to read (GET handlers, "
+                                 "permission or visibility callbacks, renderers, getters, feeds)",
+    "secret_generation_or_check": "creates or checks a secret value (reset and verification codes, API and "
+                                  "one-time tokens, share or preview links, signed URLs, webhook signatures, CSRF "
+                                  "tokens, encryption keys: how it is generated, compared, stored, and whether it "
+                                  "is hard-coded)",
 }
 
 IDENTITY_KINDS = ("registration", "login", "password_recovery", "sso", "api_token", "account_linking",
@@ -89,6 +106,7 @@ NOISE_PATH = re.compile(r"(^|/)(tests?|spec|specs|__tests__|__mocks__|fixtures?|
 MAX_SITES = 1500  # a recipe matching more is a word search, not an operation
 ANCESTOR_DEPTH = 6
 GUARD_DEPTH = 3  # the guard counts when it is in the operation's function or a caller this close
+FILE_GUARD_LINES = 40  # for code outside any function: how far above the operation the guard counts
 REACH_ORDER = {"handler": 0, "entry": 1, "no_callers": 2, "internal": 3}
 
 FUNCS = ("function", "method")
@@ -285,10 +303,11 @@ def expand(recipe: dict, rows: list[str], index: CallIndex, entries: list[dict],
 def _guard_at(index: CallIndex, guard: re.Pattern, file: str, line: int, fid: str | None,
               near: dict[str, int]) -> str | None:
     """Where the project's guard for this operation is applied on the way to it: in the operation's
-    function before the operation, or in a caller within GUARD_DEPTH calls. None when it is not."""
+    function before the operation, or in a caller within GUARD_DEPTH calls. None when it is not.
+    File-level code has no function boundary: only the FILE_GUARD_LINES before the operation count."""
     if fid is None:
-        rows = [(i + 1, t) for i, t in enumerate(index.lines(file)[:line])]
-        hit = next((n for n, t in rows if guard.search(t)), None)
+        first = max(0, line - FILE_GUARD_LINES)
+        hit = next((first + i + 1 for i, t in enumerate(index.lines(file)[first:line]) if guard.search(t)), None)
         return f"{file}:{hit}" if hit else None
     scopes = [(fid, line)] + [(a, None) for a, d in sorted(near.items(), key=lambda kv: kv[1]) if d <= GUARD_DEPTH]
     for nid, until in scopes[:60]:

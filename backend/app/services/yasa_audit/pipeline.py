@@ -4,7 +4,7 @@ recon  : an agent works out how requests reach code in THIS project (directory l
          evidence, navigation tools), writes extractor programs that enumerate every entry, and checks
          them (handlers resolve to code, sampled entries read correctly, request-reading code is reachable
          from some entry). Output: entries.json.
-         In parallel, an agent maps what is worth protecting (assets.py): recipes for seven fixed classes of
+         In parallel, an agent maps what is worth protecting (assets.py): recipes for a fixed set of classes of
          sensitive operation, expanded over the project and placed in the call graph, and the identity
          subsystems. Output: assets.json.
 review : three kinds of unit, each in a fresh context, sharing verified facts and root causes:
