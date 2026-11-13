@@ -33,7 +33,7 @@ import random
 import re
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from .discovery import _connect, codegraph_db
 
@@ -41,8 +41,12 @@ from .discovery import _connect, codegraph_db
 # description says what the operation does, then (in brackets) the forms it usually takes.
 OP_CLASSES: dict[str, str] = {
     "credential_or_privilege_write": "sets or changes what an account is or may do: its password or other "
-                                     "credentials, tokens, role, group memberships or permissions (account "
-                                     "creation, profile and user-management updates, invitations, role grants)",
+                                     "credentials, tokens, role, group memberships or permissions (registration, "
+                                     "profile updates, role and permission grants)",
+    "act_on_other_account": "acts on an account other than the caller's: sets its password or credentials, issues "
+                            "it an invitation, reset link, key or session, rotates its key, changes its role or "
+                            "memberships, disables or deletes it (user, member and key management on someone "
+                            "else's behalf)",
     "bulk_field_assignment": "copies request fields onto a stored object without naming each field (mass "
                              "assignment: fill, update or merge with the request body, model binding, spreading "
                              "request data into a create or update call)",
@@ -108,6 +112,10 @@ ANCESTOR_DEPTH = 6
 GUARD_DEPTH = 3  # the guard counts when it is in the operation's function or a caller this close
 FILE_GUARD_LINES = 40  # for code outside any function: how far above the operation the guard counts
 REACH_ORDER = {"handler": 0, "entry": 1, "no_callers": 2, "internal": 3}
+HUB_ENTRIES = 20  # a function reached by this many entries is shared infrastructure: review its contract once
+DESIGN_SPLIT_ENTRIES = 40  # a subsystem with more entries is reviewed in parts of at most this many
+REACH_DEPTH = 8  # calls followed from an entry's handler when deciding which code the entries reach
+CALLER_KINDS = ("file", "module", "component")  # non-function nodes that can call (module-level code)
 
 FUNCS = ("function", "method")
 TYPES = ("class", "interface", "trait", "enum", "struct")
@@ -132,6 +140,12 @@ class CallIndex:
         self.loc: dict[str, tuple[str, int, int, str]] = {}  # id -> (file, start, end, qualified name)
         self.callers: dict[str, set[str]] = collections.defaultdict(set)
         self.overrides: dict[str, list[str]] = collections.defaultdict(list)  # method -> parent methods
+        self.callees: dict[str, set[str]] = collections.defaultdict(set)
+        # for reachability only: names a node uses (a class put in a registry, a function passed as a
+        # callback) and the methods of each type, since an object reached is an object whose methods run
+        self.uses: dict[str, set[str]] = collections.defaultdict(set)
+        self.members: dict[str, list[str]] = collections.defaultdict(list)
+        self.file_of: dict[str, str] = {}  # every loaded node -> its file
         self._lines: dict[str, list[str]] = {}
         db = codegraph_db(root)
         self.indexed = db is not None
@@ -141,16 +155,19 @@ class CallIndex:
     def _load(self, db: Path) -> None:
         con = _connect(db)
         try:
-            kinds = (*FUNCS, *TYPES)
+            kinds = (*FUNCS, *TYPES, *CALLER_KINDS)
             nodes = con.execute("select id, kind, name, qualified_name, file_path, start_line, end_line from nodes "
                                 f"where kind in ({','.join('?' * len(kinds))})", kinds).fetchall()
             edges = con.execute("select source, target, kind from edges where kind in "
-                                "('calls', 'instantiates', 'contains', 'extends', 'implements')").fetchall()
+                                "('calls', 'instantiates', 'contains', 'extends', 'implements', 'references')"
+                                ).fetchall()
         finally:
             con.close()
         kind_of, name_of = {}, {}
         for nid, kind, name, qn, f, s, e in nodes:
             kind_of[nid], name_of[nid] = kind, name
+            if f:
+                self.file_of[nid] = f
             if kind in FUNCS and f:
                 self.loc[nid] = (f, int(s or 0), int(e or s or 0), qn or name)
                 self.spans[f].append((int(s or 0), int(e or s or 0), nid))
@@ -159,10 +176,17 @@ class CallIndex:
         parents: dict[str, list[str]] = collections.defaultdict(list)
         for src, dst, kind in edges:
             if kind in ("calls", "instantiates"):
-                self.callers[dst].add(src)
+                # a call from a test or vendored code is not a way in: it would turn an extension point
+                # (no callers) into "internal" and take part in reach and guard decisions
+                if not NOISE_PATH.search(self.file_of.get(src, "")):
+                    self.callers[dst].add(src)
+                    self.callees[src].add(dst)
+            elif kind == "references" and not NOISE_PATH.search(self.file_of.get(src, "")):
+                self.uses[src].add(dst)
             elif kind == "contains" and kind_of.get(src) in TYPES and kind_of.get(dst) in FUNCS:
                 owner[dst] = src
                 methods[(src, name_of[dst])].append(dst)
+                self.members[src].append(dst)
             elif kind in ("extends", "implements"):
                 parents[src].append(dst)
         for m, t in owner.items():
@@ -217,9 +241,42 @@ class CallIndex:
         seen.pop(fid)
         return seen
 
-    def span_text(self, fid: str) -> tuple[str, int, list[str]]:
+    def span_text(self, fid: str) -> tuple[str, int, list[str]] | None:
+        """The code of a function or method; None for other callers (module-level code, class bodies)."""
+        if fid not in self.loc:
+            return None
         f, s, e, _ = self.loc[fid]
         return f, s, self.lines(f)[max(0, s - 1):e]
+
+    def loaded_by_name(self) -> set[str]:
+        """Product files that no other file calls, instantiates or names. Code like that is either dead or
+        loaded by name at run time (a registry, a lazy import, a plugin directory, a hook table), and the
+        static index cannot tell which, so it stays reachable."""
+        named: set[str] = set()
+        for edges in (self.callers, self.uses):
+            for src_or_dst, others in edges.items():
+                for o in others:
+                    a, b = (o, src_or_dst) if edges is self.callers else (src_or_dst, o)  # a uses b
+                    fa, fb = self.file_of.get(a), self.file_of.get(b)
+                    if fa and fb and fa != fb:
+                        named.add(fb)
+        return {f for f in self.spans if f not in named and not NOISE_PATH.search(f)}
+
+    def reachable_files(self, start: set[str], files: set[str], depth: int = REACH_DEPTH) -> set[str]:
+        """Files of the code reached from `start` (function ids) and from every function of `files`
+        (handlers written as file-level code), plus those files themselves. A node reaches what it calls,
+        instantiates or names; a type reached brings its methods, because code chosen at run time
+        (a provider looked up in a registry, a plugin class) runs through an object of that type."""
+        seen: set[str] = set(start) | {nid for f in files for _s, _e, nid in self.spans.get(f, ())}
+        frontier = list(seen)
+        for _ in range(depth):
+            frontier = list({c for f in frontier
+                             for c in (*self.callees.get(f, ()), *self.uses.get(f, ()), *self.members.get(f, ()))
+                             if c not in seen})
+            if not frontier:
+                break
+            seen.update(frontier)
+        return {self.file_of[n] for n in seen if n in self.file_of} | set(files)
 
 
 def _entry_maps(index: CallIndex, entries: list[dict]) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -311,7 +368,10 @@ def _guard_at(index: CallIndex, guard: re.Pattern, file: str, line: int, fid: st
         return f"{file}:{hit}" if hit else None
     scopes = [(fid, line)] + [(a, None) for a, d in sorted(near.items(), key=lambda kv: kv[1]) if d <= GUARD_DEPTH]
     for nid, until in scopes[:60]:
-        f, s, body = index.span_text(nid)
+        code = index.span_text(nid)
+        if code is None:
+            continue
+        f, s, body = code
         for i, t in enumerate(body):
             if until is not None and s + i > until:
                 break
@@ -324,7 +384,41 @@ def site_key(s: dict) -> str:
     return f"{s['file']}:{s['line']}"
 
 
-def counters(recipe: dict, sites: list[dict], entries_known: int, seed: int = 0) -> dict:
+def entry_reach(index: CallIndex, entries: list[dict], maps: tuple[dict, dict] | None = None) -> set[str]:
+    """Files the entries can reach: their handlers, code loaded by name (which the index cannot rule out),
+    and the code those call (without an index, the handler files only)."""
+    by_fn, by_file = maps or _entry_maps(index, entries)
+    return index.reachable_files(set(by_fn), set(by_file) | index.loaded_by_name())
+
+
+def scoped_rows(grep: Any, recipe: dict, reachable: set[str]) -> tuple[list[str], list[str]]:
+    """The recipe's matches: those in its glob, plus those outside the glob in code the entries reach.
+    A glob says where the agent looked; it cannot take code a request reaches out of the map.
+    Returns (all rows, the rows the glob left out)."""
+    rows: Final = grep(recipe["pattern"], recipe.get("glob") or "")
+    if not recipe.get("glob"):
+        return rows, []
+    have: Final = set(rows)
+    extra: Final = [r for r in grep(recipe["pattern"], "") if r not in have and r.split(":", 1)[0] in reachable]
+    return rows + extra[:MAX_SITES], extra[:MAX_SITES]
+
+
+def merge_site(sites: dict[str, dict], site: dict) -> None:
+    """One site per file:line. When two recipes find the same operation, both classes stay on it, and a
+    recipe whose guard is missing there wins the guard verdict (a missing guard is the signal)."""
+    key: Final = site_key(site)
+    old: Final = sites.get(key)
+    if old is None:
+        sites[key] = site
+        return
+    if site["op_class"] != old["op_class"] and site["op_class"] not in old.setdefault("also", []):
+        old["also"].append(site["op_class"])
+    if "guard_at" in site and ("guard_at" not in old or (old["guard_at"] and not site["guard_at"])):
+        old["guard_at"], old["guard_recipe"] = site["guard_at"], site["recipe"]
+
+
+def counters(recipe: dict, sites: list[dict], entries_known: int, seed: int = 0,
+             outside_glob: list[str] | None = None) -> dict:
     """What the agent refines a recipe on."""
     reach = collections.Counter(s["reach"] for s in sites)
     out: dict[str, Any] = {
@@ -345,6 +439,11 @@ def counters(recipe: dict, sites: list[dict], entries_known: int, seed: int = 0)
     out["samples_to_read"] = [fmt(s) for s in rnd.sample(sites, min(6, len(sites)))]
     if recipe.get("guard"):
         out["unguarded_samples"] = [fmt(s) for s in sites if not s.get("guard_at")][:6]
+    if outside_glob:
+        out["reachable_outside_glob"] = {
+            "matches": len(outside_glob), "samples": [r[:160] for r in outside_glob[:5]],
+            "note": "these matches lie outside your glob in code the entries reach, so they are part of the map; "
+                    "narrow the pattern or use exclude if they are not this operation"}
     if not sites:
         out["note"] = "no site: check the pattern against code you have read (ripgrep syntax, case-sensitive)"
     return out
@@ -389,6 +488,12 @@ def check_identity(subsystems: Any, root: Path) -> tuple[list[dict], list[str]]:
     return out, problems
 
 
+def merge_identity(current: list[dict] | None, new: list[dict]) -> list[dict]:
+    """A later record of a subsystem with the same name replaces it; the others stay."""
+    names: Final = {g["name"] for g in new}
+    return [g for g in (current or []) if g["name"] not in names] + new
+
+
 def _under(path: str, roots: list[str]) -> bool:
     return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
 
@@ -411,17 +516,18 @@ def build(tb: Any, recipes: dict[str, dict], identity: list[dict] | None, absent
     """Expand every recipe over the final entries, group the identity subsystems: recon/assets.json."""
     index = tb.call_index()
     maps = _entry_maps(index, entries)
+    reachable: Final = entry_reach(index, entries, maps)
     sites: dict[str, dict] = {}
     per_recipe = {}
     for r in recipes.values():
         try:
-            rows = tb.grep_rows(r["pattern"], r.get("glob") or "")
+            rows, _ = scoped_rows(tb.grep_rows, r, reachable)
         except Exception:  # a pattern that times out now is left out, not the whole map
             continue
         found = expand(r, rows, index, entries, maps)
         per_recipe[r["name"]] = len(found)
-        for s in found:  # one site per file:line (two recipes may find the same operation)
-            sites.setdefault(site_key(s), s)
+        for s in found:
+            merge_site(sites, s)
     groups = [group_identity(s, entries, list(sites.values())) for s in (identity or [])]
     reach = collections.Counter(s["reach"] for s in sites.values())
     return {"recipes": list(recipes.values()), "absent": absent, "sites": list(sites.values()),
@@ -430,28 +536,56 @@ def build(tb: Any, recipes: dict[str, dict], identity: list[dict] | None, absent
                         "by_class": dict(collections.Counter(s["op_class"] for s in sites.values())),
                         "by_reach": dict(reach),
                         "unguarded": sum(1 for s in sites.values() if "guard_at" in s and not s["guard_at"]),
-                        "absent": sorted(absent), "identity_subsystems": len(groups)}}
+                        "absent": sorted(absent), "identity_subsystems": len(groups),
+                        "reachable_files": len(reachable)}}
 
 
 # ----------------------------------------------------------------- review units
 
-class Anchors:
-    """file:line anchors of the hypotheses reviewers recorded, shared by parallel units: an operation
-    that an entry's reviewer already traced is not reviewed a second time."""
+class Coverage:
+    """What entry reviewers have covered, shared by the units running in parallel: the anchors of their
+    hypotheses, and the code each one read. An operation whose function an entry reviewer read in full, or
+    whose line one anchored, is not reviewed a second time (its card and findings are shared)."""
 
     def __init__(self) -> None:
-        self._by_file: dict[str, set[int]] = collections.defaultdict(set)
+        self._anchors: dict[str, set[int]] = collections.defaultdict(set)
+        self._read: dict[tuple[str, str], list[tuple[int, int]]] = collections.defaultdict(list)  # (unit, file)
         self._lock = threading.Lock()
 
     def add(self, anchor: Any) -> None:
         m = re.match(r"^\s*([^:\s]+):(\d+)", str(anchor or ""))
         if m:
             with self._lock:
-                self._by_file[m.group(1).lstrip("./")].add(int(m.group(2)))
+                self._anchors[m.group(1).lstrip("./")].add(int(m.group(2)))
+
+    def read(self, unit: str, file: str, start: int, end: int) -> None:
+        with self._lock:
+            self._read[(unit, file.lstrip("./"))].append((int(start), int(end)))
 
     def covers(self, file: str, line: int, slack: int = 2) -> bool:
         with self._lock:
-            return any(abs(x - line) <= slack for x in self._by_file.get(file, ()))
+            return any(abs(x - line) <= slack for x in self._anchors.get(file, ()))
+
+    def read_in_full(self, file: str, start: int, end: int) -> bool:
+        """Whether one unit read every line of file:start-end."""
+        with self._lock:
+            spans = [sorted(v) for (_, f), v in self._read.items() if f == file]
+        for intervals in spans:
+            reach = start - 1
+            for a, b in intervals:
+                if a > reach + 1:
+                    break
+                reach = max(reach, b)
+            if reach >= end:
+                return True
+        return False
+
+    def covered(self, unit: dict) -> bool:
+        if unit.get("hub"):  # a contract review is not what an entry reviewer did
+            return False
+        s, e = unit["span"]
+        return self.read_in_full(unit["handler_file"], s, e) or all(
+            self.covers(x["file"], x["line"]) for x in unit["sites"])
 
 
 def operation_units(sites: list[dict], entries: list[dict], entry_units: list[dict],
@@ -474,22 +608,52 @@ def operation_units(sites: list[dict], entries: list[dict], entry_units: list[di
         reached = [by_id[i] for i in sorted({i for s in ss for i in s.get("entries") or []}) if i in by_id]
         exposure = min((e.get("exposure", "unknown") for e in reached), key=lambda x: rank.get(x, 1),
                        default="unknown")
+        fan_in: Final = max(s.get("entries_total", 0) for s in ss)
         units.append({"kind": "operation", "handler_file": file, "handler": fn, "span": ss[0]["span"],
                       "sites": sorted(ss, key=lambda s: s["line"]), "entries": reached, "exposure": exposure,
-                      "reach": min((s["reach"] for s in ss), key=REACH_ORDER.get),
+                      "reach": min((s["reach"] for s in ss), key=REACH_ORDER.get), "fan_in": fan_in,
+                      "hub": fan_in >= HUB_ENTRIES,
                       "unguarded": any("guard_at" in s and not s["guard_at"] for s in ss)})
     units.sort(key=lambda u: (rank.get(u["exposure"], 1), not u["unguarded"], REACH_ORDER[u["reach"]],
                               -len(u["sites"]), u["handler_file"], u["sites"][0]["line"]))
     return units
 
 
-def design_units(identity: list[dict], entries: list[dict], sites: list[dict], limit: int) -> list[dict]:
-    """One design-review unit per identity subsystem (the ones with the most code first)."""
+def _parts(entries: list[dict], size: int) -> list[list[dict]]:
+    """Entries in parts of at most `size`, entries of one handler file kept together where they fit."""
+    by_file: dict[str, list[dict]] = collections.defaultdict(list)
+    for e in entries:
+        by_file[str(e.get("handler_file") or "")].append(e)
+    parts: list[list[dict]] = []
+    for es in sorted(by_file.values(), key=len, reverse=True):
+        for i in range(0, len(es), size):
+            chunk = es[i:i + size]
+            fit = next((p for p in parts if len(p) + len(chunk) <= size), None)
+            if fit is None:
+                parts.append(list(chunk))
+            else:
+                fit.extend(chunk)
+    return parts
+
+
+def design_units(identity: list[dict], entries: list[dict], sites: list[dict], limit: int,
+                 split: int = DESIGN_SPLIT_ENTRIES) -> list[dict]:
+    """Design-review units for the identity subsystems (the ones with the most code first). A subsystem
+    with more than `split` entries is reviewed in parts, each with the subsystem's models and settings
+    and its own entries and the operations behind them: one context cannot read a hundred handlers."""
     by_id = {e.get("id"): e for e in entries}
     by_key = {site_key(s): s for s in sites}
-    units = [{"kind": "design", "handler_file": "", "handler": g["name"], "subsystem": g,
-              "entries": [by_id[i] for i in g.get("entry_ids", []) if i in by_id],
-              "sites": [by_key[k] for k in g.get("site_keys", []) if k in by_key]} for g in identity]
+    units = []
+    for g in identity:
+        es = [by_id[i] for i in g.get("entry_ids", []) if i in by_id]
+        ss = [by_key[k] for k in g.get("site_keys", []) if k in by_key]
+        parts = _parts(es, split) if len(es) > split else [es]
+        for n, part in enumerate(parts, 1):
+            ids, files = {e.get("id") for e in part}, {e.get("handler_file") for e in part}
+            mine = ss if len(parts) == 1 else [s for s in ss if s["file"] in files or ids & set(s.get("entries") or [])]
+            units.append({"kind": "design", "handler_file": "", "subsystem": g, "entries": part, "sites": mine,
+                          "handler": g["name"] if len(parts) == 1 else f"{g['name']} (part {n}/{len(parts)})",
+                          "part": None if len(parts) == 1 else (n, len(parts))})
     units.sort(key=lambda u: -(len(u["entries"]) + len(u["sites"]) + len(u["subsystem"]["files"])))
     return units[:limit]
 
@@ -524,13 +688,19 @@ def _entry_row(e: dict) -> str:
             f"{e.get('handler', '')} exposure={e.get('exposure')}" + (f" who_can_call={who}" if who else ""))
 
 
-def handler_operations(unit: dict) -> str:
-    """For an entry unit: the sensitive operations in its handler, from the project's operation map."""
+def handler_operations(unit: dict, guarded: dict[str, list[dict]] | None = None) -> str:
+    """For an entry unit: the sensitive operations in its handler, from the project's operation map, with
+    sibling sites that have the guard this one lacks."""
     ss = unit.get("operations") or []
     if not ss:
         return ""
+    rows = [_site_row(s) for s in ss[:12]]
+    for s in ss[:12]:
+        if "guard_at" in s and not s["guard_at"]:
+            sib = [x for x in (guarded or {}).get(s.get("guard_recipe") or s["recipe"], []) if x["file"] != s["file"]]
+            rows += [f"    the same operation WITH the guard: {site_key(x)}: {x['code'][:120]}" for x in sib[:2]]
     return ("Sensitive operations in this handler (from the project's operation map; check who can make "
-            "each happen and with which values):\n" + "\n".join(_site_row(s) for s in ss[:12]))
+            "each happen and with which values):\n" + "\n".join(rows))
 
 
 def operation_brief(unit: dict, siblings: list[dict], recipes: dict[str, dict]) -> str:
@@ -543,7 +713,16 @@ def operation_brief(unit: dict, siblings: list[dict], recipes: dict[str, dict]) 
     rows += [f"Class {c}: {OP_CLASSES[c]}" for c in classes]
     whys = {s["recipe"]: recipes.get(s["recipe"], {}).get("why") for s in ss}
     rows += [f"Recipe {k}: {v}" for k, v in whys.items() if v]
-    if unit["entries"]:
+    if unit.get("hub"):
+        rows.append(f"This function is shared infrastructure: {unit['fan_in']} entries reach it. Do not trace "
+                    "the paths one by one. Review its CONTRACT: for this operation to be safe, what must its "
+                    "callers guarantee (a value validated, an object already filtered to the caller's tenant, an "
+                    "authority already checked), and does the function enforce any of it itself? Record the "
+                    "contract with add_fact (one sentence: callers of X must ...; X itself checks / does not "
+                    "check ...) so the reviewers of every entry apply it. Report a finding only when the "
+                    "function is unsafe whatever its callers do, or for a caller you found that breaks it.")
+        rows += [_entry_row(e) for e in unit["entries"][:8]]
+    elif unit["entries"]:
         rows.append(f"Entries that reach it through calls ({len(unit['entries'])}; the static call graph can "
                     "miss some):")
         rows += [_entry_row(e) for e in unit["entries"][:15]]
@@ -565,6 +744,10 @@ def design_brief(unit: dict) -> str:
     """The user message of an identity design unit."""
     g = unit["subsystem"]
     rows = [f"Identity subsystem to review: {g['name']} (kind: {g['kind']})"]
+    if unit.get("part"):
+        rows.append(f"It is large, so it is reviewed in {unit['part'][1]} parts; this is part {unit['part'][0]}, "
+                    "with the entries below. Answer the checklist for what this part does; the models and "
+                    "settings are shared by all parts.")
     for label, key in (("Files", "files"), ("Models", "models"), ("Settings and defaults", "settings")):
         if g.get(key):
             rows.append(f"{label}: " + ", ".join(g[key]))
@@ -578,6 +761,38 @@ def design_brief(unit: dict) -> str:
         rows += [_site_row(s) for s in unit["sites"][:15]]
     rows.append("Checklist (answer every item with record_design):")
     rows += [f"- {k}: {q}" for k, q in IDENTITY_CHECKLIST.items()]
+    return "\n".join(rows)
+
+
+FOLLOW_UPS_PER_DESIGN = 3
+
+
+def follow_ups(unit: dict, answers: list[dict], reported: bool) -> list[dict]:
+    """Verification units for what a design review left open: a flaw it did not turn into a finding, and
+    any flaw or unclear item that names the code still to read (to_verify). Each gets a fresh context."""
+    open_items: Final = [a for a in answers if a["status"] in ("flaw", "unclear") and a.get("to_verify")]
+    open_items += [a for a in answers if a["status"] == "flaw" and not reported and a not in open_items]
+    return [{"kind": "lead", "handler_file": "", "handler": f"{unit['handler']}: {a['item']}",
+             "subsystem": unit["subsystem"], "entries": unit["entries"], "sites": unit["sites"], "answer": a}
+            for a in open_items[:FOLLOW_UPS_PER_DESIGN]]
+
+
+def lead_brief(unit: dict) -> str:
+    """The user message of a follow-up unit: one design conclusion to confirm or refute."""
+    a: Final = unit["answer"]
+    rows = [f"A design review of the identity subsystem {unit['subsystem']['name']} concluded, for the checklist "
+            f"item {a['item']} ({IDENTITY_CHECKLIST[a['item']]}):", f"status: {a['status']}", a["answer"]]
+    if a.get("evidence"):
+        rows.append("Its evidence: " + "; ".join(f"{x.get('file')}:{x.get('line')} {str(x.get('quote'))[:100]}"
+                                                for x in a["evidence"] if isinstance(x, dict)))
+    if a.get("to_verify"):
+        rows.append(f"What it left to read: {a['to_verify']}")
+    rows.append("Read that code and settle it: when the flaw holds, trace it to concrete requests and "
+                "report_finding (preconditions in the impact); when it does not, record_card with the code that "
+                "stops it.")
+    if unit["entries"]:
+        rows.append("Entries of the subsystem:")
+        rows += [_entry_row(e) for e in unit["entries"][:15]]
     return "\n".join(rows)
 
 

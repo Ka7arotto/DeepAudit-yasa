@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Final
 
 from .llm import LLM, parse_args
 from .toolbox import Toolbox
@@ -24,6 +25,24 @@ def _compact(messages: list[dict], keep_last: int = 14, limit_chars: int = 160_0
 
 # (condition(steps, toolbox), message or message(toolbox)); sent once, the first time the condition holds
 Reminder = tuple[Callable[[int, Toolbox], bool], "str | Callable[[Toolbox], str]"]
+
+
+def _invoke(tb: Toolbox, spec: dict, args: dict) -> str:
+    """Call a tool with the arguments its schema declares. Arguments it does not declare are dropped and
+    named in the result, and missing required ones are asked for, instead of the whole call failing on a
+    TypeError: a model that adds a field it invented should still get its call run."""
+    name: Final = spec["name"]
+    params: Final = spec.get("parameters") or {}
+    declared: Final = set(params.get("properties") or {})
+    extra: Final = sorted(str(k) for k in args if k not in declared)
+    missing: Final = [k for k in params.get("required") or [] if k not in args]
+    if missing:
+        return f"error: {name} needs {', '.join(missing)}; send the call again with them"
+    try:
+        result = str(getattr(tb, name)(**{k: v for k, v in args.items() if k in declared}))
+    except Exception as e:  # tool errors go back to the model
+        result = f"error: {type(e).__name__}: {e}"
+    return result + (f"\n(ignored argument(s) this tool does not have: {', '.join(extra)})" if extra else "")
 
 
 def _unmet(tb: Toolbox) -> list[tuple[str, list[str]]]:
@@ -52,7 +71,7 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
     steps = nudges = 0
     warned = time_warned = timed_out = False
     counts: dict[str, int] = {}
-    allowed = {t["function"]["name"] for t in tools}
+    specs: Final = {t["function"]["name"]: t["function"] for t in tools}
     with open(log_path, "w") as log:
         while steps < budget + 6 and not tb.finished:
             _compact(messages)
@@ -108,19 +127,16 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                 name = tc.function.name
                 counts[name] = counts.get(name, 0) + 1
                 args = parse_args(tc.function.arguments)
-                fn = getattr(tb, name, None) if name in allowed else None
-                if fn is None:
+                if name not in specs or getattr(tb, name, None) is None:
                     result = f"error: unknown tool {name}"
                 elif "_unparsed" in args:
                     result = (f"error: the arguments of {name} were not valid JSON "
                               f"({len(tc.function.arguments or '')} chars; probably cut off by the output "
-                              "limit). Send a shorter call, e.g. split a long program into several.")
+                              "limit). Send a shorter call, e.g. split a long program into several, or one "
+                              "item per call.")
                 else:
                     args = {k: v for k, v in args.items() if not str(k).startswith("_")}  # private params
-                    try:
-                        result = fn(**args)
-                    except Exception as e:  # tool errors go back to the model
-                        result = f"error: {type(e).__name__}: {e}"
+                    result = _invoke(tb, specs[name], args)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
                 log.write(json.dumps({"t": round(time.time() - t0, 1), "role": "tool", "name": name,
                                       "args": args, "content": str(result)[:3000]},
@@ -150,10 +166,7 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
             messages.append(entry)
             for tc in calls:
                 args = {k: v for k, v in parse_args(tc.function.arguments).items() if not str(k).startswith("_")}
-                try:
-                    result = getattr(tb, tc.function.name)(**args)
-                except Exception as e:
-                    result = f"error: {type(e).__name__}: {e}"
+                result = _invoke(tb, specs[tc.function.name], args)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
                 log.write(json.dumps({"t": round(time.time() - t0, 1), "role": "tool", "name": tc.function.name,
                                       "args": args, "content": str(result)[:3000]}, ensure_ascii=False) + "\n")

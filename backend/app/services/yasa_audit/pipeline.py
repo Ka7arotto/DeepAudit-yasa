@@ -26,6 +26,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Final
 
 from . import assets as assets_map
 from .agent_loop import run_agent
@@ -43,16 +44,19 @@ PEERS_MAX = 12
 
 def _schedule(units: list, work, workers: int, deadline: float | None,
               stop=None) -> tuple[list[dict], list]:
-    """Run work(i, unit) for units in order with a thread pool. Units that would start with less
-    than MIN_UNIT_S left before the deadline are skipped and returned separately."""
+    """Run work(i, unit) for units in order on `workers` threads. Units that would start with less than
+    MIN_UNIT_S left before the deadline are skipped and returned separately. A result may carry
+    "followups": units that settle what that unit left open; they run next, ahead of the units not
+    started yet, because a conclusion half-verified is worth more than one more unit started."""
+    pending: collections.deque = collections.deque(enumerate(units))
+    results: list[tuple[int, dict]] = []
     skipped: list = []
-    lock = threading.Lock()
+    cond = threading.Condition()
+    state = {"active": 0, "next": len(units)}
 
-    def guarded(i_unit: tuple[int, object]) -> dict | None:
-        i, unit = i_unit
+    def guarded(i: int, unit: object) -> dict | None:
         if (stop and stop()) or (deadline is not None and time.time() > deadline - MIN_UNIT_S):
-            with lock:
-                skipped.append(unit)
+            skipped.append(unit)
             return None
         try:
             return work(i, unit)
@@ -61,9 +65,32 @@ def _schedule(units: list, work, workers: int, deadline: float | None,
                     "cached_tokens": 0, "steps": 0, "error": f"{type(e).__name__}: {e}",
                     **({"kind": unit.get("kind", "entry")} if isinstance(unit, dict) else {})}
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        results = [r for r in ex.map(guarded, enumerate(units)) if r is not None]
-    return results, skipped
+    def worker() -> None:
+        while True:
+            with cond:
+                while not pending and state["active"]:
+                    cond.wait()
+                if not pending:
+                    cond.notify_all()
+                    return
+                i, unit = pending.popleft()
+                state["active"] += 1
+            r = guarded(i, unit)
+            with cond:
+                state["active"] -= 1
+                if r is not None:
+                    for follow in reversed(r.pop("followups", None) or []):
+                        pending.appendleft((state["next"], follow))
+                        state["next"] += 1
+                    results.append((i, r))
+                cond.notify_all()
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, workers))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return [r for _, r in sorted(results, key=lambda x: x[0])], skipped
 
 
 def _metrics(llm: LLM, extra: dict) -> dict:
@@ -224,6 +251,22 @@ def _rank_principals(entries: list[dict], ladder: list[str] | None) -> None:
         else:
             e.pop("principal_rank", None)
             e.pop("least_principal", None)
+
+
+def _scoped_exposure(entries: list[dict], scoped_roles: list[str] | None) -> int:
+    """An entry that an object-scoped role (team or organization admin, project owner) can call is open
+    to ordinary users: any of them can hold such a role for some object, by creating it or being made its
+    admin. Entries the resolver answers with such a role are reviewed as authenticated, not privileged.
+    Returns how many entries this lowered."""
+    names: Final = [n.lower() for n in scoped_roles or [] if n]
+    lowered = 0
+    for e in entries:
+        principals = [str(p).lower() for p in (e.get("who_can_call") or {}).get("principals") or []]
+        role = next((r for r in names for p in principals if r == p or r in p), None)
+        if role is not None and e.get("exposure") == "privileged":
+            e["exposure"], e["exposure_scoped_role"] = "authenticated", role
+            lowered += 1
+    return lowered
 
 
 def _apply_decisions(entries: list[dict], groups: dict[str, list[str]], decisions: dict[str, dict]) -> dict:
@@ -550,6 +593,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
         reconcile["applied"] = _apply_decisions(entries, groups, reconcile.pop("_decisions"))
     if reconcile is not None:
         reconcile["before"] = early.get("before")
+    scoped_lowered: Final = _scoped_exposure(entries, (holder.get("model") or {}).get("scoped_roles"))
     _rank_principals(entries, (holder.get("model") or {}).get("ladder"))
     resolver = {k: v for k, v in resolver.items() if not k.startswith("_")}
     (out / "entries.json").write_text(json.dumps(entries, indent=1, ensure_ascii=False))
@@ -562,6 +606,7 @@ def recon(cfg: AuditConfig, root: Path, out: Path, deploy: str = "", product: st
                        "manual_entries": len(tb.manual), "coverage": tb.coverage, "notes": tb.notes,
                        "access_model": holder["model"], "access_error": holder.get("error"),
                        "resolver": resolver, "reconcile": reconcile, "assets": assets_m,
+                       "scoped_role_entries": scoped_lowered,
                        "passes": passes, **res})
     for h, name in ((holder, "access_agent"), (assets_holder, "assets_agent")):  # every agent's tokens count
         if h.get("llm") is None:
@@ -701,19 +746,19 @@ class _Shared:
                  surface_notes: str, access_model: dict | None, resolver: str | None, assets: dict,
                  deadline: float | None):
         self.entries, self.resolver, self.deadline = entries, resolver, deadline
-        self.facts, self.issues, self.anchors = FactBook(root), IssueBoard(), assets_map.Anchors()
+        self.facts, self.issues, self.coverage = FactBook(root), IssueBoard(), assets_map.Coverage()
         self.systems = {k: review_prompt(cfg.review_budget if k != "design" else cfg.design_budget, deploy,
                                          product, surface_notes, access_model, k)
-                        for k in ("entry", "operation", "design")}
+                        for k in ("entry", "operation", "design", "lead")}
         self.known = {(str(e.get("method") or "GET").upper(), str(e.get("route"))): e for e in entries}
         self.recipes = {r["name"]: r for r in assets.get("recipes") or []}
         self.guarded: dict[str, list[dict]] = collections.defaultdict(list)  # recipe -> sites with its guard
         for site in assets.get("sites") or []:
             if site.get("guard_at"):
-                self.guarded[site["recipe"]].append(site)
+                self.guarded[site.get("guard_recipe") or site["recipe"]].append(site)
 
 
-def _entry_brief(root: Path, unit: dict, entries: list[dict]) -> str:
+def _entry_brief(root: Path, unit: dict, entries: list[dict], guarded: dict[str, list[dict]]) -> str:
     entry_view = {"routes": [{**{k: e.get(k) for k in ("id", "method", "route", "kind", "auth", "exposure",
                                                         "least_principal", "exposure_declared", "who_can_call",
                                                         "declared_at") if e.get(k)},
@@ -728,7 +773,7 @@ def _entry_brief(root: Path, unit: dict, entries: list[dict]) -> str:
     return "\n\n".join(x for x in (
         "Entry to review:\n" + json.dumps(entry_view, ensure_ascii=False),
         ("Similar entries (peers):\n" + "\n".join(peers)) if peers else "",
-        assets_map.handler_operations(unit)) if x)
+        assets_map.handler_operations(unit, guarded)) if x)
 
 
 def _unit_view(root: Path, unit: dict, sh: _Shared) -> tuple[str, str, str]:
@@ -743,20 +788,30 @@ def _unit_view(root: Path, unit: dict, sh: _Shared) -> tuple[str, str, str]:
         return (f"op:{assets_map.site_key(first)}", assets_map.operation_brief(unit, siblings, sh.recipes), code)
     if kind == "design":
         return f"design:{unit['handler']}", assets_map.design_brief(unit), ""
-    return (",".join(e["id"] for e in unit["entries"][:5]), _entry_brief(root, unit, sh.entries),
+    if kind == "lead":
+        return f"lead:{unit['handler']}", assets_map.lead_brief(unit), ""
+    return (",".join(e["id"] for e in unit["entries"][:5]), _entry_brief(root, unit, sh.entries, sh.guarded),
             _handler_snippet(root, unit))
+
+
+_SNIPPET_SPAN: Final = re.compile(r"^(\S+) lines (\d+)-(\d+) of ")
 
 
 def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, sh: _Shared) -> dict:
     kind = unit.get("kind", "entry")
-    if kind == "operation" and all(sh.anchors.covers(x["file"], x["line"]) for x in unit["sites"]):
-        # an entry's reviewer already traced this operation: its card and findings are shared
+    if kind == "operation" and sh.coverage.covered(unit):
+        # an entry's reviewer read this function in full or traced the operation: its card and findings
+        # are shared
         return {"kind": kind, "covered": True, "findings": [], "cards": [], "prompt_tokens": 0,
                 "completion_tokens": 0, "cached_tokens": 0, "steps": 0}
     out.mkdir(parents=True, exist_ok=True)
     uid, brief, code = _unit_view(root, unit, sh)
     tb = Toolbox(cfg, root, out, facts=sh.facts, unit=uid, issues=sh.issues)
-    tb.resolver_code, tb.known_entries, tb.anchors = sh.resolver, sh.known, sh.anchors
+    tb.resolver_code, tb.known_entries, tb.coverage = sh.resolver, sh.known, sh.coverage
+    if kind == "entry":  # what an entry reviewer reads counts as reviewed for the operations in it
+        tb.records_reads = True
+        if (shown := _SNIPPET_SPAN.match(code)) is not None:
+            sh.coverage.read(uid, shown.group(1), int(shown.group(2)), int(shown.group(3)))
     budget = cfg.review_budget
     if kind == "design":
         budget = cfg.design_budget
@@ -778,16 +833,23 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, sh: _Share
     res = run_agent(llm, tb, tool_schemas("design" if kind == "design" else "review"), sh.systems[kind], user,
                     budget, out / "transcript.jsonl", deadline=sh.deadline, updates=updates)
     ids = [e["id"] for e in unit["entries"]]
-    where = f"identity:{unit['handler']}" if kind == "design" else f"{unit['handler_file']}::{unit['handler']}"
+    where = f"identity:{unit['handler']}" if kind in ("design", "lead") else \
+        f"{unit['handler_file']}::{unit['handler']}"
     for x in tb.findings + tb.cards:
         x["entries"], x["handler"], x["unit_kind"] = ids, where, kind
-    design = []
+    out_extra: dict = {}
     if kind == "design":
         g = unit["subsystem"]
-        design = [{"subsystem": g["name"], "kind": g["kind"], "entries": ids, "files": g["files"],
-                   "settings": g["settings"], "complete": not left(tb),
-                   "items": [tb.design[k] for k in assets_map.IDENTITY_CHECKLIST if k in tb.design]}]
-    return {"kind": kind, "findings": tb.findings, "cards": tb.cards, "design": design, **_metrics(llm, res)}
+        answers = [tb.design[k] for k in assets_map.IDENTITY_CHECKLIST if k in tb.design]
+        out_extra["design"] = [{"subsystem": g["name"], "unit": unit["handler"], "kind": g["kind"], "entries": ids,
+                                "files": g["files"], "settings": g["settings"], "complete": not left(tb),
+                                "items": answers}]
+        out_extra["followups"] = assets_map.follow_ups(unit, answers, reported=bool(tb.findings))
+    if kind == "lead":
+        out_extra["lead_of"] = {"unit": unit["handler"].rsplit(": ", 1)[0], "item": unit["answer"]["item"],
+                                "findings": len(tb.findings),
+                                "conclusion": next((str(c.get("function") or "")[:300] for c in tb.cards), "")}
+    return {"kind": kind, "findings": tb.findings, "cards": tb.cards, **out_extra, **_metrics(llm, res)}
 
 
 def _exposure_check(cards: list[dict], entries: list[dict]) -> dict:
@@ -814,7 +876,8 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
            surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None,
            resolver: str | None = None, assets: dict | None = None) -> dict:
     """Review every unit: identity design units first (few, and nothing else covers them), then entry
-    units with operation units interleaved."""
+    units with operation units interleaved; a follow-up for what a design review left open runs as soon
+    as that review ends."""
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     assets = assets or {}
@@ -829,6 +892,12 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
     findings = [f for r in results for f in r["findings"]]
     cards = [c for r in results for c in r["cards"]]
     worksheet = [d for r in results for d in r.get("design") or []]
+    for r in results:  # what the follow-up of each open worksheet item concluded
+        lead = r.get("lead_of")
+        for d in worksheet if lead else ():
+            for item in d["items"]:
+                if d["unit"] == lead["unit"] and item["item"] == lead["item"]:
+                    item["follow_up"] = {"findings": lead["findings"], "conclusion": lead["conclusion"]}
     left = collections.defaultdict(list)
     for u in skipped:
         left[u.get("kind", "entry")].append(u)
@@ -851,6 +920,8 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
          "operation_units": len(ops), "reviewed_operation_units": kinds["operation"],
          "operation_units_covered_by_entry_review": sum(1 for r in results if r.get("covered")),
          "design_units": len(designs), "reviewed_design_units": kinds["design"],
+         "follow_up_units": kinds["lead"],
+         "hub_operation_units": sum(1 for u in ops if u.get("hub")),
          "design_items": dict(collections.Counter(i["status"] for d in worksheet for i in d["items"])),
          "prompt_tokens": s("prompt_tokens"), "completion_tokens": s("completion_tokens"),
          "cached_tokens": s("cached_tokens"), "reasoning_tokens": s("reasoning_tokens"), "steps": s("steps"),

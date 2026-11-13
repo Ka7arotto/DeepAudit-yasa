@@ -4,6 +4,7 @@ import json
 import shutil
 import sqlite3
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -317,4 +318,206 @@ def test_new_classes_have_recipes_and_appear_in_the_prompt(tmp_path):
     for c in ("bulk_field_assignment", "query_construction", "code_or_command_execution",
               "secret_generation_or_check"):
         assert c in assets.OP_CLASSES and f"- {c}: " in text
-    assert len(assets.OP_CLASSES) == 11 and AuditConfig().assets_budget == 40
+    assert len(assets.OP_CLASSES) == 12 and AuditConfig().assets_budget == 40
+
+
+@needs_rg
+def test_module_level_and_test_callers_do_not_break_the_executor(tmp_path):
+    _write(tmp_path, {"app/a.py": "def run(cmd):\n    os.system(cmd)\n\ndef hook(cmd):\n    os.system(cmd)\n",
+                      "app/b.py": "import a\na.run('x')\n", "tests/test_a.py": "a.hook('x')\n"})
+    _index(tmp_path, [("f_run", "function", "run", "a.run", "app/a.py", 1, 2),
+                      ("f_hook", "function", "hook", "a.hook", "app/a.py", 4, 5),
+                      ("file:app/b.py", "file", "b.py", "b", "app/b.py", 1, 2),
+                      ("file:tests/test_a.py", "file", "test_a.py", "test_a", "tests/test_a.py", 1, 1)],
+           [("file:app/b.py", "f_run", "calls"), ("file:tests/test_a.py", "f_hook", "calls")])
+    tb = Toolbox(_cfg(), tmp_path, tmp_path / "out")
+    # the guard walk reaches module-level code (a file node), which has no function span: no KeyError
+    res = json.loads(tb.run_recipe("shell", "code_or_command_execution", r"os\.system\(", guard="shlex", why="w"))
+    assert res["sites"] == 2 and res["guard"]["unguarded"] == 2
+    sites = {s["function"]: s for s in assets.expand(tb.recipes["shell"], tb.grep_rows(r"os\.system\("),
+                                                     tb.call_index(), [])}
+    assert sites["a.run"]["reach"] == "internal"  # called by module-level code
+    assert sites["a.hook"]["reach"] == "no_callers"  # a test calling it is not a way in
+
+
+def test_tool_calls_drop_unknown_arguments_and_ask_for_missing_ones(tmp_path):
+    from app.services.yasa_audit.agent_loop import _invoke
+
+    _write(tmp_path, {"a.py": "x = 1\n"})
+    tb = Toolbox(_cfg(), tmp_path, tmp_path / "out")
+    spec = {t["function"]["name"]: t["function"] for t in tool_schemas("review")}
+    out = _invoke(tb, spec["read_file"], {"path": "a.py", "unguarded": True})
+    assert "a.py lines 1-1" in out and "ignored argument(s) this tool does not have: unguarded" in out
+    assert _invoke(tb, spec["add_fact"], {"statement": "s"}) == "error: add_fact needs evidence; send the call " \
+                                                               "again with them"
+
+
+def test_design_answers_one_per_call_and_identity_records_merge_by_name(tmp_path):
+    _write(tmp_path, {"web/Login.php": "<?php\nfunction login() {}\n", "web/Sso.php": "<?php\nfunction sso() {}\n"})
+    tb = Toolbox(_cfg(), tmp_path, tmp_path / "out")
+    assert tb.record_design().startswith("rejected: send one answer")
+    out = tb.record_design(item="defaults", status="unclear", answer="not read", to_verify="web/Login.php:2")
+    assert "answered: 1" in out and tb.design["defaults"]["to_verify"] == "web/Login.php:2"
+    tb.record_identity({"name": "login", "kind": "login", "files": ["web/Login.php"]})
+    tb.record_identity([{"name": "sso", "kind": "sso", "files": ["web/Sso.php"]}])
+    out = tb.record_identity({"name": "login", "kind": "login", "files": ["web/Login.php"], "notes": "again"})
+    assert "2 subsystem(s) recorded in all" in out
+    assert [(g["name"], g["notes"]) for g in tb.identity] == [("sso", ""), ("login", "again")]
+    schema = next(t for t in tool_schemas("design") if t["function"]["name"] == "record_design")["function"]
+    assert schema["parameters"]["required"] == [] and "to_verify" in schema["parameters"]["properties"]
+
+
+def test_entries_an_object_scoped_role_can_call_are_not_privileged():
+    from app.services.yasa_audit.pipeline import _scoped_exposure
+
+    entries = [{"id": "E1", "exposure": "privileged", "who_can_call": {"principals": ["team_admin"]}},
+               {"id": "E2", "exposure": "privileged", "who_can_call": {"principals": ["proxy_admin"]}},
+               {"id": "E3", "exposure": "public", "who_can_call": {"principals": ["Team Admin"]}}]
+    assert _scoped_exposure(entries, ["team admin", "team_admin"]) == 1
+    assert [e["exposure"] for e in entries] == ["authenticated", "privileged", "public"]
+    assert entries[0]["exposure_scoped_role"] == "team_admin"
+    tb = Toolbox(_cfg(), ".", Path("."))
+    model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "d",
+             "shared_protections": "e", "ladder": ["user", "team_admin", "admin"], "scoped_roles": ["team_admin"],
+             "evidence": [{"file": "tests/test_yasa_assets.py", "line": 1, "quote": '"""The sensitive-asset map'}]}
+    assert tb.record_access_model(**model) == "access model recorded"
+    from app.services.yasa_audit.prompts import access_model_text
+    assert tb.access_model["scoped_roles"] == ["team_admin"] and "held for one object" in access_model_text(
+        tb.access_model)
+
+
+@needs_rg
+def test_matches_outside_the_glob_in_code_the_entries_reach_stay_in_the_map(tmp_path):
+    _write(tmp_path, {"app/h.py": "def handle(u):\n    return lib.fetch(u)\n",
+                      "lib/net.py": "def fetch(u):\n    return http.get(u)\n",
+                      # loaded by name (a provider registry, a lazy import): nothing names this file statically
+                      "lib/provider.py": "def load(u):\n    return http.get(u)\n",
+                      # named by other code, but by nothing an entry reaches
+                      "lib/old.py": "def old(u):\n    return http.get(u)\n\ndef boot():\n    cli.main()\n",
+                      "lib/cli.py": "def main():\n    old.old(1)\n",
+                      "app/own.py": "def own(u):\n    return http.get(u)\n"})
+    _index(tmp_path, [("h", "function", "handle", "h.handle", "app/h.py", 1, 2),
+                      ("f", "function", "fetch", "net.fetch", "lib/net.py", 1, 2),
+                      ("p", "function", "load", "provider.load", "lib/provider.py", 1, 2),
+                      ("o", "function", "old", "old.old", "lib/old.py", 1, 2),
+                      ("b", "function", "boot", "old.boot", "lib/old.py", 4, 5),
+                      ("c", "function", "main", "cli.main", "lib/cli.py", 1, 2),
+                      ("w", "function", "own", "own.own", "app/own.py", 1, 2)],
+           [("h", "f", "calls"), ("c", "o", "calls"), ("b", "c", "calls")])
+    entries = [{"id": "E1", "route": "/fetch", "handler_file": "app/h.py", "handler": "handle"}]
+    tb = Toolbox(_cfg(), tmp_path, tmp_path / "out")
+    tb.entries_source = lambda: entries
+    assert tb.call_index().loaded_by_name() == {"app/own.py", "lib/provider.py", "app/h.py"}
+    res = json.loads(tb.run_recipe("fetch", "outbound_request", r"http\.get\(", glob="app/**", why="w"))
+    assert res["sites"] == 3 and res["reachable_outside_glob"]["matches"] == 2  # net.py, provider.py
+    data = assets.build(tb, tb.recipes, [], {}, entries)
+    assert sorted(s["file"] for s in data["sites"]) == ["app/own.py", "lib/net.py", "lib/provider.py"]
+    assert "act_on_other_account" in assets.OP_CLASSES
+
+
+def test_shared_functions_get_a_contract_review_and_read_code_counts_as_reviewed():
+    entries = [{"id": f"E{i}", "route": f"/r{i}", "exposure": "authenticated"} for i in range(25)]
+    site = {"recipe": "r", "op_class": "query_construction", "file": "db.py", "line": 7, "code": "q(sql)",
+            "function": "Db::run", "span": [5, 12], "reach": "entry", "entries": [e["id"] for e in entries],
+            "entries_total": 25}
+    (hub,) = assets.operation_units([site], entries, [], {"authenticated": 2})
+    assert hub["hub"] and hub["fan_in"] == 25
+    brief = assets.operation_brief(hub, [], {})
+    assert "Review its CONTRACT" in brief and "add_fact" in brief
+    cov = assets.Coverage()
+    other = {**hub, "hub": False, "span": [5, 12]}
+    cov.read("E1", "db.py", 1, 8)
+    cov.read("E2", "db.py", 9, 12)
+    assert not cov.covered(other)  # two units read parts of it: neither read it in full
+    cov.read("E1", "db.py", 9, 20)
+    assert cov.covered(other) and not cov.covered(hub)  # a contract review is not covered by entry reading
+
+
+def test_a_large_identity_subsystem_is_reviewed_in_parts():
+    entries = [{"id": f"E{i}", "route": f"/u/{i}", "handler_file": f"h{i % 3}.py"} for i in range(90)]
+    g = {"name": "users", "kind": "user_management", "routes": [], "files": [], "models": [], "settings": [],
+         "notes": "", "entry_ids": [e["id"] for e in entries], "site_keys": []}
+    units = assets.design_units([g], entries, [], limit=10)
+    assert len(units) == 3 and all(len(u["entries"]) <= 40 for u in units)
+    assert {u["handler"] for u in units} == {f"users (part {n}/3)" for n in (1, 2, 3)}
+    assert "this is part" in assets.design_brief(units[0])
+
+
+def test_follow_ups_run_before_the_units_not_started_yet():
+    from app.services.yasa_audit.pipeline import _schedule
+
+    order = []
+
+    def work(i, unit):
+        order.append(unit)
+        return {"findings": [], "cards": [], "followups": ["a-check"] if unit == "a" else []}
+
+    results, skipped = _schedule(["a", "b", "c"], work, workers=1, deadline=None)
+    assert order == ["a", "a-check", "b", "c"] and len(results) == 4 and skipped == []
+
+
+def test_open_design_answers_become_follow_up_units():
+    unit = {"handler": "users", "subsystem": {"name": "users"}, "entries": [], "sites": []}
+    answers = [{"item": "privilege_ceiling", "status": "flaw", "answer": "admins can invite anyone",
+                "to_verify": "common_utils.py::admin_can_invite_user"},
+               {"item": "defaults", "status": "unclear", "answer": "not read", "to_verify": ""},
+               {"item": "identity_binding", "status": "flaw", "answer": "bound by email"}]
+    leads = assets.follow_ups(unit, answers, reported=True)
+    assert [x["answer"]["item"] for x in leads] == ["privilege_ceiling"]  # reported flaw without to_verify: done
+    leads = assets.follow_ups(unit, answers, reported=False)
+    assert [x["answer"]["item"] for x in leads] == ["privilege_ceiling", "identity_binding"]
+    brief = assets.lead_brief(leads[0])
+    assert "admin_can_invite_user" in brief and "report_finding" in brief
+
+
+def test_review_sends_a_fresh_reviewer_to_settle_an_open_design_flaw(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+
+    _write(tmp_path, {"web/Invite.php": "<?php\nfunction invite($uid) {\n  if (is_team_admin()) {\n"
+                                        "    create_link($uid);\n  }\n}\n"})
+    entries = [{"id": "E1", "method": "POST", "route": "/invite", "handler_file": "web/Invite.php",
+                "handler": "invite", "exposure": "authenticated"}]
+    g = {"name": "invitations", "kind": "invitation", "routes": ["^/invite"], "files": ["web/Invite.php"],
+         "models": [], "settings": [], "notes": "", "entry_ids": ["E1"], "site_keys": []}
+    ev = [{"file": "web/Invite.php", "line": 3, "quote": "if (is_team_admin())"}]
+    answers = [{"item": k, "status": "sound", "answer": "ok", "evidence": ev}
+               for k in assets.IDENTITY_CHECKLIST if k != "privilege_ceiling"]
+    scripts = {
+        "design": [*[("record_design", a) for a in answers],
+                   ("record_design", {"item": "privilege_ceiling", "status": "flaw", "evidence": ev,
+                                      "answer": "a team admin can invite any member, admins included",
+                                      "to_verify": "web/Invite.php::create_link"}),
+                   ("finish", {})],
+        "lead": [("report_finding", {"vuln_type": "Privilege escalation", "cwe": "CWE-269",
+                                     "sink_file": "web/Invite.php", "sink_line": 4, "source": "uid",
+                                     "entry": "POST /invite (team admin)", "required_privilege": "authenticated",
+                                     "verdict": "likely", "root_cause": "invitations ignore the target's role",
+                                     "impact": "a team admin sets an admin's password",
+                                     "route_evidence": {"file": "web/Invite.php", "line": 2,
+                                                        "quote": "function invite($uid)"}})],
+        "entry": [("record_card", {"function": "invite", "callers": "team admins", "authz_verdict": "ok",
+                                   "hypotheses": []})],
+    }
+    seen = {}
+
+    class Router(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            if not self.script and not self.usage.calls:
+                system, user = messages[0]["content"], messages[1]["content"]
+                key = ("lead" if "left a conclusion open" in system else "design" if "Identity subsystem" in user
+                       else "entry")
+                seen.setdefault(key, user)
+                self.script = list(scripts[key])
+            return super().chat(messages, tools)
+
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: Router([]))
+    m = pipeline.review(_cfg(workers=1), tmp_path, tmp_path / "review", entries,
+                        deadline=time.time() + 600, assets={"identity": [g], "sites": [], "recipes": []})
+    assert m["reviewed_design_units"] == 1 and m["follow_up_units"] == 1 and m["reviewed_units"] == 1
+    assert "web/Invite.php::create_link" in seen["lead"]
+    data = json.loads((tmp_path / "review" / "findings.json").read_text())
+    (f,) = data["findings"]
+    assert f["unit_kind"] == "lead" and f["entries"] == ["E1"]
+    (sheet,) = data["design_worksheet"]
+    item = next(i for i in sheet["items"] if i["item"] == "privilege_ceiling")
+    assert item["follow_up"]["findings"] == 1

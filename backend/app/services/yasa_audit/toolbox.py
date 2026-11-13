@@ -225,7 +225,8 @@ class Toolbox:
         self.entries_source: Any = None  # callable: the entries the surface agent has enumerated so far
         self._calls: Any = None
         self.design: dict[str, dict] = {}  # identity design review: checklist item -> answer
-        self.anchors: Any = None  # assets.Anchors shared by the review units
+        self.coverage: Any = None  # assets.Coverage shared by the review units
+        self.records_reads = False  # entry units: the code read counts as reviewed for operation units
 
     # ---------- helpers ----------
     def _safe(self, rel: str) -> Path:
@@ -270,6 +271,8 @@ class Toolbox:
         end = int(end_line or 0) or min(len(lines), start + 119)
         end = min(end, start + 249, len(lines))
         body = "\n".join(f"{i:5d}| {lines[i - 1]}" for i in range(start, end + 1))
+        if self.records_reads and self.coverage is not None:
+            self.coverage.read(self.unit, str(p.relative_to(self.root)), start, end)
         return clip(f"{path} lines {start}-{end} of {len(lines)}\n{body}")
 
     def grep_rows(self, pattern: str, glob: str = "") -> list[str]:
@@ -623,24 +626,33 @@ class Toolbox:
                    guard: str = "", why: str = "") -> str:
         """Expand a recipe for one form of a sensitive operation over the whole project and place every
         site in the call graph. The same name replaces the earlier version."""
-        from .assets import MAX_SITES, OP_CLASSES, check_recipe, counters, expand
+        from .assets import (
+            MAX_SITES,
+            OP_CLASSES,
+            check_recipe,
+            counters,
+            entry_reach,
+            expand,
+            scoped_rows,
+        )
         r = {"name": str(name), "op_class": str(op_class), "pattern": str(pattern or ""), "glob": str(glob or ""),
              "exclude": str(exclude or ""), "guard": str(guard or ""), "why": str(why or "")[:400]}
         err = check_recipe(r)
         if err:
             return f"rejected: {err}"
+        entries = self._entries_now()
+        index = self.call_index()
         try:
-            rows = self.grep_rows(r["pattern"], r["glob"])
+            rows, outside = scoped_rows(self.grep_rows, r, entry_reach(index, entries))
         except subprocess.TimeoutExpired:
             return "error: search timed out; narrow the pattern or the glob"
         if len(rows) > MAX_SITES:
             return (f"rejected: {len(rows)} matches. A recipe matches the operation itself (the call or "
                     "assignment that performs it), not every mention of a word: narrow it")
-        entries = self._entries_now()
-        sites = expand(r, rows, self.call_index(), entries)
+        sites = expand(r, rows, index, entries)
         self.recipes[r["name"]] = r
         self.absent.pop(r["op_class"], None)
-        res = counters(r, sites, len(entries))
+        res = counters(r, sites, len(entries), outside_glob=outside)
         if not self.call_index().indexed:
             res["note_index"] = "no code index: every site counts as file-level code, reach is by handler file"
         if self.entries_source is not None:
@@ -668,22 +680,34 @@ class Toolbox:
         return f"recorded: {op_class} absent"
 
     def record_identity(self, subsystems: Any) -> str:
-        """The identity subsystems of the project (replaces an earlier call)."""
-        from .assets import check_identity, group_identity
+        """Record identity subsystems; a later record with the same name replaces that subsystem, so they
+        can be sent one per call."""
+        from .assets import check_identity, group_identity, merge_identity
+        if isinstance(subsystems, dict):
+            subsystems = [subsystems]
         clean, problems = check_identity(subsystems, self.root)
         if problems and not clean:
             return "rejected: " + "; ".join(problems[:6])
-        self.identity = clean
+        self.identity = merge_identity(self.identity, clean)
         entries = self._entries_now()
         rows = [f"- {g['name']} ({g['kind']}): {len(group_identity(g, entries, [])['entry_ids'])} entries so far, "
                 f"{len(g['files'])} files, {len(g['settings'])} settings" for g in clean]
         return ("recorded " + str(len(clean)) + " subsystem(s)" + (":\n" + "\n".join(rows) if rows else "")
+                + f"\n{len(self.identity)} subsystem(s) recorded in all"
                 + ("\nnot recorded: " + "; ".join(problems[:6]) if problems else ""))
 
-    def record_design(self, items: Any) -> str:
-        """Answers to the identity checklist; each item replaces an earlier answer to it."""
+    def record_design(self, items: Any = None, item: str = "", status: str = "", answer: str = "",
+                      evidence: Any = None, to_verify: str = "") -> str:
+        """Answers to the identity checklist, several in `items` or one in the top-level fields; each
+        replaces an earlier answer to the same item."""
         from .assets import DESIGN_STATUSES, IDENTITY_CHECKLIST
         items = [items] if isinstance(items, dict) else items if isinstance(items, list) else []
+        if item:
+            items.append({"item": item, "status": status, "answer": answer, "evidence": evidence,
+                          "to_verify": to_verify})
+        if not items:
+            return ("rejected: send one answer as item, status, answer (and evidence, to_verify), or several "
+                    "in items")
         errors = []
         for it in items:
             it = it if isinstance(it, dict) else {}
@@ -705,7 +729,7 @@ class Toolbox:
                     errors.append(f"{key}: {err}")
                     continue
             self.design[key] = {"item": key, "status": status, "answer": str(it["answer"])[:1500],
-                                "evidence": ev[:6]}
+                                "evidence": ev[:6], "to_verify": str(it.get("to_verify") or "")[:400]}
         left = [k for k in IDENTITY_CHECKLIST if k not in self.design]
         return "; ".join(errors + [f"answered: {len(self.design)}",
                                    f"left: {', '.join(left)}" if left else "all items answered"])
@@ -733,10 +757,10 @@ class Toolbox:
         unknown = self.facts.cite(card.get("facts_used")) if self.facts is not None else []
         card["_unit"] = self.unit
         self.cards = [card]  # a later call updates the card
-        if self.anchors is not None:
+        if self.coverage is not None:
             for h in hyps:
                 if isinstance(h, dict):
-                    self.anchors.add(h.get("anchor"))
+                    self.coverage.add(h.get("anchor"))
         return "card recorded" + (f" (unknown fact ids ignored: {unknown})" if unknown else "")
 
     UPHOLD_STAGES = ("input_validation", "permission", "operation")
@@ -803,6 +827,8 @@ class Toolbox:
             return f"rejected: {err}"
         self.access_model = {k: model.get(k) for k in (*need, "public_by_default", "evidence")}
         self.access_model["ladder"] = ladder[:12]
+        self.access_model["scoped_roles"] = [str(x).strip() for x in (model.get("scoped_roles") or [])
+                                             if str(x).strip()][:12] if isinstance(model.get("scoped_roles"), list) else []
         return "access model recorded"
 
     def report_finding(self, **finding: Any) -> str:
@@ -933,6 +959,9 @@ def tool_schemas(role: str) -> list[dict]:
                 "ladder": {"type": "array", "items": s, "description": "the principals' names from least to "
                            "most privileged, as this project calls them (e.g. visitor, member, editor, admin); "
                            "the resolver's principals use these names"},
+                "scoped_roles": {"type": "array", "items": s, "description": "names on the ladder of roles held "
+                                 "for ONE object (team, organization, project, workspace admin or owner) that an "
+                                 "ordinary user can obtain by creating such an object or being made its admin"},
                 "evidence": {"type": "array", "items": {"type": "object", "properties": {
                     "file": s, "line": i, "quote": s}}}},
                ["authentication", "authorization", "permission_mapping", "principals", "ladder",
@@ -988,8 +1017,8 @@ def tool_schemas(role: str) -> list[dict]:
                "you searched.", {"op_class": {"type": "string", "enum": list(OP_CLASSES)}, "reason": s},
                ["op_class", "reason"]),
             fn("record_identity",
-               "Record the identity subsystems (an empty list if the project creates no identities). A later "
-               "call replaces the earlier one.",
+               "Record identity subsystems (an empty list if the project creates no identities). A later record "
+               "with the same name replaces that subsystem: send them one per call to keep each call short.",
                {"subsystems": {"type": "array", "items": {"type": "object", "properties": {
                    "name": s, "kind": {"type": "string", "enum": list(IDENTITY_KINDS)},
                    "routes": {"type": "array", "items": s, "description": "regular expressions over route "
@@ -1081,21 +1110,28 @@ def tool_schemas(role: str) -> list[dict]:
                    "file": s, "line": i, "quote": s}}}}, ["statement", "evidence"]),
         ]
     if role == "design":
+        evidence = {"type": "object", "properties": {"file": s, "line": i, "quote": s}}
         tools.append(fn(
             "record_design",
-            "Answer checklist items of the identity design review (a later answer to an item replaces the "
-            "earlier one). status: sound (the design holds, evidence quoted), flaw (it does not; also "
+            "Answer checklist items of the identity design review, one per call (item, status, answer, evidence, "
+            "to_verify) or several in items; a later answer to an item replaces the earlier one. status: sound (the design holds, evidence quoted), flaw (it does not; also "
             "report_finding when you traced the harm), owner_decision (a risky default or trade-off the "
             "owner must accept or change, evidence quoted), unclear (say what is left to read), "
             "not_applicable.",
-            {"items": {"type": "array", "items": {"type": "object", "properties": {
-                "item": {"type": "string", "enum": list(IDENTITY_CHECKLIST)},
-                "status": {"type": "string", "enum": list(DESIGN_STATUSES)},
-                "answer": {"type": "string", "description": "the design as the code implements it, and why "
-                           "it holds or not"},
-                "evidence": {"type": "array", "items": {"type": "object", "properties": {
-                    "file": s, "line": i, "quote": s}}}}, "required": ["item", "status", "answer"]}}},
-            ["items"]))
+            {"item": {"type": "string", "enum": list(IDENTITY_CHECKLIST)},
+             "status": {"type": "string", "enum": list(DESIGN_STATUSES)},
+             "answer": {"type": "string", "description": "the design as the code implements it, and why it "
+                        "holds or not"},
+             "evidence": {"type": "array", "items": evidence},
+             "to_verify": {"type": "string", "description": "for a flaw or unclear answer: the function or "
+                           "file:line still to read to confirm it; a fresh reviewer is sent there"},
+             "items": {"type": "array", "description": "several answers at once (same fields)",
+                       "items": {"type": "object", "properties": {
+                           "item": {"type": "string", "enum": list(IDENTITY_CHECKLIST)},
+                           "status": {"type": "string", "enum": list(DESIGN_STATUSES)}, "answer": s,
+                           "evidence": {"type": "array", "items": evidence}, "to_verify": s},
+                           "required": ["item", "status", "answer"]}}},
+            []))
     if role == "recon":
         tools.append(fn("finish", "Call once when you are done. unenumerated: every dispatcher you found but "
                         "did not enumerate (yet), each with where its routes are declared; another pass will "

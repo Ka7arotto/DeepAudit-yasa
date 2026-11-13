@@ -54,6 +54,7 @@ project:
 | Class | What the operation does |
 | --- | --- |
 | `credential_or_privilege_write` | sets or changes an account's credentials, tokens, role, groups or permissions |
+| `act_on_other_account` | acts on someone else's account: sets its password, issues it an invitation, reset link, key or session, rotates its key, changes its role, deletes it |
 | `bulk_field_assignment` | copies request fields onto a stored object without naming each one (mass assignment) |
 | `object_by_request_id` | loads, changes or deletes an object chosen by an id, key or path from the request |
 | `personal_data_output` | puts email, IP, phone, password hash, token, ... where someone other than the owner reads it |
@@ -86,8 +87,15 @@ The agent writes each form as a declarative **recipe**:
 ```
 
 `run_recipe` expands a recipe over the whole project (tests and vendored code left out). It places
-every site in codegraph's call graph, following calls through interfaces and parent methods, and returns
-counters the agent refines the recipe on, just as it refines an extractor on coverage:
+every site in codegraph's call graph, following calls through interfaces and parent methods; calls from
+tests and vendored code are not counted, and module-level code counts as a caller. The scope is set by
+reachability, not by the agent: a recipe's `glob` says where the agent looked, and matches outside it in
+code the entries can reach (libraries and provider adapters the application calls) are added to the map
+and reported as `reachable_outside_glob`. Reachability follows calls, instantiations and references, and a
+type reached brings its methods. Product code that no other file names statically is either dead or loaded
+by name at run time (a provider registry, a lazy import, a plugin directory), which the index cannot tell
+apart, so it counts as reachable too. The executor returns counters the agent refines the recipe on,
+just as it refines an extractor on coverage:
 
 | Counter | Meaning |
 | --- | --- |
@@ -100,9 +108,15 @@ counters the agent refines the recipe on, just as it refines an extractor on cov
 The agent can finish only when each class has a recipe or has been declared absent (`class_absent`,
 with what it searched).
 
+For `act_on_other_account` the guard is the project's own comparison of the caller's authority with the
+target account's (a set of target roles a manager may act on, a rank comparison). Every invitation,
+password reset, key rotation or deletion on someone's behalf that lacks it becomes a difference unit,
+shown next to the siblings that have it.
+
 **Identity subsystems.** The same agent records registration, login, recovery, SSO, tokens, account
 linking, invitations, MFA, sessions and user management with `record_identity`. Each subsystem carries
-its route patterns, files, models and settings (defaults with `file:line`).
+its route patterns, files, models and settings (defaults with `file:line`). Subsystems are recorded one
+per call (a later record with the same name replaces it), so no call is cut by the output limit.
 
 Once the entries are final, the recipes are expanded again against them, and the subsystems are joined
 to their entries and sites. Output: `recon/assets.json`.
@@ -135,14 +149,19 @@ There is no re-review stage.
 | design | one identity subsystem (at most `design_units_max`) | routes, models and settings together | does the design hold? |
 
 - **Operation units.** A site inside a handler is not a unit of its own: it is listed in that entry's
-  unit ("sensitive operations in this handler"), so the code is reviewed once. Every other site is
+  unit ("sensitive operations in this handler", with a guarded sibling next to an unguarded site), so
+  the code is reviewed once. Every other site is
   grouped by function. The reviewer works backward through the entries listed and through paths the
   index cannot see (hooks, events, render pipelines, jobs). It is shown sibling sites of the same recipe
   where the project's guard is on the way: a check the siblings make and this path does not is the
   most likely flaw. When nothing calls the code, the threat model is a plugin or integration written
   the way the project's documentation shows. Units are ordered by the exposure of the entries that
-  reach them, with unguarded and caller-less sites first. If an entry reviewer has already anchored a
-  hypothesis at the same `file:line`, the operation unit is skipped and the result is shared.
+  reach them, with unguarded and caller-less sites first. An operation unit is skipped, its result
+  shared, when an entry reviewer read the whole function or anchored a hypothesis at the operation.
+- **Contract units.** A function that `HUB_ENTRIES` (20) or more entries reach is shared infrastructure
+  (a database helper, an HTTP wrapper). Tracing its paths backward has no end, so its unit reviews its
+  contract instead: what callers must guarantee for the operation to be safe and whether the function
+  enforces it. The contract is recorded as a fact, which every entry reviewer then sees.
 - **Design units.** The reviewer answers a fixed checklist with `record_design` and cannot finish until
   every item is answered:
   - identity binding;
@@ -156,11 +175,23 @@ There is no re-review stage.
   - `unclear` and `not_applicable` do not.
 
   A flaw that has been traced to its harm is also reported as a finding, with its preconditions in the
-  impact.
+  impact. A subsystem with more than 40 entries is reviewed in parts that share its models and settings.
+- **Follow-up units.** A design review often ends with a conclusion it could not finish: a flaw it did
+  not trace to a finding, or an answer that depends on a function it did not read (`to_verify`). Each
+  such answer (at most three per design unit) gets a fresh reviewer that reads that code and either
+  reports the finding or records what stops it. Follow-ups run as soon as their design unit ends, and
+  their outcome is written next to the answer in the worksheet (`follow_up`).
 
 The schedule puts design units first, because they are few and nothing else covers them. Entry units
 follow, and operation units take every `operation_every`-th slot, so neither kind waits for the other to
-be used up. All units share facts, root causes and anchors. Each finding carries `unit_kind`.
+be used up. All units share facts, root causes and what the entry reviewers have covered. Each finding
+carries `unit_kind`.
+
+Exposure is about who can obtain a role, not what it is called. The access agent tells global roles from
+roles held for one object (team, organization or project admin, owner) and lists the latter in
+`scoped_roles`. An ordinary user can hold such a role, so an entry only such a role can call is reviewed
+as `authenticated`, not `privileged`. Tool calls are forgiving: arguments a tool does not declare are
+dropped and named in the result, and missing required ones are asked for, instead of the call failing.
 
 Output:
 - `review/findings.json`:

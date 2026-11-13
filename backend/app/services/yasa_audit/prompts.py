@@ -36,7 +36,10 @@ There is no list of frameworks to pick from. Work it out from this project's own
    runs and its first line, not an interface or a base class; for anonymous code such as a callback, the
    line where it starts), what the declaration says about access (auth), and exposure = the LEAST
    privileged principal that can call it: public (anyone, no login), authenticated (any logged-in user or
-   token, whatever their role), privileged (only some roles: admin, special permission), unknown.
+   token, whatever their role), privileged (only roles an ordinary user cannot obtain: a global admin, a
+   permission an operator grants), unknown. A role held for one object (admin or owner of a team,
+   organization, project or workspace) is not privileged: an ordinary user can create such an object or be
+   made its admin, so an entry such a role can call is authenticated.
    A route must be concrete (a path or a path pattern); resolve placeholders such as group or version
    names from the code instead of writing a stand-in.
 4. Check your work, and fix the extractor when a check fails:
@@ -66,7 +69,11 @@ Find and read, with the navigation tools:
 - how a request (method, path, resource, operation) is turned into the permission that is checked;
 - the principals from least to most privileged (anonymous, any registered user, roles, admin), how a
   principal gets them, and how to tell from an entry's declaration the least privileged one that can
-  call it; record their names in that order as the ladder;
+  call it; record their names in that order as the ladder. Tell global roles (held across the whole
+  deployment) from roles held for one object (admin or owner of a team, organization, project): an
+  ordinary user can create such an object or be made its admin, so put those right above the ordinary
+  user on the ladder and list them in scoped_roles; when only such a role can call an entry, the
+  resolver names it among the principals;
 - what is public by default;
 - the protections every request or outgoing operation passes whatever the handler does: input
   validation in the framework, output filtering, the wrappers used for outbound HTTP, file paths,
@@ -209,8 +216,10 @@ does not see them.
 Method:
 1. Read the subsystem: its entries, controllers and services, the models and fields it reads and writes,
    and its settings with their defaults (read where each default is defined, not only where it is used).
-2. Answer each checklist item from the code with record_design as soon as you have it: the design as the
-   code implements it, quoted at file:line, and whether it holds. A risky default or trade-off that is
+2. Answer each checklist item from the code with record_design as soon as you have it, one item per call:
+   the design as the code implements it, quoted at file:line, and whether it holds. When a flaw or an
+   unclear answer depends on code you have not read yet, name it in to_verify (a function or file:line): a
+   fresh reviewer is sent to settle it. A risky default or trade-off that is
    the owner's to accept is owner_decision; a flaw is a way for someone to get an identity, a credential
    or a privilege they should not have.
 3. For a flaw, work out the concrete steps (the requests, and the settings or states they need), then
@@ -218,6 +227,23 @@ Method:
    add_fact for what other reviewers can rely on. Then finish.
 Every checklist item needs an answer; unclear is an answer when your budget runs out (say what is left
 to read).
+
+""" + _REPORTING
+
+
+LEAD_REVIEW = """You are an application-security reviewer. A design review of one identity subsystem of the
+project at the root left a conclusion open: a flaw it did not trace to a finding, or an answer that depends
+on code it did not read. You settle that one conclusion, in a fresh context, from the code.
+{untrusted}
+
+""" + _ACCESS_BLOCK + """
+
+Method:
+1. Read the code the design reviewer left to read, and what it calls, until the conclusion is settled.
+2. If the flaw holds, work out the concrete requests (who sends them, with which values) and the
+   settings or states they need, and report_finding with those preconditions in the impact.
+3. If it does not hold, record_card with the code that stops it (hypotheses anchored there, status
+   rejected). Either way, add_fact for what other reviewers can rely on, then finish.
 
 """ + _REPORTING
 
@@ -245,10 +271,19 @@ whether the guard is on the way. Read the samples it returns, and refine a recip
 misses sites you know (the same name replaces it). Several recipes per class are normal. A class the
 project does not perform: class_absent, with what you searched.
 
+For act_on_other_account the guard is the project's comparison of the caller's authority with the
+target account's (a set of target roles a manager may act on, a rank comparison, a refusal to act on
+admins): find where the project makes that comparison and use it as the guard, so that the same kind of
+operation without it (an invitation, a password reset, a key rotation, a deletion on someone's behalf)
+stands out.
+The map covers the code the entries reach wherever it lives (libraries and provider adapters the
+application calls included): a glob only says where you looked, and matches outside it in reachable code
+are added to the map. The product context says who is trusted; it does not take code out of scope.
+
 Part 2: identity subsystems. Find the code that creates or proves an identity or changes what it may do:
 registration, login, password recovery, SSO / OAuth / SAML / LDAP, API or access tokens, account
 linking, invitations, multi-factor, sessions, user and role management. Record them with
-record_identity: for each, its routes (regular expressions over route paths), files, models, and the
+record_identity, one per call: for each, its routes (regular expressions over route paths), files, models, and the
 settings that change its behaviour with their defaults (file:line). A reviewer checks each subsystem's
 design against a fixed checklist (identity binding, claiming of existing records, token lifecycle,
 defaults, privilege ceiling): give them what they need for it.
@@ -287,6 +322,9 @@ def _access_model_text(model: dict | None) -> str:
             if model.get(k)]
     if model.get("ladder"):
         rows.append("- ladder (least to most privileged): " + " < ".join(model["ladder"]))
+    if model.get("scoped_roles"):
+        rows.append("- roles held for one object (an ordinary user can hold them, so entries they can call are "
+                    "authenticated, not privileged): " + ", ".join(model["scoped_roles"]))
     ev = ", ".join(f"{e.get('file')}:{e.get('line')}" for e in (model.get("evidence") or [])[:8])
     return "\n".join(rows) + (f"\n- evidence: {ev}" if ev else "")
 
@@ -326,7 +364,7 @@ def verify_prompt(budget: int, deploy: str = "", product: str = "", access_model
                          access_model=_access_model_text(access_model))
 
 
-REVIEW_MODES = {"entry": REVIEW, "operation": OPERATION_REVIEW, "design": DESIGN_REVIEW}
+REVIEW_MODES = {"entry": REVIEW, "operation": OPERATION_REVIEW, "design": DESIGN_REVIEW, "lead": LEAD_REVIEW}
 
 
 def review_prompt(budget: int, deploy: str = "", product: str = "", surface_notes: str = "",
