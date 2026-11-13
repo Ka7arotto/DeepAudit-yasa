@@ -643,7 +643,7 @@ class Toolbox:
         entries = self._entries_now()
         index = self.call_index()
         try:
-            rows, outside = scoped_rows(self.grep_rows, r, entry_reach(index, entries))
+            rows, outside = scoped_rows(self.grep_rows, r, entry_reach(index, entries), index.unparsed)
         except subprocess.TimeoutExpired:
             return "error: search timed out; narrow the pattern or the glob"
         if len(rows) > MAX_SITES:
@@ -754,6 +754,12 @@ class Toolbox:
             return ("rejected: these hypotheses have no anchor (file:line of the operation in the code that "
                     f"makes the risk plausible): {bad[:6]}. Anchor them, or drop risks the code gives no "
                     "reason to suspect.")
+        bare = [str(h.get("risk", "?")) for h in hyps if isinstance(h, dict) and h.get("status") != "confirmed"
+                and not str(h.get("why") or "").strip()]
+        if bare:
+            return ("rejected: these hypotheses have no why: " + str(bare[:6]) + ". A rejection needs its reason as "
+                    "much as a finding does: the code that stops it (file:line); an open one says what is left "
+                    "to read.")
         unknown = self.facts.cite(card.get("facts_used")) if self.facts is not None else []
         card["_unit"] = self.unit
         self.cards = [card]  # a later call updates the card
@@ -765,16 +771,28 @@ class Toolbox:
 
     UPHOLD_STAGES = ("input_validation", "permission", "operation")
 
-    def conclude(self, verdict: str, reason: str = "", path: Any = None) -> str:
+    def conclude(self, verdict: str, reason: str = "", path: Any = None, power: Any = None) -> str:
         """Refutation check. path: the stages of the request as read in the code, each {stage, file,
         line, quote, effect} with effect 'passes' or 'stops'. upheld needs input_validation,
         permission and operation, each quoted and none stopping; refuted needs a quoted stage that
-        stops it; uncertain needs only the reason."""
-        if verdict not in ("upheld", "refuted", "uncertain"):
-            return "rejected: verdict must be upheld, refuted or uncertain"
+        stops it; by_design needs the principal whose designed power covers the outcome, with the
+        quote where the project grants it; uncertain needs only the reason."""
+        if verdict not in ("upheld", "refuted", "by_design", "uncertain"):
+            return "rejected: verdict must be upheld, refuted, by_design or uncertain"
         if not str(reason or "").strip():
             return "rejected: reason is required"
         path = [p for p in ([path] if isinstance(path, dict) else (path or [])) if isinstance(p, dict)]
+        if verdict == "by_design":
+            power = power if isinstance(power, dict) else {}
+            if not str(power.get("principal") or "").strip():
+                return ("rejected: by_design needs power: {principal, file, line, quote}: the least privileged "
+                        "principal that can take the path, and where the project grants it this capability")
+            err = verify_evidence(self.root, [power])
+            if err:
+                return f"rejected: power: {err}"
+            self.conclusion = {"verdict": verdict, "reason": str(reason)[:1500], "path": path[:10],
+                               "power": {k: power.get(k) for k in ("principal", "file", "line", "quote")}}
+            return f"concluded: {verdict}"
         if verdict != "uncertain":
             err = verify_evidence(self.root, path) if path else "path is required"
             if err:
@@ -825,11 +843,36 @@ class Toolbox:
         err = verify_evidence(self.root, model.get("evidence") or [])
         if err:
             return f"rejected: {err}"
+        powers, err = self._powers(model.get("powers"))
+        if err:
+            return f"rejected: powers: {err}"
         self.access_model = {k: model.get(k) for k in (*need, "public_by_default", "evidence")}
         self.access_model["ladder"] = ladder[:12]
-        self.access_model["scoped_roles"] = [str(x).strip() for x in (model.get("scoped_roles") or [])
-                                             if str(x).strip()][:12] if isinstance(model.get("scoped_roles"), list) else []
+        self.access_model["powers"] = powers
+        legacy = [str(x).strip() for x in model.get("scoped_roles") or [] if str(x).strip()] \
+            if isinstance(model.get("scoped_roles"), list) else []
+        self.access_model["scoped_roles"] = list(dict.fromkeys(
+            [p["principal"] for p in powers if p["held_for_one_object"]] + legacy))[:12]
+        if not powers:
+            return ("access model recorded, but without powers: add them (record_access_model again with "
+                    "the same fields and powers), or reviewers cannot tell a designed capability from an "
+                    "escalation")
         return "access model recorded"
+
+    def _powers(self, rows: Any) -> tuple[list[dict], str]:
+        """What each principal is designed to be able to do, with where the project says so."""
+        out: list[dict] = []
+        for r in rows if isinstance(rows, list) else []:
+            if not isinstance(r, dict) or not str(r.get("principal") or "").strip() \
+                    or not str(r.get("power") or "").strip():
+                return [], "each row needs principal and power"
+            ev = r.get("evidence")
+            ev = [ev] if isinstance(ev, dict) else [e for e in ev or [] if isinstance(e, dict)]
+            if ev and (err := verify_evidence(self.root, ev)):
+                return [], f"{r['principal']}: {err}"
+            out.append({"principal": str(r["principal"]).strip()[:80], "power": _norm(str(r["power"]))[:400],
+                        "held_for_one_object": bool(r.get("held_for_one_object")), "evidence": ev[:2]})
+        return out[:24], ""
 
     def report_finding(self, **finding: Any) -> str:
         missing = [k for k in FINDING_REQUIRED if finding.get(k) in (None, "")]
@@ -959,9 +1002,21 @@ def tool_schemas(role: str) -> list[dict]:
                 "ladder": {"type": "array", "items": s, "description": "the principals' names from least to "
                            "most privileged, as this project calls them (e.g. visitor, member, editor, admin); "
                            "the resolver's principals use these names"},
-                "scoped_roles": {"type": "array", "items": s, "description": "names on the ladder of roles held "
-                                 "for ONE object (team, organization, project, workspace admin or owner) that an "
-                                 "ordinary user can obtain by creating such an object or being made its admin"},
+                "powers": {"type": "array", "description": "what each principal is DESIGNED to be able to "
+                           "do, one row per role, permission or scope that grants something different (each "
+                           "scope of a token, not only the ladder's names): what it may read, change, run or "
+                           "grant, and what the project says it must not do. Take it from the project's own "
+                           "statements: documentation, comments, the checks and restrictions it adds, its "
+                           "security fixes. Reviewers judge a capability against this: within the power is "
+                           "designed, beyond it is an escalation.",
+                           "items": {"type": "object", "properties": {
+                               "principal": s, "power": s,
+                               "held_for_one_object": {"type": "boolean", "description": "a role held for ONE "
+                                                       "object (team, organization, project or workspace admin "
+                                                       "or owner) that an ordinary user can obtain by creating "
+                                                       "such an object or being made its admin"},
+                               "evidence": {"type": "object", "properties": {"file": s, "line": i, "quote": s}}},
+                               "required": ["principal", "power"]}},
                 "evidence": {"type": "array", "items": {"type": "object", "properties": {
                     "file": s, "line": i, "quote": s}}}},
                ["authentication", "authorization", "permission_mapping", "principals", "ladder",
@@ -1036,9 +1091,14 @@ def tool_schemas(role: str) -> list[dict]:
             fn("conclude", "Your conclusion on the reported vulnerability, with the request's path as you read "
                "it in the code: one item per stage (entry, input_validation, permission, handler, "
                "operation, output) with file, line, a quote and its effect on the attack (passes or stops). "
-               "refuted: a quoted stage stops it. upheld: input_validation, permission and operation are "
-               "quoted and none stops it. uncertain: say what is left to check.",
-               {"verdict": {"type": "string", "enum": ["upheld", "refuted", "uncertain"]}, "reason": s,
+               "refuted: a quoted stage stops it. by_design: the path holds but what it gives is within the "
+               "designed power of the least privileged principal that can take it (power: that principal "
+               "and the quote where the project grants it). upheld: input_validation, permission and "
+               "operation are quoted, none stops it, and it gives more than that power. uncertain: say "
+               "what is left to check.",
+               {"verdict": {"type": "string", "enum": ["upheld", "refuted", "by_design", "uncertain"]},
+                "reason": s,
+                "power": {"type": "object", "properties": {"principal": s, "file": s, "line": i, "quote": s}},
                 "path": {"type": "array", "items": {"type": "object", "properties": {
                     "stage": {"type": "string", "enum": ["entry", "input_validation", "permission", "handler",
                                                          "operation", "output"]},
@@ -1070,7 +1130,11 @@ def tool_schemas(role: str) -> list[dict]:
                     "anchor": {"type": "string", "description": "file:line of the operation that makes this "
                                "risk plausible (where the request value is stored, queried, fetched, "
                                "rendered, used to pick an object, ...)"},
-                    "why": s, "status": {"type": "string", "enum": ["confirmed", "rejected", "open"]},
+                    "why": {"type": "string", "description": "rejected: the code that stops it (file:line); "
+                            "when that code lists forbidden values (names, characters, hosts), which consumers "
+                            "of the value you checked the list against. open: what is left to read (it is "
+                            "followed up in a fresh context)."},
+                    "status": {"type": "string", "enum": ["confirmed", "rejected", "open"]},
                     "evidence": s}, "required": ["risk", "anchor", "status"]}},
                 "facts_used": {"type": "array", "items": s,
                                "description": "ids of verified facts you relied on (e.g. F3)"}},

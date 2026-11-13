@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import random
 import re
 import threading
@@ -97,10 +98,12 @@ IDENTITY_CHECKLIST: dict[str, str] = {
     "defaults": "What does an install with no configuration allow (open registration, the role of new "
                 "accounts, verification off, SSO auto-create or auto-link, token scopes), and which "
                 "security settings are off by default?",
-    "privilege_ceiling": "Can a manager grant or reach more than they hold: assign roles, groups or "
-                         "permissions above their own, change the credentials, email or MFA of an account "
-                         "more privileged than themselves, or get there indirectly (groups, invitations, "
-                         "impersonation, token scopes)?",
+    "privilege_ceiling": "For each principal this subsystem creates or manages (its roles, scopes, tokens), "
+                         "compare what it can reach with its designed power in the access model: can it grant "
+                         "or reach more than it holds (assign roles, groups, permissions or scopes above its "
+                         "own, change the credentials, email or MFA of a more privileged account), directly or "
+                         "indirectly (groups, invitations, impersonation, data it writes that something more "
+                         "privileged later runs or obeys)?",
 }
 DESIGN_STATUSES = ("sound", "flaw", "owner_decision", "unclear", "not_applicable")
 
@@ -111,9 +114,13 @@ MAX_SITES = 1500  # a recipe matching more is a word search, not an operation
 ANCESTOR_DEPTH = 6
 GUARD_DEPTH = 3  # the guard counts when it is in the operation's function or a caller this close
 FILE_GUARD_LINES = 40  # for code outside any function: how far above the operation the guard counts
-REACH_ORDER = {"handler": 0, "entry": 1, "no_callers": 2, "internal": 3}
+REACH_ORDER = {"handler": 0, "entry": 1, "unindexed": 2, "no_callers": 2, "internal": 3}
+# Files that are documentation or data, not code: a match there is a mention, not an operation
+NOT_CODE: Final = (".md", ".rst", ".txt", ".lock", ".csv", ".svg", ".map", ".log", ".json", ".min.js", ".yaml",
+                   ".yml", ".toml", ".ini", ".proto", ".example", ".css", ".less", ".scss", ".sass")
 HUB_ENTRIES = 20  # a function reached by this many entries is shared infrastructure: review its contract once
 DESIGN_SPLIT_ENTRIES = 40  # a subsystem with more entries is reviewed in parts of at most this many
+CROSS_CUTTING_SHARE = 1 / 3  # a subsystem matching more of all entries than this is a mechanism they pass
 REACH_DEPTH = 8  # calls followed from an entry's handler when deciding which code the entries reach
 CALLER_KINDS = ("file", "module", "component")  # non-function nodes that can call (module-level code)
 
@@ -146,6 +153,7 @@ class CallIndex:
         self.uses: dict[str, set[str]] = collections.defaultdict(set)
         self.members: dict[str, list[str]] = collections.defaultdict(list)
         self.file_of: dict[str, str] = {}  # every loaded node -> its file
+        self.parsed: set[str] = set()  # files the index has nodes for (it parses their language)
         self._lines: dict[str, list[str]] = {}
         db = codegraph_db(root)
         self.indexed = db is not None
@@ -168,6 +176,7 @@ class CallIndex:
             kind_of[nid], name_of[nid] = kind, name
             if f:
                 self.file_of[nid] = f
+                self.parsed.add(f)
             if kind in FUNCS and f:
                 self.loc[nid] = (f, int(s or 0), int(e or s or 0), qn or name)
                 self.spans[f].append((int(s or 0), int(e or s or 0), nid))
@@ -247,6 +256,12 @@ class CallIndex:
             return None
         f, s, e, _ = self.loc[fid]
         return f, s, self.lines(f)[max(0, s - 1):e]
+
+    def unparsed(self, file: str) -> bool:
+        """Product code in a language the index does not parse (shell scripts, templates, ...): nothing is
+        known about what runs it, so it cannot be ruled out of reach either."""
+        return (self.indexed and file not in self.parsed and not NOISE_PATH.search(file)
+                and not file.lower().endswith(NOT_CODE))
 
     def loaded_by_name(self) -> set[str]:
         """Product files that no other file calls, instantiates or names. Code like that is either dead or
@@ -336,7 +351,7 @@ def expand(recipe: dict, rows: list[str], index: CallIndex, entries: list[dict],
         if fid is None:  # file-level code: a script, a template, a module body
             site.update(function=f"<{file}>", span=[1, len(index.lines(file))])
             ids = by_file.get(file, [])
-            site["reach"] = "handler" if ids else "no_callers"
+            site["reach"] = "handler" if ids else "unindexed" if index.unparsed(file) else "no_callers"
             site["entries"] = ids[:40]
             near: dict[str, int] = {}
         else:
@@ -391,16 +406,61 @@ def entry_reach(index: CallIndex, entries: list[dict], maps: tuple[dict, dict] |
     return index.reachable_files(set(by_fn), set(by_file) | index.loaded_by_name())
 
 
-def scoped_rows(grep: Any, recipe: dict, reachable: set[str]) -> tuple[list[str], list[str]]:
-    """The recipe's matches: those in its glob, plus those outside the glob in code the entries reach.
+def scoped_rows(grep: Any, recipe: dict, reachable: set[str],
+                unparsed: Any = None) -> tuple[list[str], list[str]]:
+    """The recipe's matches: those in its glob, plus those outside the glob in code the entries reach or
+    in code the index does not parse (`unparsed(file)`: what runs it is unknown, so it is not ruled out).
     A glob says where the agent looked; it cannot take code a request reaches out of the map.
     Returns (all rows, the rows the glob left out)."""
     rows: Final = grep(recipe["pattern"], recipe.get("glob") or "")
     if not recipe.get("glob"):
         return rows, []
     have: Final = set(rows)
-    extra: Final = [r for r in grep(recipe["pattern"], "") if r not in have and r.split(":", 1)[0] in reachable]
+    keep = (lambda f: f in reachable or unparsed(f)) if unparsed else (lambda f: f in reachable)
+    extra: Final = [r for r in grep(recipe["pattern"], "") if r not in have and keep(r.split(":", 1)[0])]
     return rows + extra[:MAX_SITES], extra[:MAX_SITES]
+
+
+def unparsed_files(root: Path, index: CallIndex, limit: int = 4000) -> list[str]:
+    """Product files the index does not parse (see CallIndex.unparsed)."""
+    if not index.indexed:
+        return []
+    out: list[str] = []
+    for d, ds, fs in os.walk(root):
+        ds[:] = sorted(x for x in ds if not x.startswith(".") and not NOISE_PATH.search(x + "/"))
+        for f in sorted(fs):
+            if f.startswith("."):  # tool configuration
+                continue
+            rel = os.path.relpath(os.path.join(d, f), root).replace(os.sep, "/")
+            if index.unparsed(rel) and _text(root / rel, script=os.path.splitext(f)[1] == ""):
+                out.append(rel)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def _text(p: Path, script: bool) -> bool:
+    """A text file (not a font, an image or an archive); without an extension, only a script (#!)."""
+    try:
+        with open(p, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    return b"\0" not in head and (not script or head.startswith(b"#!"))
+
+
+def unparsed_summary(root: Path, index: CallIndex) -> str:
+    """One line for the assets agent: which product code the index cannot see into."""
+    files: Final = unparsed_files(root, index)
+    if not files:
+        return ""
+    by: collections.Counter = collections.Counter(
+        (f.rsplit("/", 1)[0] if "/" in f else ".", os.path.splitext(f)[1] or "(none)") for f in files)
+    top = ", ".join(f"{d}/*{ext} ({n})" for (d, ext), n in by.most_common(10))
+    return (f"The code index does not parse {len(files)} product files (a language it does not read: shell "
+            f"scripts, templates, ...), e.g. {top}. Recipes still match them and their sites are part of the "
+            "map; nothing is known about what runs them, so read who does when they matter (a task runner, a "
+            "script the application executes, a template it renders).")
 
 
 def merge_site(sites: dict[str, dict], site: dict) -> None:
@@ -427,7 +487,8 @@ def counters(recipe: dict, sites: list[dict], entries_known: int, seed: int = 0,
         "reach": {k: reach.get(k, 0) for k in REACH_ORDER},
         "reach_meaning": "handler: in an entry's handler; entry: an entry reaches it through calls; no_callers: "
                          "nothing in the repository calls it (framework hook, extension point, public API, "
-                         "or dead code); internal: called, but no enumerated entry reaches it",
+                         "or dead code); internal: called, but no enumerated entry reaches it; unindexed: in a "
+                         "language the code index does not parse, so who runs it is unknown",
         "entries_known": entries_known}
     if recipe.get("guard"):
         g = [s for s in sites if s.get("guard_at")]
@@ -521,7 +582,7 @@ def build(tb: Any, recipes: dict[str, dict], identity: list[dict] | None, absent
     per_recipe = {}
     for r in recipes.values():
         try:
-            rows, _ = scoped_rows(tb.grep_rows, r, reachable)
+            rows, _ = scoped_rows(tb.grep_rows, r, reachable, index.unparsed)
         except Exception:  # a pattern that times out now is left out, not the whole map
             continue
         found = expand(r, rows, index, entries, maps)
@@ -647,6 +708,14 @@ def design_units(identity: list[dict], entries: list[dict], sites: list[dict], l
     for g in identity:
         es = [by_id[i] for i in g.get("entry_ids", []) if i in by_id]
         ss = [by_key[k] for k in g.get("site_keys", []) if k in by_key]
+        if len(es) > split and len(es) > len(entries) * CROSS_CUTTING_SHARE:
+            # a mechanism most requests pass (a session check, a token gate): its design is in its own
+            # files, which every part would read again; its entries are everyone's
+            files = set(g.get("files") or [])
+            units.append({"kind": "design", "handler_file": "", "subsystem": g, "entries": [],
+                          "sites": [s for s in ss if s["file"] in files], "handler": g["name"], "part": None,
+                          "cross_cutting": len(es)})
+            continue
         parts = _parts(es, split) if len(es) > split else [es]
         for n, part in enumerate(parts, 1):
             ids, files = {e.get("id") for e in part}, {e.get("handler_file") for e in part}
@@ -726,6 +795,11 @@ def operation_brief(unit: dict, siblings: list[dict], recipes: dict[str, dict]) 
         rows.append(f"Entries that reach it through calls ({len(unit['entries'])}; the static call graph can "
                     "miss some):")
         rows += [_entry_row(e) for e in unit["entries"][:15]]
+    elif unit["reach"] == "unindexed":
+        rows.append("The code index does not parse this file's language, so nothing is known about what runs "
+                    "it: find what runs, sources or renders it (a task runner, a command the application "
+                    "executes, a template engine), which of its values come from files, the environment or "
+                    "stored data, and who can write those.")
     elif unit["reach"] == "no_callers":
         rows.append("Nothing in the repository calls this code: it is a framework hook, an extension point, "
                     "a public API for plugins or themes, file-level code the framework loads, or dead code. "
@@ -753,6 +827,9 @@ def design_brief(unit: dict) -> str:
             rows.append(f"{label}: " + ", ".join(g[key]))
     if g.get("notes"):
         rows.append("Notes from the agent that mapped it: " + g["notes"])
+    if unit.get("cross_cutting"):
+        rows.append(f"Its routes match {unit['cross_cutting']} entries, most of the project: it is a mechanism "
+                    "requests pass through, not a set of routes. Review it from its files, models and settings.")
     if unit["entries"]:
         rows.append(f"Its entries ({len(unit['entries'])}):")
         rows += [_entry_row(e) for e in unit["entries"][:25]]
@@ -777,8 +854,52 @@ def follow_ups(unit: dict, answers: list[dict], reported: bool) -> list[dict]:
             for a in open_items[:FOLLOW_UPS_PER_DESIGN]]
 
 
+class LeadBoard:
+    """Hypotheses left open by entry and operation reviewers, claimed once per anchor for the whole run
+    (units run in parallel, and several of them often reach the same code)."""
+
+    PER_UNIT: Final = 1  # follow-ups one review may start; the rest stay in the card's open leads
+
+    def __init__(self) -> None:
+        self._claimed: set[str] = set()
+        self._lock = threading.Lock()
+
+    def follow_ups(self, unit: dict, cards: list[dict]) -> list[dict]:
+        """Lead units for what a review left open (a hypothesis with status open): each gets a fresh
+        context and its own budget, the same way as an open design conclusion."""
+        out: list[dict] = []
+        for card in cards:
+            for h in card.get("hypotheses") or []:
+                if len(out) >= self.PER_UNIT:
+                    return out
+                if not isinstance(h, dict) or h.get("status") != "open":
+                    continue
+                anchor = re.sub(r"\s+", "", str(h.get("anchor") or ""))
+                with self._lock:
+                    if not anchor or anchor in self._claimed:
+                        continue
+                    self._claimed.add(anchor)
+                out.append({"kind": "lead", "handler_file": "", "handler": f"{unit['handler']}: {anchor}",
+                            "entries": unit.get("entries") or [], "sites": unit.get("sites") or [],
+                            "hypothesis": {**{k: h.get(k) for k in ("risk", "anchor", "why", "evidence")},
+                                           "unit": card.get("function", "")[:300]}})
+        return out
+
+
 def lead_brief(unit: dict) -> str:
-    """The user message of a follow-up unit: one design conclusion to confirm or refute."""
+    """The user message of a follow-up unit: one open conclusion to confirm or refute."""
+    if "hypothesis" in unit:
+        h: Final = unit["hypothesis"]
+        rows = [f"A reviewer of: {h['unit']}", "left this hypothesis open within its budget:",
+                f"risk: {h.get('risk')}", f"anchor: {h.get('anchor')}"]
+        rows += [f"{k}: {h[k]}" for k in ("why", "evidence") if h.get(k)]
+        rows.append("Read the code from the anchor, follow the value to everything that consumes it, and settle "
+                    "it: when it holds, trace it to concrete requests and report_finding (preconditions in the "
+                    "impact); when it does not, record_card with the code that stops it.")
+        if unit["entries"]:
+            rows.append("Entries of the unit that raised it:")
+            rows += [_entry_row(e) for e in unit["entries"][:15]]
+        return "\n".join(rows)
     a: Final = unit["answer"]
     rows = [f"A design review of the identity subsystem {unit['subsystem']['name']} concluded, for the checklist "
             f"item {a['item']} ({IDENTITY_CHECKLIST[a['item']]}):", f"status: {a['status']}", a["answer"]]

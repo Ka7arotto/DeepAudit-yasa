@@ -622,8 +622,8 @@ def test_recon_finish_gates_and_access_model_evidence(tmp_path):
     assert tb.record_access_model(**base).startswith("rejected: evidence is required")
     assert "quote not found" in tb.record_access_model(
         **base, evidence=[{"file": "Sec.java", "line": 2, "quote": "denyAll"}])
-    assert tb.record_access_model(**base, evidence=[{"file": "Sec.java", "line": 2, "quote": "allowed()"}]) == \
-        "access model recorded"
+    assert tb.record_access_model(**base, evidence=[{"file": "Sec.java", "line": 2, "quote": "allowed()"}]) \
+        .startswith("access model recorded")
     assert tb.finish("done").startswith("finished") and tb.finished
     tb2 = Toolbox(AuditConfig(), tmp_path, tmp_path)
     tb2.finish_gates = tb.finish_gates
@@ -641,8 +641,11 @@ def test_record_card_requires_anchors_and_counts_fact_citations(tmp_path):
     assert tb.record_card(**card, hypotheses=[{"risk": "sqli", "status": "rejected"}]).startswith("rejected")
     assert tb.record_card(**card, hypotheses=[{"risk": "x", "anchor": "A.java:99", "status": "open"}]) \
         .startswith("rejected")  # line out of range
+    assert "have no why" in tb.record_card(**card, hypotheses=[{"risk": "idor", "anchor": "A.java:3",
+                                                                 "status": "rejected"}])
     assert "unknown fact ids ignored: ['F7']" in tb.record_card(
-        **card, hypotheses=[{"risk": "idor", "anchor": "A.java:3", "status": "open"}], facts_used=["F2", "F7"])
+        **card, hypotheses=[{"risk": "idor", "anchor": "A.java:3", "status": "open", "why": "who owns the row"}],
+        facts_used=["F2", "F7"])
     tb.record_card(**card, hypotheses=[], facts_used=["F2"])
     assert len(tb.cards) == 1  # a later call replaces the card
     block = fb.prompt_block()
@@ -1064,7 +1067,8 @@ def test_ladder_orders_units_within_a_level_and_is_shown(tmp_path):
     assert tb.record_access_model(authentication="session", authorization="grants", permission_mapping="doc.method",
                                   shared_protections="none", principals="visitor < contributor < editor < owner",
                                   ladder=["Visitor", "Contributor", "Editor", "Super Editor", "Owner"],
-                                  evidence=[{"file": "a.js", "line": 1, "quote": "x"}]) == "access model recorded"
+                                  evidence=[{"file": "a.js", "line": 1, "quote": "x"}]) \
+        .startswith("access model recorded")
     assert "ladder (least to most privileged): Visitor < Contributor < Editor < Super Editor < Owner" in \
         access_model_text(tb.access_model)
 
@@ -1207,7 +1211,8 @@ def test_access_model_requires_ladder_and_shared_protections(tmp_path):
             "evidence": [{"file": "a.js", "line": 1, "quote": "x"}]}
     assert tb.record_access_model(**base) == "rejected: missing shared_protections, ladder"
     assert tb.record_access_model(**base, shared_protections="s", ladder="anon < admin") == "rejected: missing ladder"
-    assert tb.record_access_model(**base, shared_protections="s", ladder=["anon", "admin"]) == "access model recorded"
+    assert tb.record_access_model(**base, shared_protections="s", ladder=["anon", "admin"]) \
+        .startswith("access model recorded")
 
 
 
@@ -1379,3 +1384,94 @@ def test_limiter_cuts_once_per_burst_and_recovers():
         lim.acquire()
         lim.release()
     assert lim.limit == 9
+
+
+def test_access_model_records_designed_powers_and_shows_them(tmp_path):
+    from app.services.yasa_audit.prompts import access_model_text
+
+    _write(tmp_path, {"docs/scopes.md": "crons: may edit and run scheduled commands\nenvs: task data only\n"})
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    base = {"authentication": "token", "authorization": "scopes", "permission_mapping": "ns -> scope",
+            "principals": "apps", "shared_protections": "joi", "ladder": ["anonymous", "app", "admin"],
+            "evidence": [{"file": "docs/scopes.md", "line": 1, "quote": "crons: may edit"}]}
+    assert "without powers" in tb.record_access_model(**base)
+    assert tb.record_access_model(**base, powers=[{"principal": "app:crons"}]) == \
+        "rejected: powers: each row needs principal and power"
+    assert "quote not found" in tb.record_access_model(**base, powers=[
+        {"principal": "app:envs", "power": "data", "evidence": {"file": "docs/scopes.md", "line": 2, "quote": "runs"}}])
+    assert tb.record_access_model(**base, powers=[
+        {"principal": "app:crons", "power": "edits and runs scheduled commands (code execution by design)",
+         "evidence": {"file": "docs/scopes.md", "line": 1, "quote": "crons: may edit and run"}},
+        {"principal": "app:envs", "power": "writes task data; must not control the task runner",
+         "evidence": {"file": "docs/scopes.md", "line": 2, "quote": "envs: task data only"}},
+        {"principal": "team_admin", "power": "manages one team", "held_for_one_object": True}]) == \
+        "access model recorded"
+    assert tb.access_model["scoped_roles"] == ["team_admin"]
+    text = access_model_text(tb.access_model)
+    assert "designed powers" in text and "app:envs: writes task data; must not control the task runner" in text
+    assert "team_admin (held for one object" in text and "docs/scopes.md:1" in text
+
+
+def test_a_designed_capability_leaves_the_report_as_by_design(tmp_path, monkeypatch):
+    from app.services.yasa_audit import pipeline
+    from app.services.yasa_audit.verify import verify
+
+    _write(tmp_path, {"api/crons.js": "function create(cmd) {\n  exec(cmd);\n}\n",
+                      "docs/scopes.md": "crons: may edit and run scheduled commands\n"})
+    review = tmp_path / "out" / "review"
+    review.mkdir(parents=True)
+    f = {"vuln_type": "RCE", "cwe": "CWE-78", "sink_file": "api/crons.js", "sink_line": 2, "source": "cmd",
+         "required_privilege": "authenticated", "verdict": "confirmed", "impact": "an app runs commands",
+         "entry": "POST /open/crons", "issue": "I1", "root_cause": "commands run as given"}
+    (review / "findings.json").write_text(json.dumps({"findings": [f], "not_reviewed": []}))
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "x")
+    assert tb.conclude("by_design", "crons runs commands").startswith("rejected: by_design needs power")
+    grant = {"principal": "app:crons", "file": "docs/scopes.md", "line": 1, "quote": "may edit and run"}
+    monkeypatch.setattr(pipeline, "LLM", lambda cfg: ScriptedLLM([
+        ("conclude", {"verdict": "by_design", "reason": "the crons scope is meant to run commands", "power": grant})]))
+    m = verify(_cfg(workers=1), tmp_path, review, deadline=time.time() + 300)
+    assert m["verdicts"] == {"by_design": 1} and m["findings_by_design"] == 1 and m["findings_kept"] == 0
+    data = json.loads((review / "findings.json").read_text())
+    assert data["findings"] == [] and data["by_design"][0]["verification"]["power"]["principal"] == "app:crons"
+
+
+def test_an_empty_reply_cut_by_the_output_limit_is_asked_again_with_a_wider_allowance():
+    from app.services.yasa_audit.llm import LLM
+
+    cfg = AuditConfig(llm_base_url="http://localhost:1/v1", llm_api_key="k", llm_model="m", llm_max_tokens=1000,
+                      llm_max_tokens_ceiling=3000)
+    llm = LLM(cfg)
+    asked = []
+
+    def create(**kw):
+        asked.append(kw["max_tokens"])
+        empty = len(asked) < 3
+        msg = SimpleNamespace(content="" if empty else "ok", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="length" if empty else "stop")],
+                               usage=None)
+
+    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    assert llm.chat([{"role": "user", "content": "x"}]).content == "ok"
+    assert asked == [1000, 2000, 3000] and llm.usage.widened == 2
+    asked.clear()
+    llm.cfg.llm_max_tokens_ceiling = 1000  # nothing wider to try: the empty reply goes back to the loop
+    assert llm.chat([{"role": "user", "content": "x"}]).content == "" and asked == [1000]
+
+
+def test_a_unit_whose_model_keeps_replying_with_nothing_is_counted(tmp_path):
+    from app.services.yasa_audit.agent_loop import run_agent
+    from app.services.yasa_audit.toolbox import tool_schemas
+
+    class Silent(ScriptedLLM):
+        cfg = AuditConfig()
+        last_finish_reason = "length"
+
+        def chat(self, messages, tools=None):
+            self.usage.calls += 1
+            return SimpleNamespace(content="", tool_calls=None)
+
+    tb = Toolbox(AuditConfig(), tmp_path, tmp_path / "out")
+    res = run_agent(Silent([]), tb, tool_schemas("review"), "sys", "go", 5, tmp_path / "log.jsonl")
+    assert res["ended_silent"] and not res["finished"]
+    rows = [json.loads(x) for x in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert rows[0]["finish_reason"] == "length"

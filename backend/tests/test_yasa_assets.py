@@ -104,7 +104,8 @@ def test_recipe_places_every_site_in_the_call_graph_with_its_guard(tmp_path):
     res = json.loads(tb.run_recipe("role-write", "credential_or_privilege_write", r"->role\s*=",
                                    guard=r"requireAdmin\(|->can\(", why="role column of the users table"))
     # the test file is not product code; the other three are the handler, a callee, an extension point
-    assert res["sites"] == 3 and res["reach"] == {"handler": 1, "entry": 1, "no_callers": 1, "internal": 0}
+    assert res["sites"] == 3 and res["reach"] == {"handler": 1, "entry": 1, "unindexed": 0, "no_callers": 1,
+                                                  "internal": 0}
     assert res["guard"] == {"pattern": r"requireAdmin\(|->can\(", "guarded": 1, "unguarded": 2}
     assert "credential_or_privilege_write" not in res["classes_left"] and "file_write" in res["classes_left"]
     sites = {s["function"]: s for s in assets.expand(tb.recipes["role-write"],
@@ -234,13 +235,15 @@ def test_run_maps_assets_and_reviews_operations_and_identity_design(tmp_path, mo
                                        "hypotheses": []})],
         # the entry reviewer traces the cache write: the operation unit for it is not run again
         "/home": [("record_card", {"function": "home", "callers": "anyone", "authz_verdict": "ok", "hypotheses": [
-            {"risk": "path traversal in the cache key", "anchor": "lib/Cache.php:4", "status": "rejected"}]})],
+            {"risk": "path traversal in the cache key", "anchor": "lib/Cache.php:4", "status": "rejected",
+             "why": "the key is a hash (lib/Cache.php:3)"}]})],
         "/register": [("record_card", {"function": "register", "callers": "anyone", "authz_verdict": "ok",
                                        "hypotheses": []})],
         "operation": [("record_card", {"function": "plugin import sets roles", "callers": "plugins (no caller)",
                                        "authz_verdict": "unclear", "hypotheses": [
                                            {"risk": "role from imported row", "anchor": "lib/Hooks.php:4",
-                                            "status": "open"}], "open_leads": ["lib/Hooks.php:4 role from row"]})],
+                                            "status": "open", "why": "who writes the imported rows"}],
+                                       "open_leads": ["lib/Hooks.php:4 role from row"]})],
         "design": [("finish", {}),  # refused: checklist not answered
                    ("record_design", {"items": [
                        {"item": "record_claiming", "status": "flaw", "answer": "an existing account is loaded by "
@@ -380,7 +383,7 @@ def test_entries_an_object_scoped_role_can_call_are_not_privileged():
     model = {"authentication": "a", "authorization": "b", "permission_mapping": "c", "principals": "d",
              "shared_protections": "e", "ladder": ["user", "team_admin", "admin"], "scoped_roles": ["team_admin"],
              "evidence": [{"file": "tests/test_yasa_assets.py", "line": 1, "quote": '"""The sensitive-asset map'}]}
-    assert tb.record_access_model(**model) == "access model recorded"
+    assert tb.record_access_model(**model).startswith("access model recorded")
     from app.services.yasa_audit.prompts import access_model_text
     assert tb.access_model["scoped_roles"] == ["team_admin"] and "held for one object" in access_model_text(
         tb.access_model)
@@ -434,13 +437,30 @@ def test_shared_functions_get_a_contract_review_and_read_code_counts_as_reviewed
 
 
 def test_a_large_identity_subsystem_is_reviewed_in_parts():
-    entries = [{"id": f"E{i}", "route": f"/u/{i}", "handler_file": f"h{i % 3}.py"} for i in range(90)]
+    entries = [{"id": f"E{i}", "route": f"/u/{i}", "handler_file": f"h{i % 3}.py"} for i in range(300)]
     g = {"name": "users", "kind": "user_management", "routes": [], "files": [], "models": [], "settings": [],
-         "notes": "", "entry_ids": [e["id"] for e in entries], "site_keys": []}
+         "notes": "", "entry_ids": [e["id"] for e in entries[:90]], "site_keys": []}
     units = assets.design_units([g], entries, [], limit=10)
     assert len(units) == 3 and all(len(u["entries"]) <= 40 for u in units)
     assert {u["handler"] for u in units} == {f"users (part {n}/3)" for n in (1, 2, 3)}
     assert "this is part" in assets.design_brief(units[0])
+
+
+def test_a_subsystem_most_entries_pass_is_reviewed_once_as_a_mechanism():
+    entries = [{"id": f"E{i}", "route": f"/api/{i}", "handler_file": f"h{i % 3}.py"} for i in range(120)]
+    sites = [{"recipe": "r1", "file": "auth/session.py", "line": 3, "function": "check",
+              "op_class": "secret_generation_or_check",
+              "code": "verify(token)", "reach": "entry", "entries": ["E1"]},
+             {"recipe": "r2", "file": "h1.py", "line": 9, "function": "h", "op_class": "file_write",
+              "code": "open(p, 'w')",
+              "reach": "handler", "entries": ["E1"]}]
+    g = {"name": "session", "kind": "session", "routes": ["^/api/.*$"], "files": ["auth/session.py"], "models": [],
+         "settings": [], "notes": "", "entry_ids": [e["id"] for e in entries[:100]],
+         "site_keys": ["auth/session.py:3", "h1.py:9"]}
+    (unit,) = assets.design_units([g], entries, sites, limit=10)
+    assert unit["handler"] == "session" and unit["entries"] == [] and unit["cross_cutting"] == 100
+    assert [s["file"] for s in unit["sites"]] == ["auth/session.py"]
+    assert "a mechanism requests pass through" in assets.design_brief(unit)
 
 
 def test_follow_ups_run_before_the_units_not_started_yet():
@@ -504,7 +524,7 @@ def test_review_sends_a_fresh_reviewer_to_settle_an_open_design_flaw(tmp_path, m
         def chat(self, messages, tools=None):
             if not self.script and not self.usage.calls:
                 system, user = messages[0]["content"], messages[1]["content"]
-                key = ("lead" if "left a conclusion open" in system else "design" if "Identity subsystem" in user
+                key = ("lead" if "has\nleft a conclusion open" in system else "design" if "Identity subsystem" in user
                        else "entry")
                 seen.setdefault(key, user)
                 self.script = list(scripts[key])
@@ -521,3 +541,43 @@ def test_review_sends_a_fresh_reviewer_to_settle_an_open_design_flaw(tmp_path, m
     (sheet,) = data["design_worksheet"]
     item = next(i for i in sheet["items"] if i["item"] == "privilege_ceiling")
     assert item["follow_up"]["findings"] == 1
+
+
+def test_an_open_hypothesis_is_followed_up_once_per_anchor():
+    board = assets.LeadBoard()
+    unit = {"handler": "create", "handler_file": "api/env.ts", "entries": [{"id": "E1", "route": "/envs"}],
+            "sites": []}
+    card = {"function": "creates env rows and rewrites env.sh", "hypotheses": [
+        {"risk": "names the runner reads", "anchor": "back/env.ts:273", "status": "rejected", "why": "denylist"},
+        {"risk": "values reach the runner's commands", "anchor": "shell/otask.sh:79", "status": "open",
+         "why": "did not follow conc/desi"},
+        {"risk": "second open one", "anchor": "shell/otask.sh:185", "status": "open", "why": "x"}]}
+    (lead,) = board.follow_ups(unit, [card])  # one per unit
+    assert lead["kind"] == "lead" and lead["hypothesis"]["anchor"] == "shell/otask.sh:79"
+    brief = assets.lead_brief(lead)
+    assert "left this hypothesis open" in brief and "did not follow conc/desi" in brief and "/envs" in brief
+    again = board.follow_ups({**unit, "handler": "update"}, [card])  # another unit, same open anchor
+    assert [x["hypothesis"]["anchor"] for x in again] == ["shell/otask.sh:185"]
+
+
+def test_code_the_index_does_not_parse_stays_in_the_map(tmp_path):
+    _write(tmp_path, {"app/run.py": "def run(cmd):\n    os.system(cmd)\n",
+                      "shell/task.sh": "#!/bin/bash\neval \"$CMD\"\n",
+                      "shell/runner": "#!/bin/bash\neval \"$X\"\n", "LICENSE": "MIT\n", ".npmrc": "x=1\n",
+                      "web/a.css": "a{}\n", "docs/usage.md": "eval \"$CMD\" in docs\n"})
+    index = assets.CallIndex(tmp_path)
+    index.indexed = True
+    index.parsed = {"app/run.py"}
+    assert index.unparsed("shell/task.sh") and not index.unparsed("app/run.py") and not index.unparsed("docs/usage.md")
+    assert assets.unparsed_files(tmp_path, index) == ["shell/runner", "shell/task.sh"]
+    assert "does not parse 2 product files" in assets.unparsed_summary(tmp_path, index)
+
+    def grep(pattern, glob):
+        rows = ["app/run.py:2:    os.system(cmd)", "shell/task.sh:2:eval \"$CMD\"", "docs/usage.md:1:eval in docs"]
+        return [r for r in rows if not glob or r.startswith(glob.split("*")[0])]
+
+    recipe = {"name": "exec", "op_class": "code_or_command_execution", "pattern": "eval|system", "glob": "app/**"}
+    rows, outside = assets.scoped_rows(grep, recipe, set(), index.unparsed)
+    assert outside == ["shell/task.sh:2:eval \"$CMD\""]
+    sites = assets.expand(recipe, rows, index, [])
+    assert {s["file"]: s["reach"] for s in sites}["shell/task.sh"] == "unindexed"

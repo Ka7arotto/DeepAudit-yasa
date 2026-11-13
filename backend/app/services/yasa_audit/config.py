@@ -41,6 +41,10 @@ class AuditConfig:
         default_factory=lambda: float(os.environ.get("LLM_TEMPERATURE", "0.1"))
     )
     llm_max_tokens: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS", "8192")))
+    # A reply that hidden reasoning cut off before anything visible is asked again with twice the
+    # allowance, up to this
+    llm_max_tokens_ceiling: int = field(
+        default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS_CEILING", "32768")))
     llm_timeout_s: float = field(default_factory=lambda: float(os.environ.get("LLM_TIMEOUT", "150")))
 
     # Tools: codegraph indexes the code (calls, inheritance, routes), ripgrep searches it

@@ -72,8 +72,14 @@ Find and read, with the navigation tools:
   call it; record their names in that order as the ladder. Tell global roles (held across the whole
   deployment) from roles held for one object (admin or owner of a team, organization, project): an
   ordinary user can create such an object or be made its admin, so put those right above the ordinary
-  user on the ladder and list them in scoped_roles; when only such a role can call an entry, the
-  resolver names it among the principals;
+  user on the ladder; when only such a role can call an entry, the resolver names it among the principals;
+- what each principal is DESIGNED to be able to do (powers): one row per role, permission or scope that
+  grants something different, including each scope of a scoped token, which the ladder cannot order.
+  Read it from what the project itself says and does: documentation of roles and scopes, comments, the
+  restrictions it adds ("X must not control Y"), its security fixes and their tests. A power that runs
+  code, reads secrets or grants other powers by design (an administrator installing plugins, a scope
+  that edits scheduled commands) belongs here as much as a restriction does: reviewers judge every
+  capability they find against these rows, within the power is designed, beyond it is an escalation;
 - what is public by default;
 - the protections every request or outgoing operation passes whatever the handler does: input
   validation in the framework, output filtering, the wrappers used for outbound HTTP, file paths,
@@ -113,10 +119,12 @@ wrapper or helper the input passes through rather than assuming what it does.
 
 Who the attacker is: a remote user at the entry's exposure level. Input that only an operator controls
 (CLI arguments, deployment config files, installer steps) is trusted unless the product context says
-otherwise. A dangerous capability an administrator is meant to have (installing plugins, configuring
-mail servers, impersonating) is not a vulnerability; report an admin-level issue only when it crosses a
-boundary the role should not cross (a read-only role writes, a role reads secrets it is not granted,
-one tenant reaches another), and say which boundary. "confirmed" needs a concrete request (method,
+otherwise. Judge what the attacker obtains against the designed power of the least privileged principal
+that can take the path (the access model's powers): a capability within that power (an administrator
+installing plugins, a scope meant to edit scheduled commands running a command) is not a vulnerability,
+however dangerous; one beyond it is (a read-only role writes, a data-only scope controls what runs, a
+role reads secrets it is not granted, one tenant reaches another). Say in the impact which power it
+exceeds. "confirmed" needs a concrete request (method,
 path, parameters) and the observable difference it causes; otherwise use "likely". Give each finding its
 impact (what the attacker concretely gains: data read, state changed, privilege obtained, code run; a
 check that is skipped without any such effect is not a finding) and its root cause in one sentence, or
@@ -158,11 +166,16 @@ Method:
    hypothesis names that place as its anchor (file:line). If a verified fact rules out a class for this
    project (e.g. all data access is through a typed query API), do not raise it.
 5. Trace each hypothesis to a confirmed path (file:line hops, and why the checks do not stop it) or a
-   rejection with evidence. Then record_card again with every hypothesis's final status and the fact ids
-   you relied on, report_finding for each confirmed or likely vulnerability, add_fact for short reusable
-   facts you verified, and finish. report_finding is only for a vulnerability you traced to the harmful
-   operation: when you found none, the card says so; a suspicion you could not verify goes into the
-   card's open_leads.
+   rejection with evidence. A check that lists forbidden values (names, characters, hosts, extensions)
+   is only as complete as the list is for what consumes the value: before you reject on it, find the
+   consumers (what reads, sources, runs or forwards the value, in any language of the project) and
+   check the list against them, not against the examples your hypothesis started from.
+   Then record_card again with every hypothesis's final status and the fact ids you relied on,
+   report_finding for each confirmed or likely vulnerability, add_fact for short reusable facts you
+   verified, and finish. report_finding is only for a vulnerability you traced to the harmful operation:
+   when you found none, the card says so. A hypothesis you cannot settle stays open, with what is left to
+   read: it is followed up in a fresh context (a suspicion without an anchor in code goes into the card's
+   open_leads).
 
 """ + _REPORTING
 
@@ -198,7 +211,8 @@ Method:
    caller of any path), report_finding for each path you traced to the harmful effect (entry: the route
    or the extension point; route_evidence: where that route or hook is registered, or the declaration
    that exposes the extension point), add_fact for what others can rely on, and finish. A suspicion you
-   could not trace goes into the card's open_leads.
+   could not trace stays an open hypothesis with what is left to read (it is followed up in a fresh
+   context); a rejection names the code that stops it.
 
 """ + _REPORTING
 
@@ -231,9 +245,10 @@ to read).
 """ + _REPORTING
 
 
-LEAD_REVIEW = """You are an application-security reviewer. A design review of one identity subsystem of the
-project at the root left a conclusion open: a flaw it did not trace to a finding, or an answer that depends
-on code it did not read. You settle that one conclusion, in a fresh context, from the code.
+LEAD_REVIEW = """You are an application-security reviewer. Another review of the project at the root has
+left a conclusion open: a design review's flaw it did not trace to a finding or answer that depends on code
+it did not read, or an entry or operation reviewer's hypothesis it could not settle within its budget. You
+settle that one conclusion, in a fresh context, from the code.
 {untrusted}
 
 """ + _ACCESS_BLOCK + """
@@ -322,9 +337,18 @@ def _access_model_text(model: dict | None) -> str:
             if model.get(k)]
     if model.get("ladder"):
         rows.append("- ladder (least to most privileged): " + " < ".join(model["ladder"]))
-    if model.get("scoped_roles"):
+    if model.get("powers"):
+        rows.append("- designed powers (judge every capability against the least privileged principal's row):")
+        for p in model["powers"]:
+            ev = "; ".join(f"{e.get('file')}:{e.get('line')}" for e in p.get("evidence") or [])
+            rows.append(f"  - {p['principal']}"
+                        + (" (held for one object: an ordinary user can hold it)" if p.get("held_for_one_object")
+                           else "") + f": {p['power']}" + (f" [{ev}]" if ev else ""))
+    rest = [r for r in model.get("scoped_roles") or []
+            if r not in {p["principal"] for p in model.get("powers") or [] if p.get("held_for_one_object")}]
+    if rest:
         rows.append("- roles held for one object (an ordinary user can hold them, so entries they can call are "
-                    "authenticated, not privileged): " + ", ".join(model["scoped_roles"]))
+                    "authenticated, not privileged): " + ", ".join(rest))
     ev = ", ".join(f"{e.get('file')}:{e.get('line')}" for e in (model.get("evidence") or [])[:8])
     return "\n".join(rows) + (f"\n- evidence: {ev}" if ev else "")
 
@@ -345,11 +369,19 @@ Read the whole path the attacker's request takes, in the code, not from memory:
 - whether the attacker the report names can call the entry at all.
 The shared protections of the access model below are where to look first.
 
+Then ask what the attacker obtains, against the designed powers in the access model: the least
+privileged principal that can take this path may be meant to have that capability (a scope that edits
+scheduled commands runs commands; an administrator installs plugins). A report that only describes such
+a designed capability is not a vulnerability, however dangerous the capability.
+
 Conclude with conclude, giving the path stage by stage as you read it (file, line, quote, and whether
 the stage passes or stops this attack, evaluated with this request's actual inputs: which id, which body
 fields, which caller):
 - refuted: a stage stops the attack;
-- upheld: input_validation, permission and operation are each quoted from their code and none stops it;
+- by_design: the path holds, but what it gives is within the designed power of the least privileged
+  principal that can take it; name that principal and quote where the project grants the power;
+- upheld: input_validation, permission and operation are each quoted from their code, none stops it, and
+  the attacker obtains more than their designed power;
 - uncertain: you could not settle it within your budget (say what is left).
 You have {budget} tool calls.
 {context}

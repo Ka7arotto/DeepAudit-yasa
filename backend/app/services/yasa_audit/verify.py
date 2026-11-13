@@ -7,6 +7,9 @@ format, an output serializer, a guarded HTTP client). Each root cause gets an ag
 to find that check, reading the whole path. Its conclusion needs code quotes:
 
 - refuted: the finding leaves the report (kept in findings.json under "refuted", with the reason);
+- by_design: the path holds, but what it gives is within the designed power (access model) of the least
+  privileged principal that can take it: the finding leaves the report, kept under "by_design" with that
+  principal and the project's grant;
 - upheld: the finding stays, marked verified;
 - uncertain (or not checked in time): the finding stays, marked as not verified.
 """
@@ -52,7 +55,7 @@ def _check(cfg: AuditConfig, root: Path, out: Path, iid: str, fs: list[dict], sy
     out.mkdir(parents=True, exist_ok=True)
     tb = Toolbox(cfg, root, out, unit=f"verify-{iid}")
     tb.resolver_code = resolver
-    tb.finish_gates = [(lambda t: t.conclusion is None, "conclude first (upheld, refuted or uncertain)",
+    tb.finish_gates = [(lambda t: t.conclusion is None, "conclude first (upheld, refuted, by_design or uncertain)",
                         ["conclude"])]
     llm = pipeline.LLM(cfg)  # resolved at call time (tests replace it)
     res = run_agent(llm, tb, tool_schemas("verify"), system, _claim(iid, fs), cfg.verify_budget,
@@ -68,7 +71,8 @@ def verify(cfg: AuditConfig, root: Path, review_dir: Path, deploy: str = "", pro
            access_model: dict | None = None, resolver: str | None = None,
            deadline: float | None = None) -> dict:
     """Check every root cause in review_dir/findings.json and rewrite it: refuted findings move to
-    'refuted'; kept ones carry 'verification'. Returns metrics."""
+    'refuted', those within a designed power to 'by_design'; kept ones carry 'verification'.
+    Returns metrics."""
     t0 = time.time()
     path = review_dir / "findings.json"
     data = json.loads(path.read_text())
@@ -84,14 +88,17 @@ def verify(cfg: AuditConfig, root: Path, review_dir: Path, deploy: str = "", pro
     conclusions = {r["issue"]: r["conclusion"] for r in results if r.get("issue")}
     for iid, _ in skipped:
         conclusions[iid] = {"verdict": "uncertain", "reason": "not checked: time budget"}
-    kept, refuted = [], []
+    out_of: dict[str, list[dict]] = {"refuted": [], "by_design": []}
+    kept = []
     for iid, fs in groups:
         c = conclusions.get(iid, {"verdict": "uncertain", "reason": "not checked"})
         for f in fs:
             f["verification"] = c
-            (refuted if c["verdict"] == "refuted" else kept).append(f)
+            out_of.get(c["verdict"], kept).append(f)
     data["findings"] = kept + [f for f in data.get("findings", []) if f not in findings]
-    data["refuted"] = data.get("refuted", []) + refuted
+    for k, fs in out_of.items():
+        data[k] = data.get(k, []) + fs
+    refuted = out_of["refuted"]
     path.write_text(json.dumps(data, indent=1, ensure_ascii=False))
     (review_dir / "verify.json").write_text(json.dumps(conclusions, indent=1, ensure_ascii=False))
     verdicts: dict[str, int] = {}
@@ -99,6 +106,7 @@ def verify(cfg: AuditConfig, root: Path, review_dir: Path, deploy: str = "", pro
         verdicts[c["verdict"]] = verdicts.get(c["verdict"], 0) + 1
     s = lambda k: sum(r.get(k, 0) or 0 for r in results)  # noqa: E731
     return {"root_causes": len(groups), "verdicts": verdicts, "findings_kept": len(kept),
-            "findings_refuted": len(refuted), "steps": s("steps"), "prompt_tokens": s("prompt_tokens"),
+            "findings_refuted": len(refuted), "findings_by_design": len(out_of["by_design"]),
+            "steps": s("steps"), "prompt_tokens": s("prompt_tokens"),
             "completion_tokens": s("completion_tokens"), "cached_tokens": s("cached_tokens"),
             "wall_s": round(time.time() - t0, 1)}

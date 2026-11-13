@@ -155,6 +155,11 @@ def _assets_agent(cfg: AuditConfig, root: Path, out: Path, deploy: str, product:
                         ["run_recipe", "class_absent"]),
                        (lambda t: t.identity is None,
                         "record_identity (an empty list if the project creates no identities)", ["record_identity"])]
+    try:  # what the index cannot see into is part of the map too: say so before the agent picks globs
+        unseen = assets_map.unparsed_summary(root, tb.call_index())
+    except Exception:
+        unseen = ""
+    user = f"{user}\n\n{unseen}" if unseen else user
     llm, t0 = LLM(cfg), time.time()
     no_recipe = (lambda steps, t: not t.recipes and (steps >= cfg.assets_budget // 2 or (
                      deadline is not None and time.time() >= t0 + (deadline - t0) / 2)),
@@ -747,6 +752,7 @@ class _Shared:
                  deadline: float | None):
         self.entries, self.resolver, self.deadline = entries, resolver, deadline
         self.facts, self.issues, self.coverage = FactBook(root), IssueBoard(), assets_map.Coverage()
+        self.leads = assets_map.LeadBoard()
         self.systems = {k: review_prompt(cfg.review_budget if k != "design" else cfg.design_budget, deploy,
                                          product, surface_notes, access_model, k)
                         for k in ("entry", "operation", "design", "lead")}
@@ -833,8 +839,8 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, sh: _Share
     res = run_agent(llm, tb, tool_schemas("design" if kind == "design" else "review"), sh.systems[kind], user,
                     budget, out / "transcript.jsonl", deadline=sh.deadline, updates=updates)
     ids = [e["id"] for e in unit["entries"]]
-    where = f"identity:{unit['handler']}" if kind in ("design", "lead") else \
-        f"{unit['handler_file']}::{unit['handler']}"
+    where = f"identity:{unit['handler']}" if kind == "design" or (kind == "lead" and "answer" in unit) else \
+        f"lead:{unit['handler']}" if kind == "lead" else f"{unit['handler_file']}::{unit['handler']}"
     for x in tb.findings + tb.cards:
         x["entries"], x["handler"], x["unit_kind"] = ids, where, kind
     out_extra: dict = {}
@@ -845,7 +851,9 @@ def _review_unit(cfg: AuditConfig, root: Path, out: Path, unit: dict, sh: _Share
                                 "files": g["files"], "settings": g["settings"], "complete": not left(tb),
                                 "items": answers}]
         out_extra["followups"] = assets_map.follow_ups(unit, answers, reported=bool(tb.findings))
-    if kind == "lead":
+    if kind in ("entry", "operation"):  # what this review left open is settled next, in a fresh context
+        out_extra["followups"] = sh.leads.follow_ups(unit, tb.cards)
+    if kind == "lead" and "answer" in unit:
         out_extra["lead_of"] = {"unit": unit["handler"].rsplit(": ", 1)[0], "item": unit["answer"]["item"],
                                 "findings": len(tb.findings),
                                 "conclusion": next((str(c.get("function") or "")[:300] for c in tb.cards), "")}
@@ -876,8 +884,8 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
            surface_notes: str = "", deadline: float | None = None, access_model: dict | None = None,
            resolver: str | None = None, assets: dict | None = None) -> dict:
     """Review every unit: identity design units first (few, and nothing else covers them), then entry
-    units with operation units interleaved; a follow-up for what a design review left open runs as soon
-    as that review ends."""
+    units with operation units interleaved; a follow-up for what a unit left open (a design conclusion,
+    an open hypothesis) runs as soon as that unit ends."""
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     assets = assets or {}
@@ -926,6 +934,11 @@ def review(cfg: AuditConfig, root: Path, out: Path, entries: list[dict], deploy:
          "prompt_tokens": s("prompt_tokens"), "completion_tokens": s("completion_tokens"),
          "cached_tokens": s("cached_tokens"), "reasoning_tokens": s("reasoning_tokens"), "steps": s("steps"),
          "errors": sum(1 for r in results if r.get("error")), "facts": len(sh.facts.facts),
+         # units that stopped because the model kept replying with nothing (its reasoning used the whole
+         # output allowance even after LLM.chat widened it), and requests sent again with a wider one
+         "units_ended_silent": dict(collections.Counter(r.get("kind", "entry") for r in results
+                                                         if r.get("ended_silent"))),
+         "output_widened": s("widened"),
          "cards": len(cards), "n_findings": len(findings), "root_causes": len(sh.issues.issues),
          "findings_by_unit_kind": dict(collections.Counter(f.get("unit_kind") for f in findings)),
          "authz_verdicts": dict(collections.Counter(c.get("authz_verdict") for c in cards)),

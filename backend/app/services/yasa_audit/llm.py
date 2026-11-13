@@ -18,6 +18,7 @@ class Usage:
     cached: int = 0  # prompt tokens served from the provider's prefix cache (billed lower)
     reasoning: int = 0  # completion tokens spent on hidden reasoning
     calls: int = 0
+    widened: int = 0  # requests sent again with a larger output allowance (see LLM.chat)
     seconds: float = 0.0
 
     def add(self, usage: Any, secs: float) -> None:
@@ -125,15 +126,21 @@ class LLM:
         self.limiter = limiter_for(self.cfg)
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> Any:
+        """One completion. A reasoning model's hidden reasoning counts against max_tokens: when it uses
+        the whole allowance nothing visible comes back (no text, no tool call, finish_reason 'length').
+        Asking again in words repeats the same reasoning and fails the same way, so the same request is
+        sent again with twice the allowance, up to llm_max_tokens_ceiling."""
         last_err: Exception | None = None
         err = ""
-        for attempt in range(6):
+        max_tokens = self.cfg.llm_max_tokens
+        attempt = 0
+        while attempt < 6:
             t0 = time.time()
             kw: dict[str, Any] = {
                 "model": self.cfg.llm_model,
                 "messages": messages,
                 "temperature": self.cfg.llm_temperature,
-                "max_tokens": self.cfg.llm_max_tokens,
+                "max_tokens": max_tokens,
             }
             if tools:
                 kw["tools"] = tools
@@ -144,14 +151,21 @@ class LLM:
                 resp = self.client.chat.completions.create(**kw)
                 self.usage.add(resp.usage, time.time() - t0)
                 self.last_finish_reason = getattr(resp.choices[0], "finish_reason", None)
-                return resp.choices[0].message
+                msg = resp.choices[0].message
+                if (self.last_finish_reason == "length" and not msg.content and not msg.tool_calls
+                        and max_tokens < self.cfg.llm_max_tokens_ceiling):
+                    max_tokens = min(self.cfg.llm_max_tokens_ceiling, max_tokens * 2)
+                    self.usage.widened += 1
+                    continue
+                return msg
             except Exception as e:  # network / rate limit: back off and retry
                 last_err = e
                 limited = _is_rate_limit(e)
                 err = str(e) if limited else ""
             finally:
                 self.limiter.release(rate_limited=limited, error=err)
-            time.sleep(min(30, (5 if limited else 2) * (attempt + 1)))
+            attempt += 1
+            time.sleep(min(30, (5 if limited else 2) * attempt))
         raise RuntimeError(f"LLM call failed after retries: {last_err}")
 
 

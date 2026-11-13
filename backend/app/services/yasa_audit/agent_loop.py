@@ -69,7 +69,7 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
     messages: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     t0 = time.time()
     steps = nudges = 0
-    warned = time_warned = timed_out = False
+    warned = time_warned = timed_out = ended_silent = False
     counts: dict[str, int] = {}
     specs: Final = {t["function"]["name"]: t["function"] for t in tools}
     with open(log_path, "w") as log:
@@ -106,19 +106,25 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                      "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                     for tc in msg.tool_calls]
             messages.append(entry)
-            log.write(json.dumps({"t": round(time.time() - t0, 1), **entry}, ensure_ascii=False) + "\n")
+            reason = getattr(llm, "last_finish_reason", None)
+            log.write(json.dumps({"t": round(time.time() - t0, 1), **entry,
+                                  **({"finish_reason": reason} if not msg.tool_calls else {})},
+                                 ensure_ascii=False) + "\n")
             if not msg.tool_calls:
                 nudges += 1
                 if nudges > 3:
+                    ended_silent = not msg.content
                     break
-                if getattr(llm, "last_finish_reason", None) == "length":
-                    # The provider drops a tool call that was cut by the output limit: say so, or the
-                    # model writes the same oversized call again.
+                if reason == "length":
+                    # Cut by the output limit even at the widest allowance LLM.chat tries: hidden reasoning
+                    # used it all, or a tool call was too long and the provider dropped it. Either way the
+                    # same reply again fails the same way: ask for one short step.
                     messages.append({"role": "user", "content": "Your last reply was cut off by the output "
-                                     f"limit ({llm.cfg.llm_max_tokens} tokens) before the tool call was "
-                                     "complete, so nothing ran. Send a shorter call: e.g. a program that "
-                                     "parses the registration code instead of listing entries by hand, or "
-                                     "several smaller calls."})
+                                     "limit before anything usable came out (long hidden reasoning, or a tool "
+                                     "call too long to complete), so nothing ran. Do not plan everything at "
+                                     "once: make the single next tool call now, and keep it short: e.g. a "
+                                     "program that parses the registration code instead of listing entries "
+                                     "by hand, or several smaller calls."})
                 else:
                     messages.append({"role": "user", "content": "Continue with tools; call finish when done."})
                 continue
@@ -190,4 +196,5 @@ def run_agent(llm: LLM, tb: Toolbox, tools: list[dict], system: str, user: str, 
                                           "args": args, "content": "forced finish"}, ensure_ascii=False) + "\n")
                     break
     return {"steps": steps, "wall_s": round(time.time() - t0, 1), "tool_counts": counts,
-            "finished": tb.finished, "timed_out": timed_out}
+            "finished": tb.finished, "timed_out": timed_out, "ended_silent": ended_silent,
+            "widened": getattr(getattr(llm, "usage", None), "widened", 0)}

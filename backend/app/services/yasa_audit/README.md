@@ -6,7 +6,8 @@ Three stages under one wall-clock budget (default 30 minutes):
    (sensitive operations, identity subsystems).
 2. **review** — every entry point, every sensitive operation outside a handler and every identity
    subsystem is reviewed in its own fresh context.
-3. **verify** — every reported root cause gets a sceptical agent that tries to refute it.
+3. **verify** — every reported root cause gets a sceptical agent that tries to refute it, or shows that
+   what it gives is within a principal's designed power (`by_design`).
 
 There is no per-framework code, no routing DSL and no sink list. Project knowledge lives in what the
 agents write (extractor programs, entry cards, verified facts), and correctness comes from checks that
@@ -94,8 +95,10 @@ code the entries can reach (libraries and provider adapters the application call
 and reported as `reachable_outside_glob`. Reachability follows calls, instantiations and references, and a
 type reached brings its methods. Product code that no other file names statically is either dead or loaded
 by name at run time (a provider registry, a lazy import, a plugin directory), which the index cannot tell
-apart, so it counts as reachable too. The executor returns counters the agent refines the recipe on,
-just as it refines an extractor on coverage:
+apart, so it counts as reachable too. So does product code in a language the index does not parse (shell
+scripts a task runner sources, templates): nothing is known about what runs it, so a glob cannot leave it
+out, and the agent is told up front which such files exist. The executor returns counters the agent
+refines the recipe on, just as it refines an extractor on coverage:
 
 | Counter | Meaning |
 | --- | --- |
@@ -103,6 +106,7 @@ just as it refines an extractor on coverage:
 | `entry` | an enumerated entry reaches the site through calls |
 | `no_callers` | nothing in the repository calls the site: a framework hook, an extension point, a public API, or dead code |
 | `internal` | something calls the site, but no enumerated entry reaches it |
+| `unindexed` | the file is in a language the index does not parse: who runs it is unknown, and its unit asks the reviewer to find out |
 | `guarded` / `unguarded` | whether the guard pattern appears in the operation's function before it, or in a caller within three calls |
 
 The agent can finish only when each class has a recipe or has been declared absent (`class_absent`,
@@ -168,30 +172,51 @@ There is no re-review stage.
   - claiming of existing records (inactive, guest, pending);
   - token lifecycle (expiry, single use, hashing, constant-time comparison, revocation);
   - defaults;
-  - privilege ceiling (granting or reaching more than one holds).
+  - privilege ceiling: for each principal the subsystem manages, whether it can grant or reach more than
+    its designed power (see below), directly or through data it writes that something more privileged
+    later runs or obeys.
 
   Each answer has a status:
   - `sound`, `flaw` and `owner_decision` need quoted evidence;
   - `unclear` and `not_applicable` do not.
 
   A flaw that has been traced to its harm is also reported as a finding, with its preconditions in the
-  impact. A subsystem with more than 40 entries is reviewed in parts that share its models and settings.
-- **Follow-up units.** A design review often ends with a conclusion it could not finish: a flaw it did
-  not trace to a finding, or an answer that depends on a function it did not read (`to_verify`). Each
-  such answer (at most three per design unit) gets a fresh reviewer that reads that code and either
-  reports the finding or records what stops it. Follow-ups run as soon as their design unit ends, and
-  their outcome is written next to the answer in the worksheet (`follow_up`).
+  impact. A subsystem with more than 40 entries is reviewed in parts that share its models and settings,
+  unless its routes match more than a third of all entries: then it is a mechanism most requests pass
+  (a session or token gate), reviewed once from its files, models and settings.
+- **Follow-up units.** A review often ends with a conclusion it could not finish. In a design unit that is
+  a flaw it did not trace to a finding, or an answer that depends on a function it did not read
+  (`to_verify`); at most three per design unit. In an entry or operation unit it is a hypothesis left
+  `open`: the first one per unit, once per anchor for the whole run, since parallel units often reach the
+  same code. Each gets a fresh reviewer, with the earlier reasoning, that reads the code and either
+  reports the finding or records what stops it. Follow-ups run as soon as the unit that raised them ends;
+  a design follow-up's outcome is written next to its answer in the worksheet (`follow_up`).
+- **Rejections need reasons.** A card is refused while a hypothesis that is not confirmed has no `why`:
+  a rejection names the code that stops it, an open hypothesis what is left to read. A rejection that
+  rests on a list of forbidden values (names, characters, hosts) must have checked the list against the
+  value's consumers, in whatever language they are written, not against the hypothesis's own examples.
 
 The schedule puts design units first, because they are few and nothing else covers them. Entry units
 follow, and operation units take every `operation_every`-th slot, so neither kind waits for the other to
 be used up. All units share facts, root causes and what the entry reviewers have covered. Each finding
 carries `unit_kind`.
 
-Exposure is about who can obtain a role, not what it is called. The access agent tells global roles from
-roles held for one object (team, organization or project admin, owner) and lists the latter in
-`scoped_roles`. An ordinary user can hold such a role, so an entry only such a role can call is reviewed
-as `authenticated`, not `privileged`. Tool calls are forgiving: arguments a tool does not declare are
-dropped and named in the result, and missing required ones are asked for, instead of the call failing.
+Exposure is about who can obtain a role, not what it is called; impact is about what a principal is
+meant to do. The access agent records, besides the ladder, each principal's **designed power**: one row
+per role, permission or scope that grants something different (each scope of a scoped token, which a
+ladder cannot order), read from the project's own statements (documentation, comments, the restrictions
+and security fixes it adds), with evidence. A row says whether the role is held for one object (team,
+organization or project admin, owner). An ordinary user can hold such a role, so an entry only such a
+role can call is reviewed as `authenticated`, not `privileged`. Reviewers and the refutation check judge
+what an attacker obtains against the designed power of the least privileged principal that can take the
+path: a scope meant to edit scheduled commands running a command is designed (`by_design`), a data-only
+scope controlling what runs is an escalation.
+
+Tool calls are forgiving: arguments a tool does not declare are dropped and named in the result, and
+missing required ones are asked for, instead of the call failing. A reasoning model's hidden reasoning
+counts against the output limit; when it uses all of it and nothing visible comes back, the same request
+is sent again with twice the allowance (up to `LLM_MAX_TOKENS_CEILING`, default 32768) instead of being
+lost. Units that still end that way are counted (`units_ended_silent`).
 
 Output:
 - `review/findings.json`:
@@ -199,7 +224,9 @@ Output:
   - `open_leads`;
   - `design_worksheet`: per subsystem, every checklist item with its status, answer and evidence. This is
     what a human reviews for defaults and design trade-offs.
-  - `not_reviewed`, `not_reviewed_operations` and `not_reviewed_design`, when the budget runs out.
+  - `not_reviewed`, `not_reviewed_operations` and `not_reviewed_design`, when the budget runs out;
+  - after verify, `refuted` and `by_design`: findings taken out, each with the check's reasoning (for
+    `by_design`, the principal and where the project grants the power).
 - `review/cards.json`, `review/facts.json`.
 - `metrics.json`: units of each kind, tokens, cached tokens, reasoning tokens, wall time.
 
